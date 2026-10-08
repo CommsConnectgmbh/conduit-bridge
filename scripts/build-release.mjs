@@ -65,12 +65,21 @@ function sameJson(a, b) {
   return JSON.stringify(a ?? {}) === JSON.stringify(b ?? {});
 }
 
-/** Commit time of HEAD, so two builds of one commit are byte-identical. */
+/**
+ * Commit time of HEAD, so two builds of one commit are byte-identical. Outside
+ * a git checkout, SOURCE_DATE_EPOCH must carry it. Without either the build
+ * stops: a made-up time would give a package nobody can rebuild.
+ */
 function sourceDate() {
-  if (process.env.SOURCE_DATE_EPOCH) return Number(process.env.SOURCE_DATE_EPOCH);
+  const fromEnv = process.env.SOURCE_DATE_EPOCH;
+  if (fromEnv !== undefined) {
+    if (!/^[1-9][0-9]*$/.test(fromEnv)) die(`SOURCE_DATE_EPOCH must be a positive integer, got "${fromEnv}"`);
+    return Number(fromEnv);
+  }
   const r = spawnSync("git", ["log", "-1", "--format=%ct"], { cwd: BRIDGE, encoding: "utf8" });
   const t = Number(r.stdout?.trim());
-  return Number.isFinite(t) && t > 0 ? t : 0;
+  if (r.status !== 0 || !Number.isSafeInteger(t) || t <= 0) die("no commit time: build from a git checkout or set SOURCE_DATE_EPOCH");
+  return t;
 }
 
 function tarFlavour() {

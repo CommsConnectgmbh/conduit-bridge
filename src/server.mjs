@@ -28,6 +28,7 @@ import { createSpeechService, SpeechError, LIMITS as SPEECH_LIMITS } from "./spe
 import { issuePairCode, pairPayload, CODE_TTL_MS } from "./e2e-pairing.mjs";
 import { createAlexaVerifier } from "./alexa-verify.mjs";
 import { handleAlexaRequest } from "./alexa.mjs";
+import { createAlexaSession } from "./alexa-session.mjs";
 
 /**
  * Integer from the environment, with bounds. A bare parseInt let a typo become
@@ -693,30 +694,19 @@ async function handlePasteUpload(req, res, auth) {
 }
 
 // =============================================================
-// Alexa sync handler
-// Stable single-slot Claude session for the Alexa skill — every prompt is
-// either --resume'd into it (warm path, ~3-8 s) or initialised once with
-// --session-id (cold path, ~5-12 s). Init-flag persists in LOG_DIR so the
-// bridge can restart without losing the session.
+// Alexa: the signed /alexa endpoint (alexa.mjs checks skill, user and Amazon's
+// signature) asks one Claude conversation (alexa-session.mjs).
 // =============================================================
-const ALEXA_SESSION_UUID = "00000000-0000-c1a7-0000-000000a1ec00"; // stable, opaque
-const ALEXA_INIT_FLAG = join(LOG_DIR, ".alexa-session-inited");
 const ALEXA_MODEL = process.env.CLAUDE_ALEXA_MODEL || "haiku";
-const ALEXA_HARD_TIMEOUT_MS = 26_000;
 const ALEXA_BODY_TIMEOUT_MS = 10_000;
-const ALEXA_SYSTEM_HINT =
-  "Du wirst über Alexa-Sprachausgabe vorgelesen. Antworte auf Hochdeutsch in MAXIMAL 2 kurzen Sätzen. " +
-  "Kein Markdown, keine Listen, keine URLs, keine Code-Blöcke, keine Klammer-Bemerkungen. " +
-  "Wenn unklar: ein Satz Rückfrage.";
-
-let alexaInited = existsSync(ALEXA_INIT_FLAG);
-let alexaInFlight = false;
-
 const ALEXA_SKILL_ID = (process.env.ALEXA_SKILL_ID || "").trim();
 // The Alexa account (amzn1.ask.account…) allowed to use the skill; without it the endpoint stays closed.
 const ALEXA_USER_ID = (process.env.ALEXA_USER_ID || "").trim();
 const ALEXA_MAX_BODY = 64 * 1024;
 const verifyAlexa = createAlexaVerifier();
+
+const alexaSession = createAlexaSession({ claudeBin: CLAUDE_BIN, cwd: CWD, stateDir: LOG_DIR, model: ALEXA_MODEL, log });
+const askAlexa = (query) => alexaSession.ask(query);
 
 async function handleAlexaHttp(req, res) {
   const reply = (status, body) => {
@@ -759,136 +749,6 @@ function readRawBody(req, max, timeoutMs) {
     });
     req.on("end", () => { clearTimeout(timer); resolve(Buffer.concat(chunks)); });
     req.on("error", (e) => { clearTimeout(timer); reject(e); });
-  });
-}
-
-/**
- * Run one Alexa question through the fixed Claude session.
- * Resolves with { code, body } where body is { ok, text?, error? }.
- */
-async function askAlexa(query) {
-  if (alexaInFlight) return { code: 429, body: { ok: false, error: "alexa-busy" } };
-  alexaInFlight = true;
-  const prompt = `${ALEXA_SYSTEM_HINT}\n\nFrage: ${query}`;
-  const args = [
-    "-p", prompt,
-    "--model", ALEXA_MODEL,
-    "--output-format", "stream-json",
-    "--verbose",
-    "--permission-mode", "bypassPermissions",
-  ];
-  if (alexaInited) args.push("--resume", ALEXA_SESSION_UUID);
-  else args.push("--session-id", ALEXA_SESSION_UUID);
-
-  log("info", "alexa_spawn", { resume: alexaInited, qLen: query.length });
-  const started = Date.now();
-
-  let child;
-  try {
-    child = spawn(CLAUDE_BIN, args, {
-      cwd: CWD,
-      env: { ...process.env, FORCE_COLOR: "0" },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-  } catch (e) {
-    alexaInFlight = false;
-    log("error", "alexa_spawn_failed", { err: e.message });
-    return { code: 500, body: { ok: false, error: "spawn failed" } };
-  }
-
-  let stdout = "";
-  let stderr = "";
-  let collected = "";
-  let killedByTimeout = false;
-
-  const killTimer = setTimeout(() => {
-    killedByTimeout = true;
-    try { child.kill("SIGTERM"); } catch {}
-    setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 1500).unref?.();
-  }, ALEXA_HARD_TIMEOUT_MS);
-
-  // A multi-byte character split across two chunks became U+FFFD with a plain
-  // toString — visible corruption for emoji and non-Latin scripts. The decoder
-  // holds the partial sequence until the rest arrives.
-  const alexaOut = new StringDecoder("utf8");
-  child.stdout.on("data", (chunk) => {
-    stdout += alexaOut.write(chunk);
-    if (stdout.length > MAX_BUF) stdout = stdout.slice(-MAX_BUF);
-    let idx;
-    while ((idx = stdout.indexOf("\n")) !== -1) {
-      const line = stdout.slice(0, idx).trim();
-      stdout = stdout.slice(idx + 1);
-      if (!line) continue;
-      try {
-        const ev = JSON.parse(line);
-        if (ev.type === "assistant" && ev.message?.content) {
-          for (const block of ev.message.content) {
-            if (block.type === "text" && typeof block.text === "string" && collected.length < 200_000) {
-              // Bounded: the reply is sliced to 2000 characters at the end, but
-              // the accumulator itself had no ceiling.
-              collected += block.text;
-            }
-          }
-        }
-      } catch { /* non-json line */ }
-    }
-  });
-
-  child.stderr.on("data", (chunk) => {
-    stderr += chunk.toString("utf8");
-    if (stderr.length > 4000) stderr = stderr.slice(-4000);
-  });
-
-  return new Promise((resolve) => {
-    // A failed spawn emits BOTH 'error' and 'close'. Answering twice means a
-    // second writeHead() on a finished response, which throws *outside* any
-    // try/catch here and — with no uncaughtException handler — took the whole
-    // bridge down with every other session on it. One answer, once.
-    let answered = false;
-    const reply = (code, body) => {
-      if (answered) return;
-      answered = true;
-      resolve({ code, body });
-    };
-    child.on("close", (code) => {
-      clearTimeout(killTimer);
-      alexaInFlight = false;
-      const ms = Date.now() - started;
-
-      if (killedByTimeout) {
-        log("warn", "alexa_timeout", { ms, codeNote: "killed" });
-        return reply(504, { ok: false, error: "claude timeout" });
-      }
-      if (code !== 0) {
-        log("error", "alexa_claude_exit", { code, ms, stderr: stderr.slice(0, 300) });
-        // If --resume failed because the CLI-side session is gone (~/.claude
-        // wiped, cache cleared), every future call would fail the same way
-        // forever. Drop the init flag so the next call starts a fresh session.
-        // Match only the CLI's own wording, and only in stderr — a user's spoken
-        // prompt echoed into stderr could otherwise reset the session.
-        if (alexaInited && /(no such session|session not found|could not resume|unknown session id)/i.test(stderr)) {
-          try { unlinkSync(ALEXA_INIT_FLAG); } catch {}
-          alexaInited = false;
-          log("warn", "alexa_session_reset", {});
-        }
-        return reply(502, { ok: false, error: `claude exit ${code}` });
-      }
-
-      // After a successful run, mark inited so the next call uses --resume.
-      if (!alexaInited) {
-        try { writeFileSync(ALEXA_INIT_FLAG, new Date().toISOString()); alexaInited = true; } catch {}
-      }
-
-      const text = collected.replace(/\s+/g, " ").trim().slice(0, 2000);
-      log("info", "alexa_ok", { ms, len: text.length });
-      reply(200, { ok: true, text, ms });
-    });
-    child.on("error", (e) => {
-      clearTimeout(killTimer);
-      alexaInFlight = false;
-      log("error", "alexa_claude_err", { err: e.message });
-      reply(502, { ok: false, error: e.message });
-    });
   });
 }
 
@@ -2813,6 +2673,8 @@ function activeTurns() {
     if ((r.inflight?.proc || r.inflight?.warm) && !r.inflight.done) n++;
     n += r.promptQueue?.length || 0;
   }
+  // The Alexa slot runs outside `runtime`; a restart mid-turn kills it.
+  if (alexaSession.busy) n++;
   return n;
 }
 
