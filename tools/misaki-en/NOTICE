@@ -1,0 +1,36 @@
+misaki-en-js
+JavaScript port of the American-English G2P of misaki as used by Kokoro.
+
+This product includes software and data derived from:
+
+* misaki 0.9.4 (https://github.com/hexgrad/misaki), Copyright hexgrad,
+  Apache License 2.0 (licenses/misaki-Apache-2.0.txt). The files
+  data/misaki/us_gold.json and data/misaki/us_silver.json are copied
+  unmodified from misaki/data/. src/misaki-en.mjs is a translation of
+  misaki/en.py; src/espeak-fallback.mjs contains a translation of
+  misaki/espeak.py (EspeakFallback). The upstream project ships no NOTICE file.
+* kokoro 0.9.4 (https://github.com/hexgrad/kokoro), Copyright hexgrad,
+  Apache License 2.0 (licenses/kokoro-Apache-2.0.txt). src/kokoro-pipeline.mjs
+  is a translation of KPipeline.en_tokenize / waterfall_last / __call__.
+* spaCy 3.8.16 (https://github.com/explosion/spaCy), Copyright ExplosionAI
+  GmbH, MIT License (licenses/spaCy-MIT.txt). src/spacy-tokenizer.mjs is a
+  translation of spacy/tokenizer.pyx; data/spacy/tokenizer.json contains the
+  English tokenizer rules and norm tables exported from spaCy.
+* thinc 8.3.13 (https://github.com/explosion/thinc), Copyright ExplosionAI
+  GmbH, MIT License (licenses/thinc-MIT.txt). src/spacy-tagger.mjs,
+  src/murmur.mjs and kernels/tagger_kernels.c re-implement thinc layers and
+  hashing.
+* en_core_web_sm 3.8.0 (https://github.com/explosion/spacy-models),
+  Copyright ExplosionAI GmbH, MIT License (licenses/en_core_web_sm-MIT.txt).
+  data/spacy/tagger.bin holds its tok2vec and tagger weights. Training data
+  sources as declared by the model: licenses/en_core_web_sm-LICENSES_SOURCES.md.
+
+Separately licensed modules (not covered by the Apache/MIT terms above):
+
+* src/num2words.mjs: translation of num2words 0.5.14, Copyright (c) 2003
+  Taro Ogawa, (c) 2013 Savoir-faire Linux inc., LGPL-2.1-or-later
+  (licenses/num2words-LGPL-2.1.txt).
+* src/espeak-fallback.mjs and src/espeak-wasm-adapter.mjs: GPL-3.0-or-later,
+  contain a translation of phonemizer 3.3.2 (Copyright Mathieu Bernard,
+  licenses/phonemizer-GPL-3.0.txt) and are meant to be used with espeak-ng
+  (GPL-3.0-or-later).

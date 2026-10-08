@@ -1,0 +1,20 @@
+{
+  "name": "conduit-bridge",
+  "version": "3.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "dev": "node --watch src/server.mjs",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "ws": "8.18.0"
+  },
+  "optionalDependencies": {
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "fast-check": "4.10.2"
+  }
+}
