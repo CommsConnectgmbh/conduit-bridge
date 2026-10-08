@@ -700,7 +700,8 @@ async function handlePasteUpload(req, res, auth) {
 const ALEXA_MODEL = process.env.CLAUDE_ALEXA_MODEL || "haiku";
 const ALEXA_BODY_TIMEOUT_MS = 10_000;
 const ALEXA_SKILL_ID = (process.env.ALEXA_SKILL_ID || "").trim();
-// The Alexa account (amzn1.ask.account…) allowed to use the skill; without it the endpoint stays closed.
+// The Alexa account (amzn1.ask.account…) allowed to use the skill. Until it is
+// set, verified requests of the own skill only log the caller's id (alexa.mjs).
 const ALEXA_USER_ID = (process.env.ALEXA_USER_ID || "").trim();
 const ALEXA_MAX_BODY = 64 * 1024;
 const verifyAlexa = createAlexaVerifier();
@@ -713,7 +714,7 @@ async function handleAlexaHttp(req, res) {
     res.writeHead(status, { "content-type": "application/json" });
     res.end(JSON.stringify(body));
   };
-  if (!ALEXA_SKILL_ID || !ALEXA_USER_ID) return reply(503, { error: "skill not configured" });
+  if (!ALEXA_SKILL_ID) return reply(503, { error: "skill not configured" });
   let raw;
   try {
     raw = await readRawBody(req, ALEXA_MAX_BODY, ALEXA_BODY_TIMEOUT_MS);

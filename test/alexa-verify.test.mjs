@@ -89,5 +89,25 @@ test("the skill answers only its owner's Alexa account", async () => {
   const other = await handleAlexaRequest(base("someone-else"), deps);
   assert.equal(other.body.response.shouldEndSession, true);
   assert.match(other.body.response.outputSpeech.text, /anderen Konto/);
-  assert.equal((await handleAlexaRequest(base("owner"), { ...deps, userId: "" })).status, 503);
+  assert.equal((await handleAlexaRequest(base("owner"), { ...deps, skillId: "" })).status, 503);
+});
+
+test("without a bound account, a request of the own skill only logs the caller's id; nothing runs", async () => {
+  const { handleAlexaRequest } = await import("../src/alexa.mjs");
+  const logged = [];
+  let asked = 0;
+  const deps = { skillId: "skill-1", userId: "", ask: async () => { asked++; return { code: 200, body: { ok: true, text: "x" } }; }, log: (...a) => logged.push(a) };
+  const req = (skill, intent) => ({
+    session: { application: { applicationId: skill }, user: { userId: "amzn1.ask.account.OWNER" } },
+    request: { type: "IntentRequest", requestId: "r", intent: { name: intent, slots: { query: { value: "hallo" } } } },
+  });
+  const r = await handleAlexaRequest(req("skill-1", "AskConduitIntent"), deps);
+  assert.equal(r.status, 200);
+  assert.equal(r.body.response.shouldEndSession, true);
+  assert.match(r.body.response.outputSpeech.text, /noch nicht mit deiner Bridge verbunden/);
+  assert.equal(asked, 0, "no question is run");
+  assert.deepEqual(logged, [["warn", "alexa_user_not_configured", { alexaUserId: "amzn1.ask.account.OWNER" }]]);
+  // Another skill is refused before anything is logged.
+  assert.equal((await handleAlexaRequest(req("skill-2", "AskConduitIntent"), deps)).status, 403);
+  assert.equal(logged.length, 1);
 });

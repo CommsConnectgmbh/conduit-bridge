@@ -46,11 +46,18 @@ async function sendProgressive(payload, fetchImpl) {
  */
 export async function handleAlexaRequest(payload, { skillId, userId, ask, fetchImpl = fetch, log }) {
   const incoming = payload?.session?.application?.applicationId || payload?.context?.System?.application?.applicationId;
-  if (!skillId || !userId) return { status: 503, body: { error: "skill not configured" } };
+  if (!skillId) return { status: 503, body: { error: "skill not configured" } };
   if (incoming !== skillId) return { status: 403, body: { error: "wrong skill" } };
   // The skill runs Claude on this computer: only the owner's Alexa account
   // may use it, even if the skill were ever enabled for anyone else.
   const user = payload?.session?.user?.userId || payload?.context?.System?.user?.userId;
+  if (!userId) {
+    // Not bound yet. Amazon shows the owner this id nowhere, so the first
+    // verified request of the own skill writes it to the local log; nothing
+    // is run. Binding it (ALEXA_USER_ID) is the owner's step.
+    log("warn", "alexa_user_not_configured", { alexaUserId: typeof user === "string" ? user.slice(0, 300) : null });
+    return { status: 200, body: speak("Der Skill ist noch nicht mit deiner Bridge verbunden. Deine Alexa-Kennung steht jetzt im Bridge-Protokoll.", true) };
+  }
   if (user !== userId) return { status: 200, body: speak("Dieser Skill ist mit einem anderen Konto verbunden.", true) };
 
   const type = payload?.request?.type;
