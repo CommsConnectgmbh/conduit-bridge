@@ -44,7 +44,16 @@ before(async () => {
   throw new Error("bridge did not start:\n" + logs);
 });
 
-after(() => { proc?.kill("SIGTERM"); rmSync(dir, { recursive: true, force: true }); });
+// Wait for the bridge to exit before deleting its directory: Windows keeps the
+// SQLite file locked until the process is gone.
+after(async () => {
+  if (proc && proc.exitCode === null && proc.signalCode === null) {
+    const exited = new Promise((r) => proc.once("exit", r));
+    proc.kill("SIGTERM");
+    await exited;
+  }
+  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+});
 
 test("healthz says only that a bridge is there", async () => {
   const j = await (await fetch(`http://127.0.0.1:${port}/healthz`)).json();
