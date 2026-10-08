@@ -186,5 +186,5 @@ test("npm is found next to the node binary, never through a shell", () => {
   symlinkSync(join(d, "lib/node_modules/npm/bin/npm-cli.js"), join(d, "Cellar/node/1/bin/npm"));
   const r = npmCommand(join(d, "Cellar/node/1/bin/node"));
   assert.equal(r.cmd, join(d, "Cellar/node/1/bin/node"));
-  assert.match(r.pre[0], /lib\/node_modules\/npm\/bin\/npm-cli\.js$/);
+  assert.match(r.pre[0], /lib[\\/]node_modules[\\/]npm[\\/]bin[\\/]npm-cli\.js$/);
 });

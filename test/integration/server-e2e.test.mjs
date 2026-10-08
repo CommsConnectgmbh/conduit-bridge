@@ -8,6 +8,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import net from "node:net";
 import WebSocket from "ws";
 import { generateKeyPair } from "../../src/e2e-noise.mjs";
@@ -23,7 +24,7 @@ const REAL_SPEECH = !!(process.env.CONDUIT_TEST_SPEECH_MODELS && process.env.CON
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), "conduit-itest-"));
   port = await freePort(); pairPort = await freePort();
-  proc = spawn(process.execPath, [new URL("../../src/server.mjs", import.meta.url).pathname], {
+  proc = spawn(process.execPath, [fileURLToPath(new URL("../../src/server.mjs", import.meta.url))], {
     env: {
       PATH: process.env.PATH, HOME: dir, BRIDGE_PORT: String(port), PAIR_PORT: String(pairPort),
       PAIR_PUBLIC_HOST: HOST, PAIR_OWNER_EMAIL: "owner@example.com", DB_DIR: join(dir, "db"), LOG_DIR: join(dir, "logs"),
@@ -61,7 +62,9 @@ test("plaintext API and old sockets are closed on the public port", async () => 
 test("identity key file is private", () => {
   const st = statSync(join(dir, "db", "identity.key"));
   assert.equal(st.size, 32);
-  assert.equal(st.mode & 0o077, 0);
+  // Windows has no POSIX mode bits (Node reports 0o666); there the key is
+  // protected by the ACL of the user profile it is installed into.
+  if (process.platform !== "win32") assert.equal(st.mode & 0o077, 0);
 });
 
 let device, bridgeKey;
