@@ -552,8 +552,13 @@ export async function checkAndStage(opts) {
 /**
  * `verifyKey` and `installDepsImpl` exist for the tests only (a test key, no
  * network); the server passes neither, so the compiled-in pin and real npm apply.
+ *
+ * `apply: false` and `maxVersion` are the operator's update policy
+ * (update-policy.mjs). Both act only AFTER the signature check: a release is
+ * reported as available only when it is genuinely signed, and holding it back
+ * never needs anything but the version it carries.
  */
-async function checkAndStageInner({ url, installDir = DEFAULT_INSTALL_DIR, log = () => {}, verifyKey, installDepsImpl = installDeps }) {
+async function checkAndStageInner({ url, installDir = DEFAULT_INSTALL_DIR, log = () => {}, verifyKey, installDepsImpl = installDeps, apply = true, maxVersion = null }) {
   const from = readVersion(installDir);
   // Unknown installed version → no basis for "is this newer". Skip rather than
   // guess: guessing is how a replayed old release gets installed.
@@ -614,6 +619,18 @@ async function checkAndStageInner({ url, installDir = DEFAULT_INSTALL_DIR, log =
   if (!isNewer(to, from)) {
     rmSync(work, { recursive: true, force: true });
     return { updated: false, from, to, reason: "up-to-date" };
+  }
+  // Pinned: nothing newer than the approved version. A pin below the running
+  // version therefore installs nothing at all; there is no downgrade path.
+  if (maxVersion && isNewer(to, maxVersion)) {
+    rmSync(work, { recursive: true, force: true });
+    log("info", "selfupdate_held", { from, to, pin: maxVersion });
+    return { updated: false, from, to, available: true, held: true, reason: `held back: newer than the pinned version ${maxVersion}` };
+  }
+  if (!apply) {
+    rmSync(work, { recursive: true, force: true });
+    log("info", "selfupdate_available", { from, to });
+    return { updated: false, from, to, available: true, reason: "update available, not installed (notify only)" };
   }
 
   const oldPkg = JSON.parse(readFileSync(join(installDir, "package.json"), "utf8"));
