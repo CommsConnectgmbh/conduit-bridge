@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, chmodSync, renameSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SCRIPT = fileURLToPath(new URL("../src/uninstall.sh", import.meta.url));
@@ -185,6 +185,29 @@ test("--purge through a symlinked data directory removes only the link", { skip 
   } finally { rmSync(env.home, { recursive: true, force: true }); }
 });
 
+test("--purge refuses paths that pass through a link and does not follow a linked log directory", { skip }, () => {
+  const env = setup();
+  try {
+    // alias -> parent of home, so alias/<home name> is the home directory.
+    const alias = join(env.home, "Library", "alias");
+    symlinkSync(join(env.home, ".."), alias);
+    const homeViaAlias = join(alias, basename(env.home));
+    // A log directory that is a link to a folder with files of the same names.
+    const other = join(env.home, "elsewhere");
+    mkdirSync(other);
+    for (const n of ["bridge.log", "bridge.log.1", "keep.txt"]) writeFileSync(join(other, n), "x");
+    const logLink = join(env.home, "Library", "loglink");
+    symlinkSync(other, logLink);
+    writeFileSync(join(env.bridge, ".env.local"), `DB_DIR=${env.bridge}\nPASTE_DIR=${homeViaAlias}\nLOG_DIR=${logLink}\n`);
+    const r = run(env, ["--purge", "--yes"]);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stderr, /Skipping unsafe path/);
+    assert.equal(outside(env), "");
+    assert.ok(existsSync(join(env.home, ".claude/history.jsonl")), "home content kept");
+    for (const n of ["bridge.log", "bridge.log.1", "keep.txt"]) assert.ok(existsSync(join(other, n)), `${n} in the link target kept`);
+  } finally { rmSync(env.home, { recursive: true, force: true }); }
+});
+
 test("uninstall.ps1: dry run lists, default keeps data, -Purge deletes it", { skip: !psExe && "no PowerShell installed" }, () => {
   const env = setup();
   // install.ps1 writes PowerShell launchers instead of shell scripts.
@@ -258,6 +281,31 @@ for (const exe of psExes) {
       assert.equal(readFileSync(join(precious, "keep.txt"), "utf8"), "keep", "target of the inner link untouched");
       assert.equal(readFileSync(join(precious2, "keep.txt"), "utf8"), "keep", "target of the linked data directory untouched");
       assert.ok(existsSync(join(env.home, ".claude/history.jsonl")));
+    } finally { rmSync(env.home, { recursive: true, force: true }); }
+  });
+}
+
+for (const exe of psExes) {
+  test(`uninstall.ps1 (${exe}): -Purge refuses a path through a link and a linked log directory`, () => {
+    const env = setup();
+    renameSync(join(env.bridge, "start.sh"), join(env.bridge, "start.ps1"));
+    renameSync(join(env.dir, "tunnel.sh"), join(env.dir, "tunnel.ps1"));
+    const type = process.platform === "win32" ? "junction" : "dir";
+    const alias = join(env.home, "Library", "alias");
+    symlinkSync(join(env.home, ".."), alias, type);
+    const homeViaAlias = join(alias, basename(env.home));
+    const other = join(env.home, "elsewhere");
+    mkdirSync(other);
+    for (const n of ["bridge.log", "bridge.log.1", "keep.txt"]) writeFileSync(join(other, n), "x");
+    const logLink = join(env.home, "Library", "loglink");
+    symlinkSync(other, logLink, type);
+    writeFileSync(join(env.bridge, ".env.local"), `DB_DIR=${env.bridge}\nPASTE_DIR=${homeViaAlias}\nLOG_DIR=${logLink}\n`);
+    try {
+      const r = runPs(env, ["-Yes", "-Purge"], exe);
+      assert.equal(r.status, 0, r.stderr + r.stdout);
+      assert.match(r.stderr + r.stdout, /Skipping unsafe path/);
+      assert.ok(existsSync(join(env.home, ".claude/history.jsonl")), "home content kept");
+      for (const n of ["bridge.log", "bridge.log.1", "keep.txt"]) assert.ok(existsSync(join(other, n)), `${n} in the link target kept`);
     } finally { rmSync(env.home, { recursive: true, force: true }); }
   });
 }

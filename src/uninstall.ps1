@@ -51,6 +51,17 @@ function Get-SafePath($p) {
   if ($full.Equals($homeFull, $cmp)) { return $null }
   if ($full.Equals([IO.Path]::GetPathRoot($full).TrimEnd('\', '/'), $cmp)) { return $null }
   foreach ($sep in @('\', '/')) { if ($homeFull.StartsWith($full + $sep, $cmp)) { return $null } }
+  # No link in between: a junction or symbolic link in any parent segment
+  # could lead somewhere else entirely (lexical checks cannot see that). Only
+  # the last segment may be a link; Remove-Tree then removes just the link.
+  $root = [IO.Path]::GetPathRoot($full)
+  $rest = $full.Substring($root.Length).Split([char[]]@('\', '/'), [StringSplitOptions]::RemoveEmptyEntries)
+  $cur = $root
+  for ($i = 0; $i -lt $rest.Length - 1; $i++) {
+    $cur = Join-Path $cur $rest[$i]
+    $it = Get-Item -LiteralPath $cur -Force -ErrorAction SilentlyContinue
+    if ($it -and (($it.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { return $null }
+  }
   return $full
 }
 function Test-Safe($p) { return [bool](Get-SafePath $p) }

@@ -62,6 +62,18 @@ canon() { # prints the canonical path, or nothing
   local p; p="$(printf '%s' "$1" | tr -s /)"   # "//", "///" and so on count as "/"
   case "$p" in /*) ;; *) return 1 ;; esac
   [ "$p" != "/" ] || return 1
+  # No link in between: a symbolic link in a parent segment could lead
+  # somewhere else entirely. Only the last segment may be a link, which is then
+  # removed as the link itself. Segments directly below / are system links on
+  # macOS (/var, /tmp) and are left out of this check.
+  local rest="${p#/}" cur="" seg
+  rest="${rest%/}"
+  while [ "${rest#*/}" != "$rest" ]; do
+    seg="${rest%%/*}"; rest="${rest#*/}"
+    cur="$cur/$seg"
+    [ "$cur" = "/$seg" ] && continue
+    [ -L "$cur" ] && return 1
+  done
   # A symlink itself (not its target) is what gets removed: keep its own path,
   # with the parent directory made canonical.
   if [ -L "${p%/}" ] && [ "${p%/}" = "$(printf '%s' "$p" | sed 's:/*$::')" ]; then
