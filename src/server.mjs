@@ -25,7 +25,7 @@ import {
   db as historyDb,
 } from "./db.mjs";
 import {
-  readHousekeepingPolicy, purgeExpiredHistory, enableSecureDelete, sweepOldFiles,
+  readHousekeepingPolicy, purgeExpiredHistory, enableSecureDelete, sweepOldFiles, PASTE_NAME_RE,
   rotateOwnLog, rotateServiceLogs,
 } from "./housekeeping.mjs";
 import { loadIdentity } from "./e2e-identity.mjs";
@@ -635,7 +635,7 @@ const PASTE_FILENAME_FALLBACK_EXT = new Set([
 ]);
 
 function gcPasteDir() {
-  return sweepOldFiles(PASTE_DIR, PASTE_MAX_AGE_MS);
+  return sweepOldFiles(PASTE_DIR, PASTE_MAX_AGE_MS, Date.now(), PASTE_NAME_RE);
 }
 
 async function handlePasteUpload(req, res, auth) {

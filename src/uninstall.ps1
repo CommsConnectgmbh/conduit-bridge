@@ -38,21 +38,30 @@ $Identity   = Setting "CONDUIT_IDENTITY_PATH" (Join-Path $DbDir "identity.key")
 
 # Never anything that is not clearly ours: only absolute paths below the
 # drive root, and never the home directory itself.
-function Test-Safe($p) {
-  if (-not $p) { return $false }
-  if (-not [IO.Path]::IsPathRooted($p)) { return $false }
+# GetFullPath makes the path canonical (repeated separators, "." and ".."),
+# and only that canonical form is used afterwards. Refused as well: anything
+# that contains the home directory.
+function Get-SafePath($p) {
+  if (-not $p) { return $null }
+  if (-not [IO.Path]::IsPathRooted($p)) { return $null }
   $full = [IO.Path]::GetFullPath($p).TrimEnd('\', '/')
-  if ($full -eq [IO.Path]::GetFullPath($HOME).TrimEnd('\', '/')) { return $false }
-  if ($full -eq [IO.Path]::GetPathRoot($full).TrimEnd('\', '/')) { return $false }
-  return $true
+  $homeFull = [IO.Path]::GetFullPath($HOME).TrimEnd('\', '/')
+  $cmp = [StringComparison]::OrdinalIgnoreCase
+  if (-not $full) { return $null }
+  if ($full.Equals($homeFull, $cmp)) { return $null }
+  if ($full.Equals([IO.Path]::GetPathRoot($full).TrimEnd('\', '/'), $cmp)) { return $null }
+  foreach ($sep in @('\', '/')) { if ($homeFull.StartsWith($full + $sep, $cmp)) { return $null } }
+  return $full
 }
+function Test-Safe($p) { return [bool](Get-SafePath $p) }
 
 $Program = New-Object System.Collections.Generic.List[string]
 $Data = New-Object System.Collections.Generic.List[string]
 function Add-Path($list, $p) {
   if (-not (Test-Path -LiteralPath $p)) { return }
-  if (-not (Test-Safe $p)) { Write-Warning "Skipping unsafe path: $p"; return }
-  if (-not $list.Contains($p)) { $list.Add($p) }
+  $safe = Get-SafePath $p
+  if (-not $safe) { Write-Warning "Skipping unsafe path: $p"; return }
+  if (-not $list.Contains($safe)) { $list.Add($safe) }
 }
 
 $TaskNames = @("ConduitBridge", "ConduitTunnel")

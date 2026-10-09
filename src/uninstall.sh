@@ -54,14 +54,37 @@ RUNTIME_DIR="$(setting CONDUIT_SPEECH_RUNTIME_DIR "$HOME/.conduit/speech-runtime
 IDENTITY="$(setting CONDUIT_IDENTITY_PATH "$DB_DIR/identity.key")"
 SERVICE_LOG_DIR="$DIR/logs"
 
-# Never anything that is not clearly ours: no empty, relative or top-level
-# path, and never the home directory itself.
-safe() {
-  local p="${1%/}"
+# Never anything that is not clearly ours. Every path is made canonical first
+# (repeated and trailing slashes, "." and "..", symlinked directories resolved),
+# and only the canonical form is ever deleted. Refused: empty, relative or
+# top-level paths, the home directory, and anything that contains it.
+canon() { # prints the canonical path, or nothing
+  local p; p="$(printf '%s' "$1" | tr -s /)"   # "//", "///" and so on count as "/"
   case "$p" in /*) ;; *) return 1 ;; esac
-  case "$p" in */../*|*/..) return 1 ;; esac
-  [ "$p" != "${HOME%/}" ] || return 1
-  [ "$(printf '%s' "$p" | tr -cd / | wc -c)" -ge 2 ] || return 1
+  [ "$p" != "/" ] || return 1
+  # A symlink itself (not its target) is what gets removed: keep its own path,
+  # with the parent directory made canonical.
+  if [ -L "${p%/}" ] && [ "${p%/}" = "$(printf '%s' "$p" | sed 's:/*$::')" ]; then
+    local parent; parent="$(cd -P "$(dirname "$p")" 2>/dev/null && pwd -P)" || return 1
+    printf '%s/%s' "${parent%/}" "$(basename "$p")"; return 0
+  fi
+  if [ -d "$p" ]; then (cd -P "$p" 2>/dev/null && pwd -P); return; fi
+  local parent; parent="$(cd -P "$(dirname "$p")" 2>/dev/null && pwd -P)" || return 1
+  printf '%s/%s' "${parent%/}" "$(basename "$p")"
+}
+HOME_CANON="$( (cd -P "$HOME" 2>/dev/null && pwd -P) || printf '%s' "${HOME%/}")"
+CANON=""
+safe() { # sets CANON on success
+  CANON=""
+  local c; c="$(canon "$1")" || return 1
+  c="$(printf '%s' "$c" | tr -s /)"
+  [ -n "$c" ] || return 1
+  case "$c" in /*) ;; *) return 1 ;; esac
+  [ "$c" != "/" ] || return 1
+  [ "$c" != "$HOME_CANON" ] || return 1
+  case "$HOME_CANON/" in "$c"/*) return 1 ;; esac   # an ancestor of home
+  [ "$(printf '%s' "$c" | tr -cd / | wc -c)" -ge 2 ] || return 1
+  CANON="$c"
 }
 
 SERVICES=(); PROGRAM=(); DATA=()
@@ -70,8 +93,8 @@ add() { # list path
   [ -e "$p" ] || [ -L "$p" ] || return 0
   safe "$p" || { printf 'Skipping unsafe path: %s\n' "$p" >&2; return 0; }
   case "$list" in
-    program) PROGRAM+=("$p") ;;
-    data)    DATA+=("$p") ;;
+    program) PROGRAM+=("$CANON") ;;
+    data)    DATA+=("$CANON") ;;
   esac
 }
 
@@ -179,7 +202,7 @@ if [ "$PURGE" = 1 ]; then
   [ ${#DATA[@]} -gt 0 ] && echo "Deleted the local data"
   # Directories that are now empty, innermost first.
   for d in "$LOG_DIR" "$DB_DIR" "$(dirname "$PASTE_DIR")" "$BRIDGE_DIR" "$DIR"; do
-    safe "$d" && rmdir "$d" 2>/dev/null || true
+    safe "$d" && rmdir "$CANON" 2>/dev/null || true
   done
 fi
 echo "Done."

@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, chmodSync, renameSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, chmodSync, renameSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,7 +15,8 @@ const skip = process.platform === "win32" && "uninstall.sh is for macOS and Linu
 const mac = process.platform === "darwin";
 
 function setup() {
-  const home = mkdtempSync(join(tmpdir(), "conduit-uninstall-"));
+  // realpath: the script works with canonical paths (/private/var on macOS).
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "conduit-uninstall-")));
   const dir = join(home, ".conduit");
   const bridge = join(dir, "bridge");
   const files = {
@@ -48,6 +49,19 @@ function setup() {
     writeFileSync(join(bin, tool), `#!/bin/sh\necho "${tool} $*" >> "${join(home, "calls.log")}"\n`);
     chmodSync(join(bin, tool), 0o755);
   }
+  // Guard for the test machine: rm and rmdir only act inside the fake home.
+  // Anything else is refused and recorded, so a faulty path check in the
+  // script can never reach real files (it once tried \`rm -rf //\`).
+  for (const tool of ["rm", "rmdir"]) {
+    writeFileSync(join(bin, tool), `#!/bin/sh
+for a in "$@"; do
+  case "$a" in -*) continue ;; esac
+  case "$a" in "${home}"/*) ;; *) echo "${tool} $a" >> "${join(home, "outside.log")}"; exit 1 ;; esac
+done
+exec /bin/${tool} "$@"
+`);
+    chmodSync(join(bin, tool), 0o755);
+  }
   return { home, dir, bridge, bin };
 }
 
@@ -58,6 +72,7 @@ const run = (env, args) => spawnSync("bash", [SCRIPT, ...args], {
   encoding: "utf8", detached: true, stdio: ["ignore", "pipe", "pipe"],
 });
 const calls = (env) => existsSync(join(env.home, "calls.log")) ? readFileSync(join(env.home, "calls.log"), "utf8") : "";
+const outside = (env) => existsSync(join(env.home, "outside.log")) ? readFileSync(join(env.home, "outside.log"), "utf8") : "";
 
 test("dry run lists services, program and data, and changes nothing", { skip }, () => {
   const env = setup();
@@ -130,6 +145,45 @@ const runPs = (env, args) => spawnSync(psExe, ["-NoProfile", "-NonInteractive", 
   `Set-Variable -Name HOME -Value '${env.home.replace(/'/g, "''")}' -Force -Scope Global -ErrorAction SilentlyContinue; & '${PS1.replace(/'/g, "''")}' ${args.join(" ")}; exit $LASTEXITCODE`],
 { encoding: "utf8", env: { ...process.env, CONDUIT_DIR: join(env.home, ".conduit") } });
 
+test("--purge never deletes the home directory or anything above it, however the path is written", { skip }, () => {
+  const variants = (home) => [
+    `${home}//`, `${home}///`, `${home}/.`, `${home}/./`, `${home}/Library/..`, `${home}/Library/../`,
+    `${home}/./Library/../`, "/", "//", join(home, ".."), `${join(home, "..")}/`,
+  ];
+  const probe = setup();
+  const list = variants(probe.home).map((v) => v.replaceAll(probe.home, "<HOME>"));
+  rmSync(probe.home, { recursive: true, force: true });
+  for (const tpl of list) {
+    const env = setup();
+    try {
+      const v = tpl.replaceAll("<HOME>", env.home);
+      // The bridge configuration names the dangerous path for every data directory.
+      writeFileSync(join(env.bridge, ".env.local"), `DB_DIR=${env.bridge}\nPASTE_DIR=${v}\nLOG_DIR=${v}\n`);
+      const r = run(env, ["--purge", "--yes"]);
+      assert.equal(r.status, 0, `${tpl}: ${r.stderr}`);
+      assert.match(r.stderr, /Skipping unsafe path/, tpl);
+      // The home directory and things in it that are not Conduit's survive.
+      assert.ok(existsSync(join(env.home, ".claude/history.jsonl")), `${tpl}: home content deleted`);
+      assert.ok(existsSync(join(env.home, "Library/LaunchAgents/com.other.agent.plist")), `${tpl}: other agent deleted`);
+      assert.ok(existsSync(env.home), tpl);
+      assert.equal(outside(env), "", `${tpl}: tried to remove outside the fake home`);
+    } finally { rmSync(env.home, { recursive: true, force: true }); }
+  }
+});
+
+test("--purge through a symlinked data directory removes only the link", { skip }, () => {
+  const env = setup();
+  try {
+    const link = join(env.home, "Library/conduit-bridge/pastes-link");
+    symlinkSync(env.home, link);
+    writeFileSync(join(env.bridge, ".env.local"), `DB_DIR=${env.bridge}\nPASTE_DIR=${link}\n`);
+    const r = run(env, ["--purge", "--yes"]);
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(!existsSync(link), "the link itself is removed");
+    assert.ok(existsSync(join(env.home, ".claude/history.jsonl")), "the link target is untouched");
+  } finally { rmSync(env.home, { recursive: true, force: true }); }
+});
+
 test("uninstall.ps1: dry run lists, default keeps data, -Purge deletes it", { skip: !psExe && "no PowerShell installed" }, () => {
   const env = setup();
   // install.ps1 writes PowerShell launchers instead of shell scripts.
@@ -151,4 +205,26 @@ test("uninstall.ps1: dry run lists, default keeps data, -Purge deletes it", { sk
     assert.ok(!existsSync(join(env.home, "Library/conduit-bridge")));
     assert.ok(existsSync(join(env.home, ".claude/history.jsonl")));
   } finally { rmSync(env.home, { recursive: true, force: true }); }
+});
+
+test("uninstall.ps1: the home directory or anything above it is refused, however written (dry run only)", { skip: !psExe && "no PowerShell installed" }, () => {
+  const probe = setup();
+  const tpls = [`${probe.home}//`, `${probe.home}/.`, `${probe.home}/Library/..`, join(probe.home, ".."), `${join(probe.home, "..")}/`, "/"]
+    .map((v) => v.replaceAll(probe.home, "<HOME>"));
+  rmSync(probe.home, { recursive: true, force: true });
+  for (const tpl of tpls) {
+    const env = setup();
+    renameSync(join(env.bridge, "start.sh"), join(env.bridge, "start.ps1"));
+    try {
+      const v = tpl.replaceAll("<HOME>", env.home);
+      writeFileSync(join(env.bridge, ".env.local"), `DB_DIR=${env.bridge}\nPASTE_DIR=${v}\nLOG_DIR=${v}\n`);
+      const r = runPs(env, ["-DryRun", "-Purge"]);
+      assert.equal(r.status, 0, `${tpl}: ${r.stderr}${r.stdout}`);
+      assert.match(r.stderr + r.stdout, /Skipping unsafe path/, tpl);
+      // In the list of things to delete there is no entry that is the home directory or above it.
+      const listed = (r.stdout.split(/Data to DELETE/)[1] || "").split("\n").map((l) => l.trim()).filter(Boolean);
+      for (const line of listed) assert.ok(!(env.home + "/").startsWith(line.replace(/\/+$/, "") + "/"), `${tpl}: would delete ${line}`);
+      assert.ok(existsSync(join(env.home, ".claude/history.jsonl")));
+    } finally { rmSync(env.home, { recursive: true, force: true }); }
+  }
 });

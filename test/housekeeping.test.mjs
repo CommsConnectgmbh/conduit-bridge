@@ -6,7 +6,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  readHousekeepingPolicy, purgeExpiredHistory, enableSecureDelete, sweepOldFiles, rotateOwnLog, rotateServiceLogs,
+  readHousekeepingPolicy, purgeExpiredHistory, enableSecureDelete, sweepOldFiles, PASTE_NAME_RE, rotateOwnLog, rotateServiceLogs,
 } from "../src/housekeeping.mjs";
 
 const dir = mkdtempSync(join(tmpdir(), "conduit-housekeeping-"));
@@ -139,4 +139,16 @@ test("a writer holding the file open in append mode (like launchd) continues at 
   } finally { closeSync(fd); }
   assert.equal(readFileSync(f, "utf8"), "after\n");
   assert.equal(statSync(f + ".1").size, 3000);
+});
+
+test("paste sweep only touches files named the way the bridge names attachments", () => {
+  const dir = mkdtempSync(join(tmpdir(), "paste-pattern-"));
+  const old = NOW - 40 * DAY;
+  const ours = ["1760000000000-0a1b2c3d.png", "1760000000001-deadbeef.txt", "1760000000002-01234567"];
+  const theirs = ["notes.txt", ".zshrc", "Documents.pdf", "1760000000000-0a1b2c3d.png.bak", "176000000000-0a1b2c3d.png"];
+  for (const n of [...ours, ...theirs]) { writeFileSync(join(dir, n), "x"); utimesSync(join(dir, n), old / 1000, old / 1000); }
+  assert.equal(sweepOldFiles(dir, 30 * DAY, NOW, PASTE_NAME_RE), ours.length);
+  for (const n of theirs) assert.ok(existsSync(join(dir, n)), `${n} kept`);
+  for (const n of ours) assert.ok(!existsSync(join(dir, n)), `${n} removed`);
+  rmSync(dir, { recursive: true, force: true });
 });

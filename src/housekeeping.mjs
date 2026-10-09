@@ -113,12 +113,22 @@ export function enableSecureDelete(db) {
   try { db.exec("PRAGMA secure_delete = ON"); return true; } catch { return false; }
 }
 
-/** Dateien direkt in `dir`, deren Änderungszeit älter ist als `maxAgeMs`, löschen. */
-export function sweepOldFiles(dir, maxAgeMs, now = Date.now()) {
+/** So benennt die Bridge Anhänge: `<Millisekunden>-<8 Hex>.<Endung>`. */
+export const PASTE_NAME_RE = /^\d{13}-[0-9a-f]{8}(\.[a-z0-9]{1,10})?$/;
+
+/**
+ * Dateien direkt in `dir`, deren Änderungszeit älter ist als `maxAgeMs`,
+ * löschen; mit `pattern` nur Dateien, deren Name passt. Für den
+ * Anhang-Ordner ist das der Name, den die Bridge selbst vergibt: Zeigt
+ * PASTE_DIR versehentlich auf einen fremden Ordner (etwa das Home-Verzeichnis),
+ * bleibt dort alles andere unberührt.
+ */
+export function sweepOldFiles(dir, maxAgeMs, now = Date.now(), pattern = null) {
   if (!(maxAgeMs > 0) || !dir || !existsSync(dir)) return 0;
   const cutoff = now - maxAgeMs;
   let n = 0;
   for (const name of readdirSync(dir)) {
+    if (pattern && !pattern.test(name)) continue;
     const p = join(dir, name);
     try {
       const st = statSync(p);
