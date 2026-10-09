@@ -134,10 +134,34 @@ foreach ($t in $Tasks) {
   Write-Host "Removed task $t"
 }
 
+# Deletes a tree without ever following a link: a junction or symbolic link
+# (a reparse point) is removed as the link itself, its target stays. Remove-Item
+# -Recurse cannot be trusted with that on Windows PowerShell 5.1, which follows
+# directory links into their targets.
+function Test-Reparse($item) { return (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) }
+function Remove-Link($item) {
+  # Windows removes directory links with RemoveDirectory, Unix with unlink.
+  try { [IO.Directory]::Delete($item.FullName, $false) } catch { [IO.File]::Delete($item.FullName) }
+}
+function Remove-Tree($p) {
+  $item = Get-Item -LiteralPath $p -Force -ErrorAction Stop
+  if (Test-Reparse $item) { Remove-Link $item; return }
+  if ($item.PSIsContainer) {
+    foreach ($c in @(Get-ChildItem -LiteralPath $item.FullName -Force -ErrorAction Stop)) { Remove-Tree $c.FullName }
+    [IO.Directory]::Delete($item.FullName, $false)
+  } else {
+    $item.Attributes = [IO.FileAttributes]::Normal
+    [IO.File]::Delete($item.FullName)
+  }
+}
+
 # A process that just ended can hold its files for a moment.
 function Remove-Retry($p) {
   for ($i = 0; $i -lt 10; $i++) {
-    try { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction Stop; return } catch { Start-Sleep -Milliseconds 500 }
+    try { Remove-Tree $p; return } catch {
+      if (-not (Test-Path -LiteralPath $p)) { return }
+      Start-Sleep -Milliseconds 500
+    }
   }
   Write-Warning "Could not remove $p"
 }

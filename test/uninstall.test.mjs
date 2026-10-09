@@ -139,9 +139,10 @@ test("--purge deletes the data too, and nothing outside it", { skip }, () => {
 // elsewhere). The home directory is redirected to the fake one; scheduled
 // tasks are looked up by their fixed names and none exist on a test machine.
 const PS1 = fileURLToPath(new URL("../src/uninstall.ps1", import.meta.url));
-const psExe = ["pwsh", ...(process.platform === "win32" ? ["powershell"] : [])]
-  .find((exe) => spawnSync(exe, ["-NoProfile", "-Command", "exit 0"], { stdio: "ignore" }).status === 0);
-const runPs = (env, args) => spawnSync(psExe, ["-NoProfile", "-NonInteractive", "-Command",
+const psExes = ["pwsh", ...(process.platform === "win32" ? ["powershell"] : [])]
+  .filter((exe) => spawnSync(exe, ["-NoProfile", "-Command", "exit 0"], { stdio: "ignore" }).status === 0);
+const psExe = psExes[0];
+const runPs = (env, args, exe = psExe) => spawnSync(exe, ["-NoProfile", "-NonInteractive", "-Command",
   `Set-Variable -Name HOME -Value '${env.home.replace(/'/g, "''")}' -Force -Scope Global -ErrorAction SilentlyContinue; & '${PS1.replace(/'/g, "''")}' ${args.join(" ")}; exit $LASTEXITCODE`],
 { encoding: "utf8", env: { ...process.env, CONDUIT_DIR: join(env.home, ".conduit") } });
 
@@ -228,3 +229,35 @@ test("uninstall.ps1: the home directory or anything above it is refused, however
     } finally { rmSync(env.home, { recursive: true, force: true }); }
   }
 });
+
+// A real -Purge with links, under every PowerShell on the machine (on the
+// Windows CI: Windows PowerShell 5.1 and pwsh). Links are junctions on
+// Windows and symbolic links elsewhere; their targets must survive.
+for (const exe of psExes) {
+  test(`uninstall.ps1 (${exe}): -Purge removes links as links, their targets stay`, () => {
+    const env = setup();
+    renameSync(join(env.bridge, "start.sh"), join(env.bridge, "start.ps1"));
+    renameSync(join(env.dir, "tunnel.sh"), join(env.dir, "tunnel.ps1"));
+    const precious = join(env.home, "precious");
+    const precious2 = join(env.home, "precious2");
+    mkdirSync(precious); mkdirSync(precious2);
+    writeFileSync(join(precious, "keep.txt"), "keep");
+    writeFileSync(join(precious2, "keep.txt"), "keep");
+    const type = process.platform === "win32" ? "junction" : "dir";
+    // A link inside a data directory that -Purge deletes recursively (the
+    // speech models), and a data directory that is itself a link.
+    symlinkSync(precious, join(env.dir, "models", "linked-inside"), type);
+    const pasteLink = join(env.home, "Library/conduit-bridge/pastes-link");
+    symlinkSync(precious2, pasteLink, type);
+    writeFileSync(join(env.bridge, ".env.local"), `DB_DIR=${env.bridge}\nPASTE_DIR=${pasteLink}\n`);
+    try {
+      const r = runPs(env, ["-Yes", "-Purge"], exe);
+      assert.equal(r.status, 0, r.stderr + r.stdout);
+      assert.ok(!existsSync(join(env.dir, "models")), "the data directory with the inner link is removed");
+      assert.ok(!existsSync(pasteLink), "the linked data directory is removed as a link");
+      assert.equal(readFileSync(join(precious, "keep.txt"), "utf8"), "keep", "target of the inner link untouched");
+      assert.equal(readFileSync(join(precious2, "keep.txt"), "utf8"), "keep", "target of the linked data directory untouched");
+      assert.ok(existsSync(join(env.home, ".claude/history.jsonl")));
+    } finally { rmSync(env.home, { recursive: true, force: true }); }
+  });
+}
