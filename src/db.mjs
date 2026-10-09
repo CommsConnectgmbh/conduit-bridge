@@ -67,7 +67,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS paired_devices (
     jti        TEXT PRIMARY KEY,
     email      TEXT NOT NULL,
-    label      TEXT NOT NULL DEFAULT 'Gerät',
+    label      TEXT NOT NULL DEFAULT 'Device',
     created_at INTEGER NOT NULL,
     last_seen  INTEGER NOT NULL,
     revoked    INTEGER NOT NULL DEFAULT 0
@@ -225,7 +225,7 @@ const EQ = {
 /** Authorise a device key. Re-pairing a revoked key makes it valid again. */
 export function addE2eDevice({ pubkey, deviceId, email, label, platform, pairedVia }) {
   const now = Date.now();
-  EQ.insert.run(pubkey, deviceId, email, String(label || "Gerät").slice(0, 80), String(platform || "web").slice(0, 20), pairedVia, now, now);
+  EQ.insert.run(pubkey, deviceId, email, String(label || "Device").slice(0, 80), String(platform || "web").slice(0, 20), pairedVia, now, now);
 }
 
 /** The device row for a key, or null. Callers must check revoked_at. */

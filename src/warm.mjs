@@ -89,7 +89,7 @@ export function createWarmPool({
         // retries the same prompt through the one-shot spawn — re-running a
         // turn that had already been executing for the whole stall window.
         t.handlers.onError?.(
-          `Antwort blieb ${secs}s ohne Lebenszeichen stehen — abgebrochen. Schick die Nachricht einfach nochmal.`,
+          `The answer stalled for ${secs}s without any sign of life. Stopped. Just send the message again.`,
           { stall: true },
         );
         killProc(p, "stall");
@@ -180,7 +180,7 @@ export function createWarmPool({
         // output" and re-runs the prompt through the one-shot path — so a turn
         // that had already executed its tools executes them a second time.
         t.handlers.onError?.(
-          ev.result ? String(ev.result).slice(0, 600) : "claude meldete einen Fehler",
+          ev.result ? String(ev.result).slice(0, 600) : "Claude reported an error",
           { terminal: true, reason: "cli_error" },
         );
       }

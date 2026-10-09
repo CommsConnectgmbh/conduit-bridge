@@ -130,7 +130,7 @@ export function createE2eEndpoint(deps) {
       const deviceId = deviceIdFor(deviceKey);
       deps.devices.add({
         pubkey: key, deviceId, email: code.email,
-        label: String(hello?.label || "Gerät").slice(0, 80),
+        label: String(hello?.label || "Device").slice(0, 80),
         platform: String(hello?.client || "web").slice(0, 20),
         pairedVia: code.issuedBy,
       });

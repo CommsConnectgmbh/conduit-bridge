@@ -35,7 +35,7 @@ const CLAUDE = {
   id: "claude",
   // Der Name, den der Client in der Engine-Auswahl zeigt.
   name: "Claude Opus 5",
-  badge: "⚡ Flaggschiff",
+  badge: "⚡ Flagship",
   // Kurzform für Log-Meta und interne Zwecke.
   label: "Claude",
   // Wie der Turn gefahren wird: "spawn" startet das Binary und liest dessen
@@ -49,7 +49,7 @@ const CLAUDE = {
   defaultModel: process.env.CLAUDE_MODEL || "claude-opus-5",
   models: [
     { id: "claude-opus-5", name: "Opus 5 (1M Context)", default: true },
-    { id: "claude-sonnet-5", name: "Sonnet (Schnell)" },
+    { id: "claude-sonnet-5", name: "Sonnet (Fast)" },
   ],
   // Nur Claude läuft über den Warm-Pool: der hält einen langlebigen
   // `claude --print --input-format stream-json` pro Session, spart den
@@ -119,7 +119,7 @@ const CLAUDE = {
       }
     } else if (ev.type === "result") {
       if (ev.is_error) {
-        sink.onError(ev.result ? String(ev.result).slice(0, 600) : "claude meldete einen Fehler");
+        sink.onError(ev.result ? String(ev.result).slice(0, 600) : "Claude reported an error");
       }
       sink.onUsage(ev);
     }
@@ -141,12 +141,12 @@ const CLAUDE = {
   // antwortet nicht" ist eine andere Auskunft als „Antigravity antwortet nicht",
   // und der Nutzer soll wissen, welche der beiden gerade klemmt.
   messages: {
-    spawnFailed: (m) => `claude konnte nicht gestartet werden: ${m}`,
-    stall: "Claude antwortet seit 10 min nicht — abgebrochen.",
-    stallIncomplete: "Claude antwortete nicht mehr — Antwort ist unvollständig.",
+    spawnFailed: (m) => `Claude could not be started: ${m}`,
+    stall: "Claude has not responded for 10 minutes. Stopped.",
+    stallIncomplete: "Claude stopped responding. The answer is incomplete.",
     exit: (code, tail) => `claude exit ${code}: ${tail}`,
     procError: (m) => `claude error: ${m}`,
-    emptyTurn: "Leere Antwort — Claude hat den Turn ohne Text beendet. Bitte nochmal senden.",
+    emptyTurn: "Empty answer: Claude finished without any text. Please send again.",
   },
 };
 
@@ -248,7 +248,7 @@ const ANTIGRAVITY = {
       }
     } else if (ev.event === "result" && ev.result) {
       if (ev.result.status === "ERROR") {
-        sink.onError(ev.result.response || "Antigravity meldete einen Fehler");
+        sink.onError(ev.result.response || "Antigravity reported an error");
       } else if (ev.result.status === "SUCCESS" && !sink.hasContent() && ev.result.response) {
         // Kam nichts als Delta durch, ist die Gesamtantwort im Ergebnis-Event
         // die einzige Quelle für den Text.
@@ -277,12 +277,12 @@ const ANTIGRAVITY = {
   killMeta: { engine: "gemini" },
 
   messages: {
-    spawnFailed: (m) => `Antigravity CLI konnte nicht gestartet werden: ${m}`,
-    stall: "Antigravity antwortet seit 10 min nicht — abgebrochen.",
-    stallIncomplete: "Antigravity antwortete nicht mehr — Antwort ist unvollständig.",
+    spawnFailed: (m) => `The Antigravity CLI could not be started: ${m}`,
+    stall: "Antigravity has not responded for 10 minutes. Stopped.",
+    stallIncomplete: "Antigravity stopped responding. The answer is incomplete.",
     exit: (code, tail) => `agy exit ${code}: ${tail}`,
     procError: (m) => `agy error: ${m}`,
-    emptyTurn: "Leere Antwort — Antigravity hat den Turn ohne Text beendet. Bitte nochmal senden.",
+    emptyTurn: "Empty answer: Antigravity finished without any text. Please send again.",
   },
 };
 
@@ -352,7 +352,7 @@ function codexModels() {
   if (configured && !list.some((m) => m.id === configured)) list.unshift({ id: configured, name: configured });
   // Ohne jede Auskunft bleibt „Voreinstellung": die CLI nimmt dann, was sie
   // selbst eingestellt hat, und die Auswahl ist nie leer.
-  if (list.length === 0) list.push({ id: "default", name: "Codex-Voreinstellung" });
+  if (list.length === 0) list.push({ id: "default", name: "Codex default" });
   const def = configured || list[0].id;
   codexModelCache.models = list.map((m) => (m.id === def ? { ...m, default: true } : m));
   return codexModelCache.models;
@@ -497,7 +497,7 @@ const CODEX = {
         sink.onToolEnd({ tool_use_id: id, is_error: codexToolFailed(item), content: codexToolOutput(item) });
       }
     } else if (ev.type === "turn.failed") {
-      sink.onError(String(ev.error?.message || "Codex meldete einen Fehler").slice(0, 600));
+      sink.onError(String(ev.error?.message || "Codex reported an error").slice(0, 600));
     } else if (ev.type === "turn.completed" && ev.usage) {
       sink.onUsage({
         usage: {
@@ -520,12 +520,12 @@ const CODEX = {
   killMeta: { engine: "codex" },
 
   messages: {
-    spawnFailed: (m) => `Codex CLI konnte nicht gestartet werden: ${m}`,
-    stall: "Codex antwortet seit 10 min nicht — abgebrochen.",
-    stallIncomplete: "Codex antwortete nicht mehr — Antwort ist unvollständig.",
+    spawnFailed: (m) => `The Codex CLI could not be started: ${m}`,
+    stall: "Codex has not responded for 10 minutes. Stopped.",
+    stallIncomplete: "Codex stopped responding. The answer is incomplete.",
     exit: (code, tail) => `codex exit ${code}: ${tail}`,
     procError: (m) => `codex error: ${m}`,
-    emptyTurn: "Leere Antwort — Codex hat den Turn ohne Text beendet. Bitte nochmal senden.",
+    emptyTurn: "Empty answer: Codex finished without any text. Please send again.",
   },
 };
 
@@ -632,8 +632,8 @@ refreshOllamaCache();
 const OLLAMA = {
   id: "ollama",
   aliases: ["local"],
-  name: "Lokales Modell",
-  badge: "🖥️ Läuft lokal · ohne Werkzeuge",
+  name: "Local model",
+  badge: "🖥️ Runs locally · no tools",
   label: "Ollama",
   transport: "http",
   endpoint: OLLAMA_HOST,
@@ -692,8 +692,8 @@ const OLLAMA = {
     // Nutzer soll den richtigen lesen, sonst sucht er an der falschen Stelle.
     if (!model) {
       throw new Error(ollamaCache.available
-        ? "kein lokales Modell installiert — erst `ollama pull <modell>`"
-        : `Dienst unter ${OLLAMA_HOST} antwortet nicht`);
+        ? "No local model installed. Run `ollama pull <model>` first."
+        : `No response from the service at ${OLLAMA_HOST}`);
     }
     let prior = [];
     try {
@@ -743,12 +743,12 @@ const OLLAMA = {
   killMeta: { engine: "ollama" },
 
   messages: {
-    spawnFailed: (m) => `Ollama konnte nicht angesprochen werden: ${m}`,
-    stall: "Das lokale Modell antwortet seit 10 min nicht — abgebrochen.",
-    stallIncomplete: "Das lokale Modell antwortete nicht mehr — Antwort ist unvollständig.",
-    exit: (code, tail) => `Ollama antwortete mit ${code}: ${tail}`,
-    procError: (m) => `Ollama nicht erreichbar: ${m}`,
-    emptyTurn: "Leere Antwort — das lokale Modell hat den Turn ohne Text beendet. Bitte nochmal senden.",
+    spawnFailed: (m) => `Could not reach Ollama: ${m}`,
+    stall: "The local model has not responded for 10 minutes. Stopped.",
+    stallIncomplete: "The local model stopped responding. The answer is incomplete.",
+    exit: (code, tail) => `Ollama answered with ${code}: ${tail}`,
+    procError: (m) => `Ollama is not reachable: ${m}`,
+    emptyTurn: "Empty answer: the local model finished without any text. Please send again.",
   },
 };
 

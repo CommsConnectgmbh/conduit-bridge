@@ -763,8 +763,8 @@ function resolveOwnerEmail() {
 }
 
 function pairConfigError() {
-  if (!PAIR_PUBLIC_HOST) return "PAIR_PUBLIC_HOST ist auf der Bridge nicht gesetzt";
-  if (!resolveOwnerEmail()) return "Noch kein Konto auf diesem Rechner — bitte einmal über die Conduit-App anmelden, dann koppeln";
+  if (!PAIR_PUBLIC_HOST) return "PAIR_PUBLIC_HOST is not set on this bridge";
+  if (!resolveOwnerEmail()) return "No account on this computer yet. Sign in once through the Conduit app, then pair.";
   return null;
 }
 
@@ -797,7 +797,7 @@ async function handlePairPage(req, res) {
   const headers = { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" };
   if (cfgErr) {
     res.writeHead(500, headers);
-    return res.end(`<!doctype html><meta charset=utf-8><body style="font-family:system-ui;background:#0b0f17;color:#e5e7eb;padding:40px"><h1>Pairing nicht konfiguriert</h1><p>${cfgErr}</p>`);
+    return res.end(`<!doctype html><meta charset=utf-8><body style="font-family:system-ui;background:#0b0f17;color:#e5e7eb;padding:40px"><h1>Pairing is not configured</h1><p>${cfgErr}</p>`);
   }
   const { url } = e2ePairLink("localhost");
   let svg = "";
@@ -1173,7 +1173,7 @@ async function handleApi(req, res, u, auth) {
       if (rt) {
         rt.deleted = true;
         for (const sub of [...(rt.subscribers || [])]) {
-          try { sub.send(JSON.stringify({ type: "error", message: "Session wurde gelöscht." })); } catch {}
+          try { sub.send(JSON.stringify({ type: "error", message: "This chat was deleted." })); } catch {}
           try { sub.close(); } catch {}
         }
         rt.subscribers?.clear?.();
@@ -1387,7 +1387,7 @@ function armTurnDeadline(rt, inflight, stop) {
   inflight.deadlineTimer = setTimeout(() => {
     if (rt.inflight !== inflight || inflight.done) return;
     inflight.abortedByStall = true;   // reported as an abort, not a clean done
-    inflight.errorMsg = `Turn nach ${Math.round(MAX_TURN_MS / 60000)} min hartem Limit abgebrochen.`;
+    inflight.errorMsg = `Stopped after the hard limit of ${Math.round(MAX_TURN_MS / 60000)} minutes.`;
     log("warn", "turn_deadline_exceeded", { sid: rt.sid, ms: MAX_TURN_MS });
     broadcast(rt, { type: "error", message: inflight.errorMsg, assistantMessageId: inflight.assistantId });
     try { stop(); } catch {}
@@ -1602,7 +1602,7 @@ function buildHeartbeat(inflight, silentMs, warm) {
  * same turn.
  */
 function markStreamError(rt, inflight, msg) {
-  inflight.errorMsg = inflight.errorMsg || msg || "claude meldete einen Fehler";
+  inflight.errorMsg = inflight.errorMsg || msg || "Claude reported an error";
   try { setMessageStatus(rt.sid, inflight.assistantId, "error"); } catch {}
 }
 
@@ -1718,7 +1718,7 @@ function spawnInflight(rt, sess, prompt, assistantId, userMessageId = null, engi
     log("warn", "turn_rejected_at_capacity", { sid: rt.sid, active: MAX_CONCURRENT_TURNS });
     broadcast(rt, {
       type: "error",
-      message: "Zu viele Läufe gleichzeitig — bitte kurz warten und erneut senden.",
+      message: "Too many runs at once. Please wait a moment and send again.",
       assistantMessageId: assistantId,
     });
     return;
@@ -1863,7 +1863,7 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null) 
       onError: (msg, info) => {
         if (inflight.stopRequested) {
           finishTurn(inflight.abortedByStop === "client_stop"
-            ? "Abgebrochen — die Antwort ist unvollständig."
+            ? "Stopped. The answer is incomplete."
             : null);
           return;
         }
@@ -2149,7 +2149,7 @@ function runInflightTurn(engine, rt, sess, prompt, assistantId, userMessageId = 
           (inflight.abortedByStall || inflight.abortedByStop || inflight.errorMsg || (code !== 0 && signal !== "SIGTERM") || emptyOK) ? "error" : "ok");
       } catch {}
       if (inflight.abortedByStop) {
-        inflight.errorMsg = inflight.errorMsg || "Abgebrochen — die Antwort ist unvollständig.";
+        inflight.errorMsg = inflight.errorMsg || "Stopped. The answer is incomplete.";
         broadcast(rt, { type: "error", message: inflight.errorMsg, assistantMessageId: inflight.assistantId });
       } else if (inflight.abortedByStall) {
         // Killed by the stall watchdog: the answer is truncated. SIGTERM would
@@ -2390,16 +2390,16 @@ function handleSocket(ws) {
       // budget ran out and the real reason was buried under a generic timeout.
       const promptBytes = Buffer.byteLength(msg.content, "utf8");
       if (promptBytes > MAX_PROMPT_BYTES) {
-        send({ type: "error", assistantMessageId: msg.assistantMessageId, message: `Nachricht zu lang (${promptBytes} Bytes, max ${MAX_PROMPT_BYTES}). Bitte als Datei anhängen.` });
+        send({ type: "error", assistantMessageId: msg.assistantMessageId, message: `Message too long (${promptBytes} bytes, max ${MAX_PROMPT_BYTES}). Please attach it as a file.` });
         return;
       }
       if (!msg.content.trim()) {
-        send({ type: "error", assistantMessageId: msg.assistantMessageId, message: "Leere Nachricht." });
+        send({ type: "error", assistantMessageId: msg.assistantMessageId, message: "Empty message." });
         return;
       }
 
       if (rt.deleted) {
-        send({ type: "error", assistantMessageId: msg.assistantMessageId, message: "Session wurde gelöscht." });
+        send({ type: "error", assistantMessageId: msg.assistantMessageId, message: "This chat was deleted." });
         try { ws.close(); } catch {}
         return;
       }
@@ -2427,7 +2427,7 @@ function handleSocket(ws) {
             queueLength: rt.promptQueue?.length || 0,
           });
           if (replay.kind === "finished") {
-            if (replay.errored) send({ type: "error", message: "Dieser Turn wurde mit einem Fehler beendet.", assistantMessageId: replay.assistantId });
+            if (replay.errored) send({ type: "error", message: "This answer ended with an error.", assistantMessageId: replay.assistantId });
             else send({ type: "done", assistantMessageId: replay.assistantId });
           }
         }
@@ -2481,7 +2481,7 @@ function handleSocket(ws) {
         } else {
           // Turn is genuinely alive — queue the follow-up.
           if (rt.promptQueue.length >= MAX_PROMPT_QUEUE) {
-            send({ type: "error", assistantMessageId: msg.assistantMessageId, message: "Zu viele wartende Nachrichten. Bitte kurz warten." });
+            send({ type: "error", assistantMessageId: msg.assistantMessageId, message: "Too many messages waiting. Please wait a moment." });
             return;
           }
           const sess = ensureSession(sid, email);
@@ -2554,7 +2554,7 @@ function handleSocket(ws) {
     }
    } catch (e) {
      log("error", "ws_message_failed", { sid, err: String(e?.stack || e).slice(0, 500) });
-     send({ type: "error", message: "Interner Fehler bei der Verarbeitung." });
+     send({ type: "error", message: "Internal error while processing." });
    }
   });
 
