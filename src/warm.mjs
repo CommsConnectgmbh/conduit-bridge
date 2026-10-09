@@ -170,6 +170,11 @@ export function createWarmPool({
       return;
     }
     if (ev.type === "result") {
+      // Tool calls the permission policy refused, collected by the CLI. Told
+      // to the caller before the turn ends so the notice lands in the answer.
+      if (Array.isArray(ev.permission_denials) && ev.permission_denials.length) {
+        t.handlers.onPermissionDenied?.(ev.permission_denials.map((d) => d?.tool_name));
+      }
       t.finished = true;
       p.busy = false;
       p.lastUsed = Date.now();
@@ -235,7 +240,9 @@ export function createWarmPool({
       "--output-format", "stream-json",
       "--include-partial-messages",
       "--verbose",
-      "--permission-mode", "bypassPermissions",
+      // Same policy as the one-shot path (agent-policy.mjs); default
+      // bypassPermissions.
+      ...getEngine("claude").permissionArgs(),
     ];
     if (targetModel) args.push("--model", targetModel);
 
@@ -272,7 +279,7 @@ export function createWarmPool({
 
   /**
    * Run one turn for `sid`. Reuses the warm proc if present, else spawns one.
-   * handlers: { onSessionId, onChunk, onToolUse, onUsageEvent, onDone, onError }
+   * handlers: { onSessionId, onChunk, onToolUse, onToolResult, onPermissionDenied, onUsageEvent, onDone, onError }
    * Returns true if the turn was started, false if the proc was busy.
    */
   function runTurn({ sid, sess, cwd, prompt, model: modelIn, handlers }) {

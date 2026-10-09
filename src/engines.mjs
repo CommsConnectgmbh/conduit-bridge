@@ -19,6 +19,13 @@
 import { homedir } from "node:os";
 import { accessSync, readFileSync, statSync, constants as FS } from "node:fs";
 import { listMessages, setClaudeSessionId, setAgyConversationId, setCodexThreadId } from "./db.mjs";
+import {
+  readAgentPolicy, claudePermissionArgs, codexPermissionArgs, agyPermissionArgs, deniedNotice,
+} from "./agent-policy.mjs";
+
+// Rechte-Einstellung der Firma (agent-policy.mjs). Einmal beim Start gelesen,
+// wie alle anderen Umgebungsvariablen dieser Datei auch.
+export const AGENT_POLICY = readAgentPolicy();
 
 /**
  * Verfügbarkeit heißt hier bewusst nur „das Binary ist ausführbar" — nicht
@@ -84,13 +91,17 @@ const CLAUDE = {
 
   preparePrompt({ prompt }) { return prompt; },
 
+  // Dieselben Rechte für Ein-Turn-Pfad, Warm-Pool und Alexa. Voreinstellung
+  // bleibt bypassPermissions; siehe agent-policy.mjs.
+  permissionArgs() { return claudePermissionArgs(AGENT_POLICY.claude); },
+
   buildArgs({ prompt, model, resumeId, sessionId }) {
     const args = [
       "-p", prompt,
       "--model", model,
       "--output-format", "stream-json",
       "--verbose",
-      "--permission-mode", "bypassPermissions",
+      ...this.permissionArgs(),
     ];
     // --resume setzt auf der bestehenden CLI-Session auf; ohne eine solche
     // darf die Session-Id nur vorgegeben werden, wenn unsere sid überhaupt
@@ -118,6 +129,11 @@ const CLAUDE = {
         if (block.type === "tool_result") sink.onToolEnd(block);
       }
     } else if (ev.type === "result") {
+      // Was die Rechte-Einstellung abgelehnt hat, steht gesammelt im
+      // Ergebnis-Event (claude 2.1.295: permission_denials[].tool_name).
+      if (Array.isArray(ev.permission_denials) && ev.permission_denials.length) {
+        sink.onPermissionDenied(ev.permission_denials.map((d) => d?.tool_name));
+      }
       if (ev.is_error) {
         sink.onError(ev.result ? String(ev.result).slice(0, 600) : "Claude reported an error");
       }
@@ -212,7 +228,8 @@ const ANTIGRAVITY = {
     const args = [
       "-p", prompt,
       "--output-format", "stream-json",
-      "--dangerously-skip-permissions",
+      // Voreinstellung --dangerously-skip-permissions; siehe agent-policy.mjs.
+      ...agyPermissionArgs(AGENT_POLICY.gemini),
     ];
     if (model && model !== "default") args.push("--model", model);
     if (resumeId) args.push("--conversation", resumeId);
@@ -242,11 +259,19 @@ const ANTIGRAVITY = {
           sink.onToolEnd({
             tool_use_id: String(su.step_index ?? ""),
             is_error: su.state === "ERROR",
-            content: su.tool_info?.output || su.tool_output || "",
+            // Ein abgelehnter Aufruf hat keine Ausgabe, nur tool_info.error —
+            // ohne den Fallback stünde der Schritt ohne Grund als gescheitert da.
+            content: su.tool_info?.output || su.tool_output || su.tool_info?.error?.message || "",
           });
         }
       }
     } else if (ev.event === "result" && ev.result) {
+      // Ohne --dangerously-skip-permissions lehnt die CLI im Druckmodus ab, was
+      // ihre settings.json nicht erlaubt, und beendet den Turn oft ganz ohne
+      // Text. Ohne diesen Satz käme beim Nutzer „leere Antwort" an.
+      if (Array.isArray(ev.result.denied_actions) && ev.result.denied_actions.length) {
+        sink.onPermissionDenied(ev.result.denied_actions.map((d) => d?.display_name || d?.action));
+      }
       if (ev.result.status === "ERROR") {
         sink.onError(ev.result.response || "Antigravity reported an error");
       } else if (ev.result.status === "SUCCESS" && !sink.hasContent() && ev.result.response) {
@@ -454,8 +479,10 @@ const CODEX = {
       // Die Arbeitsverzeichnisse der Sessions sind nicht zwingend Git-Repos.
       "--skip-git-repo-check",
       // Wie bei Claude (bypassPermissions) und Antigravity: am Handy gibt es
-      // niemanden, der eine Rückfrage im Terminal beantworten könnte.
-      "--dangerously-bypass-approvals-and-sandbox",
+      // niemanden, der eine Rückfrage im Terminal beantworten könnte. Deshalb
+      // ohne Einstellung ohne Sandbox; mit CONDUIT_CODEX_SANDBOX läuft Codex in
+      // der Sandbox und fragt nie (agent-policy.mjs).
+      ...codexPermissionArgs(AGENT_POLICY.codex),
     );
     if (model && model !== "default") args.push("--model", model);
     // `--` trennt die Positionsargumente ab: ein Prompt, der mit „-" beginnt,
@@ -802,6 +829,26 @@ export function engineCatalog() {
     // jede andere — der Nutzer soll vor dem ersten Prompt wissen, dass hier
     // niemand eine Datei liest oder einen Befehl ausführt.
     capabilities: e.capabilities,
-    available: e.isAvailable(),
+    // Eine von der Firma abgeschaltete Engine ist nicht verfügbar, auch wenn
+    // ihr Binary da ist; `disabled` sagt dem Client, warum.
+    available: !AGENT_POLICY.disabled.has(e.id) && e.isAvailable(),
+    ...(AGENT_POLICY.disabled.has(e.id) ? { disabled: true } : {}),
   }));
 }
+
+/**
+ * Warum eine Engine gerade keinen Turn fahren darf, oder null.
+ *
+ * Abgeschaltet oder falsch eingestellt: beides wird vor dem Start gemeldet,
+ * nicht erst als kryptischer Exit-Code der CLI.
+ */
+export function enginePolicyBlock(engine) {
+  if (AGENT_POLICY.disabled.has(engine.id)) {
+    return `${engine.label} is turned off on this bridge (CONDUIT_DISABLED_ENGINES). Nothing was run.`;
+  }
+  const err = AGENT_POLICY.errors[engine.id];
+  if (err) return `${engine.label} is blocked by a configuration error on this bridge: ${err}. Nothing was run.`;
+  return null;
+}
+
+export { deniedNotice };

@@ -1,13 +1,15 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, appendFileSync, statSync, renameSync, writeFileSync, realpathSync, readdirSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, appendFileSync, statSync, writeFileSync, realpathSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID, createHash } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import { createWarmPool } from "./warm.mjs";
 import { checkAndStage, isSupervised, readVersion, DEFAULT_INSTALL_DIR } from "./selfupdate.mjs";
-import { resolveEngine, getEngine, engineCatalog, DEFAULT_ENGINE_ID } from "./engines.mjs";
+import { readUpdatePolicy, inUpdateWindow, updateWindowKey } from "./update-policy.mjs";
+import { resolveEngine, getEngine, engineCatalog, DEFAULT_ENGINE_ID, AGENT_POLICY, enginePolicyBlock, deniedNotice } from "./engines.mjs";
+import { policySummary } from "./agent-policy.mjs";
 import {
   ensureSession, updateSessionEngine, listSessions, deleteSession, getSession,
   listMessages, insertUserMessage, insertAssistantPlaceholder, appendAssistant,
@@ -20,7 +22,12 @@ import {
 } from "./db.mjs";
 import {
   addE2eDevice, getE2eDevice, listE2eDevices, revokeE2eDevice, touchE2eDevice,
+  db as historyDb,
 } from "./db.mjs";
+import {
+  readHousekeepingPolicy, purgeExpiredHistory, enableSecureDelete, sweepOldFiles,
+  rotateOwnLog, rotateServiceLogs,
+} from "./housekeeping.mjs";
 import { loadIdentity } from "./e2e-identity.mjs";
 import { createE2eEndpoint } from "./e2e-endpoint.mjs";
 import { encodeMessage } from "./e2e-messages.mjs";
@@ -170,8 +177,16 @@ const ORPHAN_CHILD_GRACE_MS = 30 * 60_000; // 30 min
 const INFLIGHT_DONE_TTL_MS = 5 * 60_000;   // keep finished inflight around for late attach
 const MAX_BUF = 1_000_000;
 const LOG_FILE = join(LOG_DIR, "bridge.log");
-const MAX_LOG_BYTES = 10 * 1024 * 1024; // 10 MB
-const MAX_LOG_FILES = 5;
+// Retention and log rotation (housekeeping.mjs). Defaults: chats and audit
+// kept until deleted, attachments 30 days, bridge.log 10 MB x 5, the service
+// logs the installer points launchd at are left alone. The default service log
+// directory follows the installer layout: DB_DIR=<dir>/bridge, logs in <dir>/logs.
+const HOUSEKEEPING = readHousekeepingPolicy(process.env, {
+  serviceLogDirDefault: process.env.DB_DIR ? join(dirname(process.env.DB_DIR), "logs") : null,
+});
+for (const err of HOUSEKEEPING.errors) console.error(`[conduit] ${err}`);
+const MAX_LOG_BYTES = HOUSEKEEPING.logMaxBytes;
+const MAX_LOG_FILES = HOUSEKEEPING.logFiles;
 const WS_PONG_TIMEOUT_MS = 75_000;       // terminate WS if no client traffic
 const CHILD_STALL_MS = intEnv("CONDUIT_TURN_STALL_MS", 900_000, 1000, 24 * 3600_000); // no stdout for this long → kill claude
 const CHILD_HEARTBEAT_MS = 10_000;       // tick interval for the "still working" heartbeat
@@ -218,7 +233,9 @@ async function getQRCode() {
 }
 
 // Self-update: a running bridge pulls a newer bridge.tar.gz from the app origin
-// so fixes land without a manual reinstall. Off with CONDUIT_SELFUPDATE=0.
+// so fixes land without a manual reinstall. Off with CONDUIT_SELFUPDATE=0; the
+// operator can also have it only report, pin a version or set a maintenance
+// window (update-policy.mjs).
 const BRIDGE_VERSION = readVersion(DEFAULT_INSTALL_DIR) || "unknown";
 
 // End-to-end identity. Devices pin its public key when they pair; see
@@ -229,7 +246,12 @@ const IDENTITY_PATH = process.env.CONDUIT_IDENTITY_PATH
 const IDENTITY = await loadIdentity(IDENTITY_PATH);
 const b64url = (b) => Buffer.from(b).toString("base64url");
 const IDENTITY_FINGERPRINT = createHash("sha256").update(IDENTITY.publicKey).digest("hex").slice(0, 16).match(/.{4}/g).join(" ");
-const SELFUPDATE = process.env.CONDUIT_SELFUPDATE !== "0";
+const UPDATE_POLICY = readUpdatePolicy();
+const SELFUPDATE = UPDATE_POLICY.mode !== "off";
+for (const err of UPDATE_POLICY.errors) console.error(`[conduit] ${err}`);
+// Newest signed release seen on the origin and not installed (notify mode, pin,
+// or waiting for the window). Shown in /api/status.
+let updateAvailable = null;
 const APP_BASE = (process.env.PAIR_APP_BASE || process.env.CONDUIT_APP_BASE || "https://app.tryconduit.de").replace(/\/+$/, "");
 // The 3.x channel. /bridge.tar.gz stays frozen on the 3.0.0 stepping stone for
 // bridges older than 3.0 (see selfupdate.mjs).
@@ -343,18 +365,9 @@ if (!existsSync(LOG_DIR)) mkdirSync(LOG_DIR, { recursive: true });
 }
 
 
+// MAX_LOG_FILES counts the live file: 5 means bridge.log plus .1 to .4.
 function rotateLogIfNeeded() {
-  try {
-    const st = statSync(LOG_FILE);
-    if (st.size < MAX_LOG_BYTES) return;
-    // Start one lower: rotating from MAX_LOG_FILES-1 created a .MAX file on top
-    // of the base file, i.e. one more than the configured maximum.
-    for (let i = MAX_LOG_FILES - 2; i >= 0; i--) {
-      const src = i === 0 ? LOG_FILE : `${LOG_FILE}.${i}`;
-      const dst = `${LOG_FILE}.${i + 1}`;
-      try { renameSync(src, dst); } catch {}
-    }
-  } catch {}
+  rotateOwnLog(LOG_FILE, MAX_LOG_BYTES, MAX_LOG_FILES);
 }
 
 // Logs never carry who someone is or what they work on: no email, no paths,
@@ -373,7 +386,9 @@ function sanitizeLogMeta(meta) {
 
 const log = (level, msg, meta = {}) => {
   const line = JSON.stringify({ t: new Date().toISOString(), level, msg, ...sanitizeLogMeta(meta) }) + "\n";
-  process.stdout.write(line);
+  // Under launchd stdout lands in a second file the bridge does not rotate.
+  // CONDUIT_LOG_STDOUT=0 keeps it to bridge.log alone.
+  if (HOUSEKEEPING.logStdout) process.stdout.write(line);
   rotateLogIfNeeded();
   try { appendFileSync(LOG_FILE, line); } catch {}
 };
@@ -504,9 +519,11 @@ const server = http.createServer(async (req, res) => {
 // override with FILE_SEARCH_ROOTS as a colon-separated list of absolute paths.
 //
 // SCOPE — read this before trusting it. SEARCH_ROOTS bounds the session `cwd`
-// a client may switch to. It is NOT a sandbox around claude. Every turn runs with
-// `--permission-mode bypassPermissions`, so a prompt like "read ~/.ssh/config"
-// reaches the real filesystem no matter what is configured here. Treat this as
+// a client may switch to. It is NOT a sandbox around claude. Unless the operator
+// restricts it (CONDUIT_CLAUDE_PERMISSION_MODE and friends, agent-policy.mjs),
+// every turn runs with `--permission-mode bypassPermissions`, so a prompt like
+// "read ~/.ssh/config" reaches the real filesystem no matter what is configured
+// here. Treat this as
 // a discovery filter that keeps the picker tidy and honest, and treat a valid
 // token as equivalent to a shell on this machine — because it is.
 //
@@ -561,7 +578,9 @@ function isAllowedPath(p) {
 // runs under the local account) so the user can also grep their own pastes.
 const PASTE_DIR = process.env.PASTE_DIR || join(homedir(), "Library/conduit-bridge/pastes");
 const PASTE_MAX_BYTES = 25 * 1024 * 1024; // 25 MB
-const PASTE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30d retention — keeps DB references valid for a sane window
+// 30 days by default (CONDUIT_PASTE_RETENTION_DAYS, 0 keeps them) — keeps DB
+// references valid for a sane window.
+const PASTE_MAX_AGE_MS = HOUSEKEEPING.pasteDays * 24 * 60 * 60 * 1000;
 const PASTE_ALLOWED_MIME = new Map([
   ["image/png", ".png"],
   ["image/jpeg", ".jpg"],
@@ -616,15 +635,7 @@ const PASTE_FILENAME_FALLBACK_EXT = new Set([
 ]);
 
 function gcPasteDir() {
-  if (!existsSync(PASTE_DIR)) return;
-  const cutoff = Date.now() - PASTE_MAX_AGE_MS;
-  for (const name of readdirSync(PASTE_DIR)) {
-    const p = join(PASTE_DIR, name);
-    try {
-      const st = statSync(p);
-      if (st.isFile() && st.mtimeMs < cutoff) unlinkSync(p);
-    } catch { /* file vanished between readdir and stat — ignore */ }
-  }
+  return sweepOldFiles(PASTE_DIR, PASTE_MAX_AGE_MS);
 }
 
 async function handlePasteUpload(req, res, auth) {
@@ -706,8 +717,19 @@ const ALEXA_USER_ID = (process.env.ALEXA_USER_ID || "").trim();
 const ALEXA_MAX_BODY = 64 * 1024;
 const verifyAlexa = createAlexaVerifier();
 
-const alexaSession = createAlexaSession({ claudeBin: CLAUDE_BIN, cwd: CWD, stateDir: LOG_DIR, model: ALEXA_MODEL, log });
-const askAlexa = (query) => alexaSession.ask(query);
+const alexaSession = createAlexaSession({
+  claudeBin: CLAUDE_BIN, cwd: CWD, stateDir: LOG_DIR, model: ALEXA_MODEL, log,
+  permissionArgs: CLAUDE_ENGINE.permissionArgs(),
+});
+const askAlexa = async (query) => {
+  // Claude switched off or misconfigured: Alexa runs nothing either.
+  const blocked = enginePolicyBlock(CLAUDE_ENGINE);
+  if (blocked) {
+    log("warn", "alexa_blocked_by_policy", {});
+    return { code: 503, body: { ok: false, error: "policy" } };
+  }
+  return alexaSession.ask(query);
+};
 
 async function handleAlexaHttp(req, res) {
   const reply = (status, body) => {
@@ -905,6 +927,14 @@ async function handleApi(req, res, u, auth) {
       claude: claudeOk,
       claudeReady,
       claudeMsg: redactHome(claudeMsg),
+      // What the agents may do on this machine (modes only, no paths).
+      agentPolicy: policySummary(AGENT_POLICY),
+      update: {
+        mode: UPDATE_POLICY.mode,
+        pin: UPDATE_POLICY.pin,
+        window: UPDATE_POLICY.window?.label || null,
+        available: updateAvailable,
+      },
       activeChildren: [...runtime.values()].filter((r) => r.inflight?.proc || r.inflight?.warm).length,
     });
   }
@@ -1643,7 +1673,21 @@ function makeStreamSink(engine, rt, inflight) {
       broadcast(rt, { type: "error", message: msg, assistantMessageId: inflight.assistantId });
     },
     onUsage: (ev) => applyResultUsage(rt, ev, engine),
+    onPermissionDenied: (names) => emitDeniedNotice(rt, inflight, engine, names),
   };
+}
+
+/**
+ * The permission policy refused a tool call. The CLI reports it in its own
+ * words to the model, but the user should not have to read that between the
+ * lines (or, with Antigravity, get no text at all): one plain sentence goes at
+ * the end of the answer, stored with it like any other text.
+ */
+function emitDeniedNotice(rt, inflight, engine, names) {
+  const notice = deniedNotice(engine.label, names);
+  if (!notice) return;
+  log("info", "tool_denied_by_policy", { sid: rt.sid, engine: engine.id, tools: [...new Set(names)].slice(0, 10).join(",") });
+  emitChunk(rt, inflight, (inflight.content ? "\n\n" : "") + notice);
 }
 
 function handleStreamLine(line, rt, inflight, engine) {
@@ -1727,6 +1771,16 @@ function spawnInflight(rt, sess, prompt, assistantId, userMessageId = null, engi
   // Session-Zeile) landet auf der Standard-Engine, statt den Turn scheitern zu
   // lassen; das war vor der Registry der Sinn des `else`-Zweigs der if-Kette.
   const engineDef = resolveEngine(engine || rt.engine || sess.engine || DEFAULT_ENGINE_ID);
+  // Switched off or misconfigured by the operator: say so before anything
+  // runs. Never fall back to another engine, that would bypass the decision.
+  const blocked = enginePolicyBlock(engineDef);
+  if (blocked) {
+    log("warn", "turn_blocked_by_policy", { sid: rt.sid, engine: engineDef.id });
+    try { setMessageStatus(rt.sid, assistantId, "error"); } catch {}
+    broadcast(rt, { type: "error", message: blocked, assistantMessageId: assistantId });
+    maybeFlushQueue(rt);
+    return;
+  }
   // Der Warm-Pool ist eine Eigenschaft der Engine, keine Eigenschaft des
   // Turns: nur eine CLI, die einen langlebigen Prozess mit stream-json-Eingabe
   // beherrscht, kann darüber laufen. Ist er abgeschaltet (CONDUIT_WARM=0),
@@ -1858,6 +1912,7 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null) 
         emitActivityStart(rt, inflight, block);
       },
       onToolResult: (block) => { armStall(); emitActivityEnd(rt, inflight, block); },
+      onPermissionDenied: (names) => emitDeniedNotice(rt, inflight, CLAUDE_ENGINE, names),
       onUsageEvent: (ev) => { armStall(); applyResultUsage(rt, ev); },
       onDone: () => finishTurn(null),
       onError: (msg, info) => {
@@ -2684,13 +2739,32 @@ function activeTurns() {
 // the next tick retries. Without a supervisor we leave the new files applied for
 // the next manual restart instead of exiting into a stopped bridge.
 let selfUpdateRunning = false;
+// With a maintenance window the timer ticks every few minutes and the check
+// runs once per window; this remembers which window already had its check.
+let lastUpdateWindowKey = null;
 async function maybeSelfUpdate() {
   if (!SELFUPDATE || selfUpdateRunning) return;
+  // Reporting changes nothing on this machine, so it needs no window. Only
+  // installing waits for it.
+  const installing = UPDATE_POLICY.mode === "install";
+  const win = installing ? UPDATE_POLICY.window : null;
+  if (win) {
+    const now = new Date();
+    if (!inUpdateWindow(win, now)) return;
+    if (lastUpdateWindowKey === updateWindowKey(win, now)) return;
+  }
   if (activeTurns() > 0) return;
   selfUpdateRunning = true;
   try {
-    const r = await checkAndStage({ url: UPDATE_URL, log });
-    if (!r.updated) { log("info", "selfupdate_checked", { running: r.from, origin: r.to }); return; }
+    const r = await checkAndStage({ url: UPDATE_URL, log, apply: installing, maxVersion: UPDATE_POLICY.pin });
+    // The window is used up once the origin gave a definite answer (newer
+    // release installed or held, or nothing newer). A busy bridge (above), a
+    // failed download or a rejected package tries again on the next tick.
+    if (win && (r.updated || r.available || r.reason === "up-to-date")) lastUpdateWindowKey = updateWindowKey(win, new Date());
+    if (r.available) updateAvailable = r.to;
+    else if (r.reason === "up-to-date") updateAvailable = null;
+    if (!r.updated) { log("info", "selfupdate_checked", { running: r.from, origin: r.to, mode: UPDATE_POLICY.mode, held: !!r.held }); return; }
+    updateAvailable = null;
     log("info", "selfupdate_done", r);
     if (activeTurns() > 0) return;             // a turn started during npm install
     if (isSupervised()) {
@@ -2705,6 +2779,28 @@ async function maybeSelfUpdate() {
     selfUpdateRunning = false;
   }
 }
+
+// Retention and service log rotation, hourly and once shortly after boot.
+// Sessions with a running or queued turn are skipped this round.
+function runHousekeeping() {
+  const keep = new Set();
+  for (const [sid, r] of runtime) {
+    if ((r.inflight && !r.inflight.done) || r.promptQueue?.length) keep.add(sid);
+  }
+  try {
+    const purged = purgeExpiredHistory(historyDb, { chatDays: HOUSEKEEPING.chatDays, auditDays: HOUSEKEEPING.auditDays, keep });
+    if (purged.sessions || purged.audit) log("info", "retention_purged", purged);
+  } catch (e) { log("error", "retention_failed", { err: String(e?.message || e) }); }
+  try {
+    const n = gcPasteDir();
+    if (n) log("info", "paste_retention_purged", { files: n });
+  } catch {}
+  try {
+    const rotated = rotateServiceLogs(HOUSEKEEPING.serviceLogDir, HOUSEKEEPING.serviceLogMaxBytes, HOUSEKEEPING.serviceLogFiles);
+    if (rotated.length) log("info", "service_logs_rotated", { count: rotated.length });
+  } catch {}
+}
+if (HOUSEKEEPING.chatDays > 0 || HOUSEKEEPING.auditDays > 0) enableSecureDelete(historyDb);
 
 function killAllInflightChildren() {
   // warmPool.killAll() only covers pooled procs. One-shot children (the fallback
@@ -2738,12 +2834,31 @@ server.listen(PORT, HOST, () => {
   // mid-tool (crash/kill/self-update). Close them so the audit trail has no
   // permanently ambiguous entries.
   try { const swept = sweepStaleRunningAudit(); if (swept) log("info", "audit_swept_stale", { count: swept }); } catch {}
+  setTimeout(runHousekeeping, 60_000).unref?.();
+  setInterval(runHousekeeping, 60 * 60_000).unref?.();
+  log("info", "housekeeping_policy", {
+    chatDays: HOUSEKEEPING.chatDays, auditDays: HOUSEKEEPING.auditDays, pasteDays: HOUSEKEEPING.pasteDays,
+    logMaxBytes: MAX_LOG_BYTES, logFiles: MAX_LOG_FILES, logStdout: HOUSEKEEPING.logStdout,
+    serviceLogMaxBytes: HOUSEKEEPING.serviceLogMaxBytes, serviceLogFiles: HOUSEKEEPING.serviceLogFiles,
+  });
   // Warm the auth-readiness cache so the first healthz already knows the truth.
   setTimeout(() => { try { probeClaude(); } catch {} }, 1500);
   // Self-update: first check shortly after boot (idle), then on a slow interval.
   if (SELFUPDATE) {
+    log("info", "selfupdate_policy", {
+      mode: UPDATE_POLICY.mode, pin: UPDATE_POLICY.pin, window: UPDATE_POLICY.window?.label || null,
+    });
     setTimeout(() => { maybeSelfUpdate(); }, 45_000);
-    const iv = setInterval(() => { maybeSelfUpdate(); }, SELFUPDATE_INTERVAL_MS);
+    // A window of a few hours would be missed by a 6-hour tick. Inside the
+    // window the check still runs once (see maybeSelfUpdate).
+    const tick = UPDATE_POLICY.mode === "install" && UPDATE_POLICY.window
+      ? Math.min(SELFUPDATE_INTERVAL_MS, 5 * 60_000)
+      : SELFUPDATE_INTERVAL_MS;
+    const iv = setInterval(() => { maybeSelfUpdate(); }, tick);
     iv.unref?.();
   }
+  // As one string: the log drops a key named "claude" (see LOG_DROP).
+  log("info", "agent_policy", { policy: JSON.stringify(policySummary(AGENT_POLICY)) });
+  for (const [engine, err] of Object.entries(AGENT_POLICY.errors)) log("error", "agent_policy_invalid", { engine, err });
+  for (const err of [...UPDATE_POLICY.errors, ...HOUSEKEEPING.errors]) log("error", "config_invalid", { err });
 });

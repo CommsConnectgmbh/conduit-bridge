@@ -162,6 +162,40 @@ test("signature by another key, missing signature, link members and older versio
   assert.deepEqual(tree(dir), before);
 });
 
+test("notify only: a signed newer release is reported, nothing is installed", async () => {
+  const dir = install(V3);
+  const before = tree(dir);
+  const url = publish({ "package.json": pkg("3.1.0"), "src/server.mjs": "// 3.1.0" });
+  const r = await checkAndStage(opts(url, dir, { apply: false }));
+  assert.equal(r.updated, false);
+  assert.equal(r.available, true);
+  assert.equal(r.to, "3.1.0");
+  assert.deepEqual(tree(dir), before);
+  // Reporting still requires the signature: a release signed by another key
+  // is not "available", it is rejected.
+  const forged = await checkAndStage(opts(publish({ "package.json": pkg("3.2.0"), "src/server.mjs": "x" }, { key: other.privateKey }), dir, { apply: false }));
+  assert.equal(forged.available, undefined);
+  assert.match(forged.reason, /signature rejected/);
+  assert.deepEqual(tree(dir), before);
+});
+
+test("a pinned version holds back anything newer and installs up to it", async () => {
+  const dir = install(V3);
+  const before = tree(dir);
+  let r = await checkAndStage(opts(publish({ "package.json": pkg("3.2.0"), "src/server.mjs": "// 3.2.0" }), dir, { maxVersion: "3.1.0" }));
+  assert.equal(r.updated, false);
+  assert.equal(r.held, true);
+  assert.equal(r.available, true);
+  assert.deepEqual(tree(dir), before);
+  r = await checkAndStage(opts(publish({ "package.json": pkg("3.1.0"), "src/server.mjs": "// 3.1.0" }), dir, { maxVersion: "3.1.0" }));
+  assert.equal(r.updated, true);
+  assert.equal(readFileSync(join(dir, "src/server.mjs"), "utf8"), "// 3.1.0");
+  // A pin below the running version installs nothing and never downgrades.
+  r = await checkAndStage(opts(publish({ "package.json": pkg("3.3.0"), "src/server.mjs": "// 3.3.0" }), dir, { maxVersion: "3.0.0" }));
+  assert.equal(r.updated, false);
+  assert.equal(readFileSync(join(dir, "src/server.mjs"), "utf8"), "// 3.1.0");
+});
+
 test("npm is found next to the node binary, never through a shell", () => {
   const layout = (rel) => {
     const d = mkdtempSync(join(root, "node-"));

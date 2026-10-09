@@ -43,7 +43,12 @@ const SYSTEM_HINT =
  * @param {number} [o.timeoutMs] budget for the whole request, re-init included, not per spawn
  * @param {(args: string[], opts: object) => import("node:child_process").ChildProcess} [o.spawnClaude]
  */
-export function createAlexaSession({ claudeBin, cwd, stateDir, model, log, timeoutMs = 26_000, spawnClaude }) {
+export function createAlexaSession({
+  claudeBin, cwd, stateDir, model, log, timeoutMs = 26_000, spawnClaude,
+  // The bridge's permission policy (agent-policy.mjs); the default is the
+  // behaviour before the policy existed.
+  permissionArgs = ["--permission-mode", "bypassPermissions"],
+}) {
   const stateFile = join(stateDir, ".alexa-session.json");
   const legacyFlag = join(stateDir, ".alexa-session-inited");
   const run = spawnClaude || ((args, opts) => spawn(claudeBin, args, opts));
@@ -95,7 +100,7 @@ export function createAlexaSession({ claudeBin, cwd, stateDir, model, log, timeo
   /** One CLI run. Resolves exactly once; never rejects. */
   function runClaude(prompt, sessionArgs, budgetMs) {
     const args = ["-p", prompt, "--model", model, "--output-format", "stream-json", "--verbose",
-      "--permission-mode", "bypassPermissions", ...sessionArgs];
+      ...permissionArgs, ...sessionArgs];
     return new Promise((resolve) => {
       let child;
       try {

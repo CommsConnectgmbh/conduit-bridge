@@ -112,6 +112,9 @@ test("pair via the loopback page, then RPC and chat inside the session", async (
   };
   const st = await call("GET", "/api/status");
   assert.equal(st.head.status, 200); assert.equal(st.body.ok, true); assert.match(st.body.fingerprint, /^[0-9a-f]{4}( [0-9a-f]{4}){3}$/);
+  // Operator settings are visible to the paired owner: defaults here.
+  assert.deepEqual(st.body.agentPolicy, { claude: "bypassPermissions", codex: "bypass", gemini: "bypass", disabled: [], misconfigured: [] });
+  assert.deepEqual(st.body.update, { mode: "off", pin: null, window: null, available: null });
   const devs = await call("GET", "/api/e2e/devices");
   assert.equal(devs.body.devices.length, 1); assert.equal(devs.body.devices[0].current, true); assert.equal(devs.body.devices[0].label, "itest");
   const sessions = await call("GET", "/api/sessions");
