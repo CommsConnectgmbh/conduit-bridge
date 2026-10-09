@@ -27,6 +27,26 @@ Self-updates accept only packages signed with the pinned release key. See [RELEA
 
 Report security issues to [hi@tryconduit.de](mailto:hi@tryconduit.de).
 
+## Settings for companies
+
+All settings are environment variables in `.env.local` in the bridge directory. Without them the bridge behaves as before. [docs/ENTERPRISE.md](docs/ENTERPRISE.md) lists every variable, the network connections, the local data and how to run the engines on company accounts.
+
+- **Agent permissions.** By default Claude Code, Codex and Antigravity run every tool without asking. `CONDUIT_CLAUDE_PERMISSION_MODE`, `CONDUIT_CLAUDE_ALLOWED_TOOLS`, `CONDUIT_CLAUDE_DISALLOWED_TOOLS`, `CONDUIT_CLAUDE_SETTINGS`, `CONDUIT_CODEX_SANDBOX`, `CONDUIT_AGY_PERMISSIONS`, `CONDUIT_AGY_SANDBOX` and `CONDUIT_DISABLED_ENGINES` restrict them with the options of each CLI. A refused tool call is reported in the answer. An invalid value blocks the engine.
+- **Updates.** `CONDUIT_SELFUPDATE=notify` only reports a newer release, `CONDUIT_UPDATE_PIN` installs nothing newer than a given version, and `CONDUIT_UPDATE_WINDOW` limits installs to a time range. The signature check always applies.
+- **Local data.** `CONDUIT_RETENTION_DAYS`, `CONDUIT_AUDIT_RETENTION_DAYS` and `CONDUIT_PASTE_RETENTION_DAYS` set retention periods. `CONDUIT_LOG_*` and `CONDUIT_SERVICE_LOG_*` control log rotation.
+
+## Uninstall
+
+The bridge ships an uninstaller for each platform. It lists everything before removing anything. By default it removes the services and the program and keeps chats, keys, configuration, logs and models. Add `--purge` (`-Purge` on Windows) to delete them too, or use `--dry-run` (`-DryRun`) to only see the list.
+
+```bash
+bash ~/.conduit/bridge/src/uninstall.sh            # macOS, Linux
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "$HOME\.conduit\bridge\src\uninstall.ps1"   # Windows
+```
+
 ## Local speech
 
 Optional speech recognition and synthesis run on your computer:
