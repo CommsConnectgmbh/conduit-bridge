@@ -17,7 +17,7 @@ The installer writes `~/.conduit/bridge/.env.local` (Windows: `%USERPROFILE%\.co
 Notes:
 
 - Self-updates replace `src/`, `node_modules/` and the package files. They do not touch `.env.local`.
-- **Re-running the installer rewrites `.env.local`** with the installer's values. Settings from this document must be added again afterwards.
+- **Re-running the installer** updates only its own keys in `.env.local` (`BRIDGE_HOST`, `BRIDGE_PORT`, `PAIR_PORT`, `CLAUDE_BIN`, `DB_DIR`, `PAIR_PUBLIC_HOST`, `PAIR_APP_BASE`, `CONDUIT_SUPERVISED`, `PAIR_OWNER_EMAIL`) and keeps every other line as it is, including the settings from this document. Installers from before October 2026 rewrote the whole file.
 - The user who owns the machine account can edit `.env.local`. These settings are an operator configuration, not protection against that user. For Claude Code, policies the user cannot change belong in Claude Code's managed settings (see Anthropic's documentation); the bridge does not override them.
 - The bridge logs the active agent, update and retention settings at startup (`agent_policy`, `selfupdate_policy`, `housekeeping_policy` in `bridge.log`). The paired owner can also see them in the app's status call (`/api/status`: `agentPolicy`, `update`).
 
