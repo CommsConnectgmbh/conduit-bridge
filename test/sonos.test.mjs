@@ -175,7 +175,7 @@ test("playClip: subscribes, sends the clip without an output-only clip type, wai
   } finally { await sp.close(); }
 });
 
-test("playClip: refusal, foreign answers and silence before acceptance reject (safe to retry)", async () => {
+test("playClip: refusal or no connection reject (nothing played, safe to retry)", async () => {
   const refuse = await fakeSpeaker((h, b, send) => {
     if (h.command === "loadAudioClip") send([{ response: "loadAudioClip", success: false, cmdId: h.cmdId }, { errorCode: "ERROR_DISALLOWED_BY_POLICY" }]);
   });
@@ -183,20 +183,52 @@ test("playClip: refusal, foreign answers and silence before acceptance reject (s
     await assert.rejects(playClip({ playerId: "P", streamUrl: "u", volume: 10, connect: refuse.connect }), /refused the clip: ERROR_DISALLOWED_BY_POLICY/);
   } finally { await refuse.close(); }
 
+  // A server that never completes the WebSocket handshake: nothing is sent.
+  const tcp = (await import("node:net")).createServer(() => {});
+  await new Promise((r) => tcp.listen(0, "127.0.0.1", r));
+  try {
+    const connect = () => new WebSocket(`ws://127.0.0.1:${tcp.address().port}`, "v1.api.smartspeaker.audio");
+    await assert.rejects(playClip({ playerId: "P", streamUrl: "u", volume: 10, connect, timeoutMs: 300 }), /did not answer/);
+  } finally { tcp.close(); }
+});
+
+test("playClip: once sent, no answer, a lost acknowledgement or a foreign answer give UNKNOWN, never a retry", async () => {
+  const silent = await fakeSpeaker(() => {});
+  try {
+    assert.equal(await playClip({ playerId: "P", streamUrl: "u", volume: 10, connect: silent.connect, timeoutMs: 100, playTimeoutMs: 100 }), "UNKNOWN");
+  } finally { await silent.close(); }
+
+  // The speaker schedules the clip, then the line drops before its answer.
+  const lost = await fakeSpeaker((h, b, send, ws) => { if (h.command === "loadAudioClip") ws.terminate(); });
+  try {
+    assert.equal(await playClip({ playerId: "P", streamUrl: "u", volume: 10, connect: lost.connect }), "UNKNOWN");
+  } finally { await lost.close(); }
+
   const other = await fakeSpeaker((h, b, send) => { if (h.command === "loadAudioClip") send([{ response: "loadAudioClip", success: true, cmdId: "not-ours" }, { id: "x" }]); });
   try {
-    await assert.rejects(playClip({ playerId: "P", streamUrl: "u", volume: 10, connect: other.connect, timeoutMs: 300 }), /did not answer/);
+    assert.equal(await playClip({ playerId: "P", streamUrl: "u", volume: 10, connect: other.connect, timeoutMs: 100, playTimeoutMs: 100 }), "UNKNOWN");
   } finally { await other.close(); }
 
   const noId = await fakeSpeaker((h, b, send) => { if (h.command === "loadAudioClip") send([{ response: "loadAudioClip", success: true, cmdId: h.cmdId }, {}]); });
   try {
-    await assert.rejects(playClip({ playerId: "P", streamUrl: "u", volume: 10, connect: noId.connect }), /refused/);
+    assert.equal(await playClip({ playerId: "P", streamUrl: "u", volume: 10, connect: noId.connect }), "UNKNOWN");
   } finally { await noId.close(); }
+});
 
-  const silent = await fakeSpeaker(() => {});
+test("playClip: INTERRUPTED ends the wait at once; malformed status frames are ignored, not thrown", async () => {
+  const cut = await fakeSpeaker((h, b, send) => {
+    if (h.command !== "loadAudioClip") return;
+    send(accepted(h));
+    send([{ type: "audioClipStatus" }, { audioClips: {} }], 20);
+    send([{ type: "audioClipStatus" }, { audioClips: [null, 5, "x", { id: 7 }] }], 40);
+    send([{ type: "audioClipStatus" }, null], 60);
+    send(status("clip-1", "INTERRUPTED"), 100);
+  });
   try {
-    await assert.rejects(playClip({ playerId: "P", streamUrl: "u", volume: 10, connect: silent.connect, timeoutMs: 300 }), /did not answer/);
-  } finally { await silent.close(); }
+    const t0 = Date.now();
+    assert.equal(await playClip({ playerId: "P", streamUrl: "u", volume: 10, connect: cut.connect, playTimeoutMs: 5000 }), "INTERRUPTED");
+    assert.ok(Date.now() - t0 < 1000);
+  } finally { await cut.close(); }
 });
 
 test("playClip: after acceptance it never rejects; no status in time or a dropped line give UNKNOWN", async () => {

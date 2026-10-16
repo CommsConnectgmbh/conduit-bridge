@@ -99,11 +99,14 @@ test("announce: never rejects; no speaker, no voice or a dead speaker are logged
   assert.match(mute.logs.at(-1).d.err, /no voice/);
   assert.equal(mute.calls.play.length, 0);
 
-  // Accepted but not played to the end: reported, never played a second time.
+  // Sent but not played to the end (or unknown): reported, never sent a second time.
   const cut = rig({ endStatus: "DISMISSED" });
   assert.equal(await cut.speaker.announce("Test."), false);
   assert.equal(cut.calls.play.length, 1);
   assert.match(cut.logs.at(-1).d.err, /DISMISSED/);
+  const unsure = rig({ endStatus: "UNKNOWN" });
+  assert.equal(await unsure.speaker.announce("Test."), false);
+  assert.equal(unsure.calls.play.length, 1);
 
   const dead = rig({ playFails: 5 });
   assert.equal(await dead.speaker.announce("Test."), false);

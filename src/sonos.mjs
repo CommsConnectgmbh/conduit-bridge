@@ -249,15 +249,17 @@ export function createClipHost({ ttlMs = 5 * 60_000, log = () => {} } = {}) {
   };
 }
 
-const CLIP_DONE = new Set(["DONE", "ERROR", "DISMISSED"]);
+// Final clip states; INTERRUPTED: another clip (an alarm, Alexa) cut in.
+const CLIP_DONE = new Set(["DONE", "ERROR", "DISMISSED", "INTERRUPTED"]);
 
 /**
  * Play `streamUrl` as an audio clip on a player and wait until it has been
- * played. Rejects if the speaker cannot be reached, is not the player
- * (checkSonosCert) or refuses the clip: then nothing was played and trying
- * again is safe. Once the clip is accepted it resolves with its final status
- * ("DONE", "ERROR", "DISMISSED", or "UNKNOWN" when no status came within
- * `playTimeoutMs`).
+ * played. Rejects only when the clip was certainly not played: the speaker
+ * could not be reached, is not the player (checkSonosCert), or refused the
+ * clip; trying again is then safe. Once the clip has been sent it resolves
+ * with its final status ("DONE", "ERROR", "DISMISSED", "INTERRUPTED"), or
+ * "UNKNOWN" when the line dropped or no status came within `playTimeoutMs`:
+ * the speaker may be playing it, so it is not sent twice.
  */
 export function playClip({ websocketUrl, playerId, streamUrl, volume, timeoutMs = 5000, playTimeoutMs = 60_000, connect }) {
   return new Promise((resolve, reject) => {
@@ -273,6 +275,7 @@ export function playClip({ websocketUrl, playerId, streamUrl, volume, timeoutMs 
     const subId = randomBytes(4).toString("hex");
     const cmdId = randomBytes(4).toString("hex");
     let clipId = null;
+    let sent = false;
     let verified = !!connect; // stand-in connections in tests are plain
     let settled = false;
     let timer = setTimeout(() => finish(new Error("speaker did not answer")), timeoutMs);
@@ -281,10 +284,9 @@ export function playClip({ websocketUrl, playerId, streamUrl, volume, timeoutMs 
       settled = true;
       clearTimeout(timer);
       try { ws.terminate ? ws.terminate() : ws.close(); } catch {}
-      if (clipId && !err) return resolve(status);
-      // After acceptance an error ends the wait, but the clip is not repeated.
-      if (clipId) return resolve("UNKNOWN");
-      reject(err);
+      if (err?.refused || !sent) return reject(err);
+      // Sent: an error only ends the wait, the clip may be playing.
+      resolve(err ? "UNKNOWN" : status);
     }
     ws.on("upgrade", (res) => {
       if (connect) return;
@@ -300,6 +302,10 @@ export function playClip({ websocketUrl, playerId, streamUrl, volume, timeoutMs 
         { namespace: "audioClip:1", command: "loadAudioClip", playerId, cmdId },
         { name: "Conduit", appId: "de.tryconduit.bridge", streamUrl, volume, priority: "LOW" },
       ]));
+      sent = true;
+      // From here on the wait covers acknowledgement and playback.
+      clearTimeout(timer);
+      timer = setTimeout(() => finish(null, "UNKNOWN"), timeoutMs + playTimeoutMs);
     });
     ws.on("message", (raw) => {
       let msg;
@@ -307,16 +313,20 @@ export function playClip({ websocketUrl, playerId, streamUrl, volume, timeoutMs 
       const [header, body] = Array.isArray(msg) ? msg : [];
       if (!header) return;
       if (header.cmdId === cmdId) {
-        if (header.success !== true || header.response !== "loadAudioClip" || typeof body?.id !== "string") {
-          return finish(new Error(`speaker refused the clip: ${String(body?.errorCode || body?.reason || "unknown").slice(0, 80)}`));
+        if (header.success !== true || header.response !== "loadAudioClip") {
+          const e = new Error(`speaker refused the clip: ${String(body?.errorCode || body?.reason || "unknown").slice(0, 80)}`);
+          e.refused = true;
+          return finish(e);
         }
+        // Accepted; without an id its status cannot be followed.
+        if (typeof body?.id !== "string") return finish(null, "UNKNOWN");
         clipId = body.id;
         clearTimeout(timer);
         timer = setTimeout(() => finish(null, "UNKNOWN"), playTimeoutMs);
         return;
       }
-      if (clipId && header.type === "audioClipStatus") {
-        const mine = (body?.audioClips || []).find((c) => c?.id === clipId);
+      if (clipId && header.type === "audioClipStatus" && Array.isArray(body?.audioClips)) {
+        const mine = body.audioClips.find((c) => c && typeof c === "object" && c.id === clipId);
         if (mine && CLIP_DONE.has(mine.status)) finish(null, mine.status);
       }
     });
