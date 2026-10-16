@@ -6,7 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  ANNOUNCE_PREFIX, BUSY_TEXT, HANDOFF_TEXT, REPLY_HINT, handleAlexaRequest, questionOf, spokenResult,
+  ANNOUNCE_PREFIX, BUSY_TEXT, HANDOFF_TEXT, REPLY_HINT, TASK_VERBS, handleAlexaRequest, questionOf, spokenResult,
 } from "../src/alexa.mjs";
 
 const SKILL = "amzn1.ask.skill.test";
@@ -143,6 +143,22 @@ test("empty question, wrong skill and foreign account are still refused before a
   const foreign = req("AskConduitIntent", "x");
   foreign.session.user.userId = "amzn1.ask.account.someone";
   assert.match(said(await handleAlexaRequest(foreign, deps)), /anderen Konto/);
+});
+
+test("task verbs: the verb Alexa drops from the slot comes back in front of the rest", async () => {
+  const asked = [];
+  const deps = { skillId: SKILL, userId: USER, log: () => {}, fetchImpl: async () => ({}), ask: async (q) => { asked.push(q); return ok("Gut."); } };
+  await handleAlexaRequest(req("TaskSchreibIntent", "eine Mail an Peter, dass ich später komme"), deps);
+  await handleAlexaRequest(req("TaskFassIntent", "meine Mails von heute zusammen"), deps);
+  await handleAlexaRequest(req("TaskPruefIntent", "ob der Build durch ist"), deps);
+  assert.deepEqual(asked, ["Schreib eine Mail an Peter, dass ich später komme", "Fass meine Mails von heute zusammen", "Prüf ob der Build durch ist"]);
+  for (const [intent, verb] of Object.entries(TASK_VERBS)) assert.equal(questionOf(intent, "x"), `${verb} x`);
+  // Only the verb, nothing to do with it: asked again, nothing runs.
+  assert.match(said(await handleAlexaRequest(req("TaskMachIntent", ""), deps)), /nicht verstanden/);
+  assert.equal(asked.length, 3);
+  // Names from the prototype chain are no intents.
+  assert.equal(questionOf("constructor", "x"), null);
+  assert.equal(questionOf("toString", "x"), null);
 });
 
 test("spokenResult: answer, question back with the reply hint, timeout, failure", () => {
