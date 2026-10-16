@@ -13,7 +13,7 @@
 // this computer over the LAN, under a random one-time path, from a listener
 // that exists only while a clip is pending. Nothing goes through the tunnel.
 import { createSocket } from "node:dgram";
-import { randomBytes } from "node:crypto";
+import { X509Certificate, createPublicKey, randomBytes } from "node:crypto";
 import http from "node:http";
 import https from "node:https";
 import { isIPv4 } from "node:net";
@@ -99,21 +99,60 @@ export function fetchLocalJson(ip, path, { timeoutMs = 3000, port = 1443 } = {})
 
 const SONOS_ROOT_CN = "Sonos Device Authentication Root CA";
 
+// Public key of the "Sonos Device Authentication Root CA" (RSA 4096), the
+// authority that signs every Sonos player's own certificate. Sonos does not
+// publish the CA certificate, and the players send only their own one, so the
+// key was recovered from the signatures of five genuine players' certificates
+// (tools/sonos-device-ca/): it verifies all of them, which no key but the
+// CA's can. Pinned like the update key: a speaker counts only if its
+// certificate is signed by this key and names the player.
+export const SONOS_DEVICE_CA_PUBKEY = `-----BEGIN PUBLIC KEY-----
+MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAmD9KTh18STYwKRFtbJda
+V2ZrctBwCJwwDu+btcMmswZoLUXkFSvjkq1t55taG4WSGmcu7bM+6BIFSO/aT8BU
+nhGvcLKGhuVM34mrErua7H/rOchi+55zeufJzRCFQ2QCXYehQF8yLdk7LwamKex3
+TuumQRAW/VCufOPFpW0Jyxcmm+GYobgh5JcVc3jrGpSw4kFnV4ZjPRh2q/4Mva7n
+yr5ksJVz4oYVOSoMKCva1vaSG/GwG0097okX0IfEph9ONQk9vGF0gyi7z542vMW4
+oCFRtK/BaMPS+xe2s+JVtTmiLrMzW3o1I3fvcsOHwR3oPXBMHK5KpJJSK7aY8gyK
+cDfHQX+xX5FAUIR5W0Ml9+z7ApfKW6SrDKxL4w20yVvPd7JZiI539Fy2KgK/iTrC
+mQ7PVUERA5iSQFFiis/R9SfxHfqyHezhpgA9Q3lg5x7ILM1Pt/Hkuk3LHHYrqK/k
+feFm/pkhoFS+q1lrC01uJW5nGHCmAreSjMnK/G1cOJA8RyiZmVanLoOxn8jKXMvG
+pRPTYLMGjEjTKSjy/1wAZr3C5ndztca9eZuVEq5Hb2tVPzvdDy7u9x9VMP6ho8ei
+gSo8oEQz5YKy0Rgb/sh3d/ubtM7Qg+QIPUfcU8auT3qf1MAOF0wGW7LjnXR9pYPt
+4jGLA7mxKkpinVgwyvltMxsCAwEAAQ==
+-----END PUBLIC KEY-----`;
+let caKey = null;
+const sonosCaKey = () => (caKey ??= createPublicKey(SONOS_DEVICE_CA_PUBKEY));
+
+/** "CN=…\nOU=…" (X509Certificate.subject / .issuer) to { CN, OU, … }. */
+function dn(text) {
+  const out = {};
+  for (const line of String(text || "").split("\n")) {
+    const i = line.indexOf("=");
+    if (i > 0 && !(line.slice(0, i) in out)) out[line.slice(0, i)] = line.slice(i + 1);
+  }
+  return out;
+}
+
 /**
- * Does the certificate a speaker presented belong to player `playerId`?
- * Sonos issues every player a certificate from its device CA with the
- * player's MAC address as common name (RINCON_<MAC>01400). The CA itself is
- * not published, so the chain cannot be verified: this check turns away any
- * device that is not presenting a certificate for this very player, but not
- * one that forges all of these fields. Returns null or the reason.
+ * Is `der` (the certificate a speaker presented) Sonos' certificate for
+ * player `playerId`? Signed by the Sonos device CA, issued to the player's
+ * MAC address (RINCON_<MAC>01400), and valid now. Returns null or the reason.
+ * `ca` exists for the tests only.
  */
-export function checkSonosCert(cert, playerId, now = Date.now()) {
+export function checkSonosCert(der, playerId, { now = Date.now(), ca } = {}) {
   const m = /^RINCON_([0-9A-F]{12})\d{5}$/.exec(String(playerId || ""));
   if (!m) return "not a Sonos player id";
-  if (!cert || !cert.subject || !cert.issuer) return "no certificate";
-  if (cert.issuer.CN !== SONOS_ROOT_CN || cert.issuer.O !== "Sonos, Inc") return "certificate not issued by Sonos";
-  if (cert.subject.OU !== "Sonos Devices" || String(cert.subject.CN).toUpperCase() !== m[1]) return "certificate belongs to another device";
-  const from = Date.parse(cert.valid_from), to = Date.parse(cert.valid_to);
+  if (!Buffer.isBuffer(der) || !der.length) return "no certificate";
+  let x;
+  try { x = new X509Certificate(der); } catch { return "no certificate"; }
+  let signed = false;
+  try { signed = x.verify(ca || sonosCaKey()); } catch { signed = false; }
+  if (!signed) return "certificate not issued by Sonos";
+  const issuer = dn(x.issuer), subject = dn(x.subject);
+  if (issuer.CN !== SONOS_ROOT_CN) return "certificate not issued by Sonos";
+  if (subject.OU !== "Sonos Devices" || String(subject.CN).toUpperCase() !== m[1]) return "certificate belongs to another device";
+  // validFrom/validTo strings: validFromDate exists only from Node 22.10 on.
+  const from = Date.parse(x.validFrom), to = Date.parse(x.validTo);
   if (!(from <= now && now <= to)) return "certificate expired or not yet valid";
   return null;
 }
@@ -267,8 +306,9 @@ export function playClip({ websocketUrl, playerId, streamUrl, volume, timeoutMs 
       ? connect(websocketUrl)
       : new WebSocket(websocketUrl, "v1.api.smartspeaker.audio", {
         headers: { "X-Sonos-Api-Key": SONOS_LOCAL_API_KEY },
-        // The device CA is not public; the certificate is checked by hand on
-        // "upgrade", before anything is sent.
+        // There is no CA certificate to hand to TLS; the speaker's certificate
+        // is checked against the pinned CA key on "upgrade", before anything
+        // is sent (checkSonosCert).
         rejectUnauthorized: false,
         handshakeTimeout: timeoutMs,
       });
@@ -290,7 +330,9 @@ export function playClip({ websocketUrl, playerId, streamUrl, volume, timeoutMs 
     }
     ws.on("upgrade", (res) => {
       if (connect) return;
-      const why = checkSonosCert(res.socket?.getPeerCertificate?.(), playerId);
+      let why;
+      // An exception in this listener would escape the promise.
+      try { why = checkSonosCert(res.socket?.getPeerCertificate?.()?.raw, playerId); } catch (e) { why = String(e?.message || e); }
       if (why) return finish(new Error(`speaker not trusted: ${why}`));
       verified = true;
     });

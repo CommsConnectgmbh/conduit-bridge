@@ -13,7 +13,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocketServer } from "ws";
 import WebSocket from "ws";
-import { checkSonosCert, choosePlayer, createClipHost, fetchLocalJson, isPrivateIPv4, localAddressFor, playClip } from "../src/sonos.mjs";
+import { X509Certificate, createPublicKey } from "node:crypto";
+import { SONOS_DEVICE_CA_PUBKEY, checkSonosCert, choosePlayer, createClipHost, fetchLocalJson, isPrivateIPv4, localAddressFor, playClip } from "../src/sonos.mjs";
 
 const player = (id, name, caps, host = "192.168.178.23") => ({
   id, name, capabilities: caps, websocketUrl: `wss://${host}:1443/websocket/api`,
@@ -253,21 +254,55 @@ test("playClip: an unreachable speaker rejects instead of hanging", async () => 
   await assert.rejects(playClip({ playerId: "P", streamUrl: "u", volume: 10, connect, timeoutMs: 2000 }));
 });
 
-test("checkSonosCert: only the player's own Sonos certificate passes", () => {
-  const now = Date.parse("2026-10-16T12:00:00Z");
-  const good = {
-    subject: { CN: "7828CA00CD98", OU: "Sonos Devices", O: "Sonos, Inc" },
-    issuer: { CN: "Sonos Device Authentication Root CA", O: "Sonos, Inc", OU: "Sonos Devices" },
-    valid_from: "Feb 14 12:10:11 2026 GMT", valid_to: "Mar 14 12:09:11 2027 GMT",
-  };
-  assert.equal(checkSonosCert(good, "RINCON_7828CA00CD9801400", now), null);
-  assert.match(checkSonosCert(good, "RINCON_74CA60A9D77401400", now), /another device/);
-  assert.match(checkSonosCert({ ...good, issuer: { CN: "Evil CA", O: "Sonos, Inc" } }, "RINCON_7828CA00CD9801400", now), /not issued by Sonos/);
-  assert.match(checkSonosCert({ ...good, subject: { ...good.subject, OU: "Other" } }, "RINCON_7828CA00CD9801400", now), /another device/);
-  assert.match(checkSonosCert(good, "RINCON_7828CA00CD9801400", Date.parse("2027-04-01T00:00:00Z")), /expired/);
-  assert.match(checkSonosCert({}, "RINCON_7828CA00CD9801400", now), /no certificate/);
-  assert.match(checkSonosCert(undefined, "RINCON_7828CA00CD9801400", now), /no certificate/);
-  assert.match(checkSonosCert(good, "../../etc", now), /not a Sonos player id/);
+/**
+ * A stand-in Sonos CA and certificates issued by it (openssl), so the checks
+ * run against real signatures without shipping a real player's certificate.
+ */
+function testPki(t) {
+  const dir = mkdtempSync(join(tmpdir(), "sonos-pki-"));
+  const run = (...a) => execFileSync("openssl", a, { cwd: dir, stdio: "ignore" });
+  try {
+    run("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-keyout", "ca.key", "-out", "ca.pem",
+      "-subj", "/C=US/O=Sonos, Inc/OU=Sonos Devices/CN=Sonos Device Authentication Root CA");
+    const leaf = (name, subj, signer = ["-CA", "ca.pem", "-CAkey", "ca.key"]) => {
+      run("req", "-newkey", "rsa:2048", "-nodes", "-keyout", `${name}.key`, "-out", `${name}.csr`, "-subj", subj);
+      run("x509", "-req", "-in", `${name}.csr`, ...signer, "-days", "1", "-out", `${name}.pem`, "-set_serial", String(Math.floor(Math.random() * 1e9)));
+      return new X509Certificate(readFileSync(join(dir, `${name}.pem`))).raw;
+    };
+    const good = leaf("good", "/O=Sonos, Inc/OU=Sonos Devices/CN=7828CA00CD98/DC=prod");
+    const other = leaf("other", "/O=Sonos, Inc/OU=Sonos Devices/CN=74CA60A9D774/DC=prod");
+    // Same fields, but signed by itself instead of the CA.
+    const forged = leaf("forged", "/O=Sonos, Inc/OU=Sonos Devices/CN=7828CA00CD98/DC=prod", ["-signkey", "forged.key"]);
+    const ca = createPublicKey(readFileSync(join(dir, "ca.pem")));
+    return { ca, good, other, forged };
+  } catch {
+    t.skip("openssl not available");
+    return null;
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+test("checkSonosCert: only a certificate signed by the Sonos CA for this very player passes", (t) => {
+  const pki = testPki(t);
+  if (!pki) return;
+  const { ca, good, other, forged } = pki;
+  const id = "RINCON_7828CA00CD9801400";
+  assert.equal(checkSonosCert(good, id, { ca }), null);
+  assert.match(checkSonosCert(other, id, { ca }), /another device/);
+  assert.equal(checkSonosCert(other, "RINCON_74CA60A9D77401400", { ca }), null);
+  assert.match(checkSonosCert(forged, id, { ca }), /not issued by Sonos/, "same fields, wrong signature");
+  // A test certificate is not signed by the real Sonos CA either.
+  assert.match(checkSonosCert(good, id), /not issued by Sonos/);
+  assert.match(checkSonosCert(good, id, { ca, now: Date.now() + 3 * 86400_000 }), /expired/);
+  assert.match(checkSonosCert(good, id, { ca, now: Date.now() - 86400_000 }), /not yet valid/);
+  assert.match(checkSonosCert(undefined, id, { ca }), /no certificate/);
+  assert.match(checkSonosCert(Buffer.from("garbage"), id, { ca }), /no certificate/);
+  assert.match(checkSonosCert(good, "../../etc", { ca }), /not a Sonos player id/);
+});
+
+test("the pinned Sonos CA key is a 4096-bit RSA public key", () => {
+  const k = createPublicKey(SONOS_DEVICE_CA_PUBKEY);
+  assert.equal(k.asymmetricKeyType, "rsa");
+  assert.equal(k.asymmetricKeyDetails.modulusLength, 4096);
 });
 
 /** A local HTTPS server with a throwaway certificate; skipped without openssl. */
