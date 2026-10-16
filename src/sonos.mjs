@@ -151,7 +151,9 @@ export function checkSonosCert(der, playerId, { now = Date.now(), ca } = {}) {
   const issuer = dn(x.issuer), subject = dn(x.subject);
   if (issuer.CN !== SONOS_ROOT_CN) return "certificate not issued by Sonos";
   if (subject.OU !== "Sonos Devices" || String(subject.CN).toUpperCase() !== m[1]) return "certificate belongs to another device";
-  if (!(x.validFromDate.getTime() <= now && now <= x.validToDate.getTime())) return "certificate expired or not yet valid";
+  // validFrom/validTo strings: validFromDate exists only from Node 22.10 on.
+  const from = Date.parse(x.validFrom), to = Date.parse(x.validTo);
+  if (!(from <= now && now <= to)) return "certificate expired or not yet valid";
   return null;
 }
 
@@ -328,7 +330,9 @@ export function playClip({ websocketUrl, playerId, streamUrl, volume, timeoutMs 
     }
     ws.on("upgrade", (res) => {
       if (connect) return;
-      const why = checkSonosCert(res.socket?.getPeerCertificate?.()?.raw, playerId);
+      let why;
+      // An exception in this listener would escape the promise.
+      try { why = checkSonosCert(res.socket?.getPeerCertificate?.()?.raw, playerId); } catch (e) { why = String(e?.message || e); }
       if (why) return finish(new Error(`speaker not trusted: ${why}`));
       verified = true;
     });
