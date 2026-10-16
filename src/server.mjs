@@ -36,6 +36,7 @@ import { issuePairCode, pairPayload, CODE_TTL_MS } from "./e2e-pairing.mjs";
 import { createAlexaVerifier } from "./alexa-verify.mjs";
 import { handleAlexaRequest } from "./alexa.mjs";
 import { createAlexaSession } from "./alexa-session.mjs";
+import { createSpeaker } from "./speaker.mjs";
 
 /**
  * Integer from the environment, with bounds. A bare parseInt let a typo become
@@ -717,18 +718,31 @@ const ALEXA_USER_ID = (process.env.ALEXA_USER_ID || "").trim();
 const ALEXA_MAX_BODY = 64 * 1024;
 const verifyAlexa = createAlexaVerifier();
 
+// Optional: a Sonos speaker in the local network (room name or player id)
+// that reads out answers taking longer than Alexa waits (speaker.mjs). Needs
+// the German voice of the bridge's speech service.
+const ALEXA_SPEAKER = (process.env.ALEXA_SPEAKER || "").trim();
+const ALEXA_SPEAKER_VOLUME = intEnv("ALEXA_SPEAKER_VOLUME", 40, 1, 100);
+// How long a handed-off question may run; nobody waits on the line for it.
+const ALEXA_TASK_TIMEOUT_MS = intEnv("ALEXA_TASK_TIMEOUT_MS", 10 * 60_000, 30_000, 60 * 60_000);
+const alexaSpeaker = ALEXA_SPEAKER
+  ? createSpeaker({ target: ALEXA_SPEAKER, volume: ALEXA_SPEAKER_VOLUME, speech, voice: (process.env.ALEXA_SPEAKER_VOICE || "").trim() || undefined, log })
+  : null;
+if (alexaSpeaker) log("info", "alexa_speaker_configured", { target: ALEXA_SPEAKER.slice(0, 64), voiceReady: alexaSpeaker.ready() });
+
 const alexaSession = createAlexaSession({
   claudeBin: CLAUDE_BIN, cwd: CWD, stateDir: LOG_DIR, model: ALEXA_MODEL, log,
+  longTimeoutMs: ALEXA_TASK_TIMEOUT_MS,
   permissionArgs: CLAUDE_ENGINE.permissionArgs(),
 });
-const askAlexa = async (query) => {
+const askAlexa = async (query, opts) => {
   // Claude switched off or misconfigured: Alexa runs nothing either.
   const blocked = enginePolicyBlock(CLAUDE_ENGINE);
   if (blocked) {
     log("warn", "alexa_blocked_by_policy", {});
     return { code: 503, body: { ok: false, error: "policy" } };
   }
-  return alexaSession.ask(query);
+  return alexaSession.ask(query, opts);
 };
 
 async function handleAlexaHttp(req, res) {
@@ -754,7 +768,9 @@ async function handleAlexaHttp(req, res) {
     log("warn", "alexa_verify_failed", { err: String(e?.message || e).slice(0, 120) });
     return reply(400, { error: "signature verification failed" });
   }
-  const out = await handleAlexaRequest(payload, { skillId: ALEXA_SKILL_ID, userId: ALEXA_USER_ID, ask: askAlexa, log });
+  const out = await handleAlexaRequest(payload, {
+    skillId: ALEXA_SKILL_ID, userId: ALEXA_USER_ID, ask: askAlexa, speaker: alexaSpeaker || undefined, log,
+  });
   return reply(out.status, out.body);
 }
 
@@ -2815,6 +2831,7 @@ function killAllInflightChildren() {
 }
 
 function shutdown(sig) {
+  try { alexaSpeaker?.close(); } catch {}
   try { speech.close(); } catch {}
   try { warmPool?.killAll(); } catch {}
   try { killAllInflightChildren(); } catch {}

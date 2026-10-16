@@ -35,6 +35,8 @@ Outbound connections:
 | bridge | `https://github.com/CommsConnectgmbh/conduit-bridge/releases/download/...` (`CONDUIT_MODELS_URL`), which redirects to GitHub's download host | Optional speech models | Only when a user installs a voice or speech recognition |
 | bridge | `OLLAMA_HOST`, by default `http://127.0.0.1:11434` | Local models | When Ollama is used |
 | bridge | Amazon's Alexa API (`api*.amazonalexa.com`) and the certificate URL in a signed Alexa request | Optional Alexa skill | Only with `ALEXA_SKILL_ID` set |
+| bridge | Sonos speakers in the local network: SSDP multicast (`239.255.255.250:1900`), their local API on port 1443 | Optional speaker for long Alexa answers | Only with `ALEXA_SPEAKER` set, when an answer is read aloud |
+| Sonos speaker | This computer, on its local address and a random port, path `/clip/<random>.wav` | The speaker fetches the answer as a WAV clip | Only while a clip is pending (at most 5 minutes); the listener is closed otherwise and never reachable through the tunnel |
 | AI CLIs | Their vendors (Anthropic, OpenAI, Google) | The model calls | Per turn, under the CLI's own sign-in |
 | installer | `app.tryconduit.de`, the Conduit cloud API, GitHub (cloudflared download if not installed), npm | Installation | Once |
 
@@ -207,6 +209,9 @@ Paths set in `.env.local` (`DB_DIR`, `LOG_DIR`, `PASTE_DIR`, `CONDUIT_MODELS_DIR
 | `CONDUIT_IDENTITY_PATH` | Bridge private key | `<DB_DIR>/identity.key` |
 | `CONDUIT_MODELS_DIR`, `CONDUIT_SPEECH_RUNTIME_DIR`, `CONDUIT_MODELS_URL` | Speech models, runtime, download base | `~/.conduit/models`, `~/.conduit/speech-runtime`, the GitHub releases of this repository |
 | `ALEXA_SKILL_ID`, `ALEXA_USER_ID` | Optional own Alexa skill | empty: endpoint answers 503 |
+| `ALEXA_SPEAKER` | Sonos room name or player id (`RINCON_…`). An Alexa question that takes longer than Alexa waits keeps running; the answer is read aloud there with the bridge's German voice, which must be installed. In a room with several speakers the one with a voice assistant is used. | empty: off |
+| `ALEXA_SPEAKER_VOLUME`, `ALEXA_SPEAKER_VOICE` | Volume of the clip (1-100), voice id | `40`, the first German voice |
+| `ALEXA_TASK_TIMEOUT_MS` | How long a question handed to the speaker may run | 600000 |
 | `CONDUIT_SUPERVISED` | `1` tells the bridge a service manager restarts it (set by `install.sh`) | detected |
 
 ## Known limits
