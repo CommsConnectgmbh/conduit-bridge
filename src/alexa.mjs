@@ -100,14 +100,29 @@ export async function handleAlexaRequest(payload, { skillId, userId, ask, speake
   return { status: 200, body: speak("Unbekannte Anfrage.", true) };
 }
 
+// One intent per action verb (skill model: "mach {query}", "schreib {query}"
+// …): Alexa keeps only the rest of the sentence in the slot, so the verb
+// that says what to do comes back from the intent's name.
+export const TASK_VERBS = Object.freeze({
+  TaskMachIntent: "Mach",
+  TaskSchauIntent: "Schau",
+  TaskSuchIntent: "Such",
+  TaskSchreibIntent: "Schreib",
+  TaskPruefIntent: "Prüf",
+  TaskLiesIntent: "Lies",
+  TaskFassIntent: "Fass",
+  TaskErledigeIntent: "Erledige",
+});
+
 /**
  * The text for Claude, or null for an intent that asks nothing. A "ja" or
  * "nein" (alone or with more, "ja, schick sie ab") answers Claude's last
- * question; Alexa drops the word itself from the slot, so it is put back.
+ * question; Alexa drops such words from the slot, so they are put back.
  */
 export function questionOf(intent, slot) {
   const rest = String(slot || "").trim().slice(0, 1000);
   if (intent === "AskConduitIntent") return rest;
+  if (Object.hasOwn(TASK_VERBS, intent)) return rest ? `${TASK_VERBS[intent]} ${rest}` : "";
   if (intent === "AMAZON.YesIntent") return "Ja.";
   if (intent === "AMAZON.NoIntent") return "Nein.";
   if (intent === "ConduitYesIntent") return rest ? `Ja, ${rest}` : "Ja.";
