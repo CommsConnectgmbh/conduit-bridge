@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { WebSocketServer } from "ws";
 import WebSocket from "ws";
 import { X509Certificate, createPublicKey } from "node:crypto";
-import { SONOS_DEVICE_CA_PUBKEY, checkSonosCert, choosePlayer, createClipHost, fetchLocalJson, isPrivateIPv4, localAddressFor, playClip } from "../src/sonos.mjs";
+import { SONOS_DEVICE_CA_PUBKEY, checkSonosCert, choosePlayer, playersInRoom, createClipHost, fetchLocalJson, isPrivateIPv4, localAddressFor, playClip } from "../src/sonos.mjs";
 
 const player = (id, name, caps, host = "192.168.178.23") => ({
   id, name, capabilities: caps, websocketUrl: `wss://${host}:1443/websocket/api`,
@@ -25,27 +25,44 @@ test("isPrivateIPv4: RFC 1918 and link-local only", () => {
   for (const ip of ["8.8.8.8", "172.32.0.1", "172.15.0.1", "127.0.0.1", "0.0.0.0", "::1", "192.168.1", "fe80::1", "example.org"]) assert.equal(isPrivateIPv4(ip), false, ip);
 });
 
-test("choosePlayer: room name prefers the speaker with a voice assistant", () => {
+// Well-formed ids that belong to no real player.
+const ONE = "RINCON_0000000000A101400", PLAY1 = "RINCON_0000000000A201400", BUERO = "RINCON_0000000000B101400";
+
+test("choosePlayer: exactly the configured player id, never a room name", () => {
   const players = [
-    player("RINCON_PLAY1", "Wohnzimmer", ["PLAYBACK", "AUDIO_CLIP"], "192.168.178.25"),
-    player("RINCON_ONE", "Wohnzimmer", ["PLAYBACK", "AUDIO_CLIP", "VOICE"], "192.168.178.23"),
-    player("RINCON_BUERO", "Büro", ["PLAYBACK", "AUDIO_CLIP"], "192.168.178.132"),
+    player(PLAY1, "Wohnzimmer", ["PLAYBACK", "AUDIO_CLIP"], "192.168.178.25"),
+    player(ONE, "Wohnzimmer", ["PLAYBACK", "AUDIO_CLIP", "VOICE"], "192.168.178.23"),
+    player(BUERO, "Büro", ["PLAYBACK", "AUDIO_CLIP"], "192.168.178.132"),
   ];
-  assert.deepEqual(choosePlayer(players, "wohnzimmer"), {
-    id: "RINCON_ONE", name: "Wohnzimmer", host: "192.168.178.23", websocketUrl: "wss://192.168.178.23:1443/websocket/api",
-  });
-  assert.equal(choosePlayer(players, "Büro").id, "RINCON_BUERO");
-  assert.equal(choosePlayer(players, "RINCON_PLAY1").id, "RINCON_PLAY1");
-  assert.equal(choosePlayer(players, "Küche"), null);
+  assert.deepEqual(choosePlayer(players, ONE), { id: ONE, name: "Wohnzimmer", host: "192.168.178.23", websocketUrl: "wss://192.168.178.23:1443/websocket/api" });
+  assert.equal(choosePlayer(players, PLAY1).id, PLAY1);
+  assert.equal(choosePlayer(players, "Wohnzimmer"), null);
+  assert.equal(choosePlayer(players, "wohnzimmer"), null);
+  assert.equal(choosePlayer(players, "RINCON_0000000000C101400"), null);
   assert.equal(choosePlayer(players, ""), null);
-  assert.equal(choosePlayer(null, "Büro"), null);
+  assert.equal(choosePlayer(null, ONE), null);
 });
 
 test("choosePlayer: never a player without audio clips or outside the local network", () => {
-  assert.equal(choosePlayer([player("RINCON_A", "Bad", ["PLAYBACK"])], "Bad"), null);
-  assert.equal(choosePlayer([player("RINCON_B", "Bad", ["AUDIO_CLIP"], "203.0.113.5")], "Bad"), null);
-  assert.equal(choosePlayer([{ ...player("RINCON_C", "Bad", ["AUDIO_CLIP"]), websocketUrl: "ws://192.168.178.9:1443/x" }], "Bad"), null);
-  assert.equal(choosePlayer([{ ...player("RINCON_D", "Bad", ["AUDIO_CLIP"]), websocketUrl: "nonsense" }], "Bad"), null);
+  assert.equal(choosePlayer([player(ONE, "Bad", ["PLAYBACK"])], ONE), null);
+  assert.equal(choosePlayer([player(ONE, "Bad", ["AUDIO_CLIP"], "203.0.113.5")], ONE), null);
+  assert.equal(choosePlayer([{ ...player(ONE, "Bad", ["AUDIO_CLIP"]), websocketUrl: "ws://192.168.178.9:1443/x" }], ONE), null);
+  assert.equal(choosePlayer([{ ...player(ONE, "Bad", ["AUDIO_CLIP"]), websocketUrl: "nonsense" }], ONE), null);
+});
+
+test("playersInRoom: setup help lists the room's ids, voice speaker first", () => {
+  const players = [
+    player(PLAY1, "Wohnzimmer", ["PLAYBACK", "AUDIO_CLIP"], "192.168.178.25"),
+    player(ONE, "Wohnzimmer", ["PLAYBACK", "AUDIO_CLIP", "VOICE"], "192.168.178.23"),
+    player(BUERO, "Büro", ["PLAYBACK"], "192.168.178.132"),
+  ];
+  assert.deepEqual(playersInRoom(players, "wohnzimmer"), [
+    { id: ONE, room: "Wohnzimmer", voice: true, audioClip: true },
+    { id: PLAY1, room: "Wohnzimmer", voice: false, audioClip: true },
+  ]);
+  assert.deepEqual(playersInRoom(players, "Büro"), [{ id: BUERO, room: "Büro", voice: false, audioClip: false }]);
+  assert.deepEqual(playersInRoom(players, "Küche"), []);
+  assert.deepEqual(playersInRoom(null, "Büro"), []);
 });
 
 /** A local address of this machine, as the speaker would fetch from. */
@@ -165,13 +182,13 @@ test("playClip: subscribes, sends the clip without an output-only clip type, wai
   });
   try {
     const t0 = Date.now();
-    const st = await playClip({ playerId: "RINCON_ONE", streamUrl: "http://192.168.178.30:5000/clip/a.wav", volume: 40, connect: sp.connect });
+    const st = await playClip({ playerId: ONE, streamUrl: "http://192.168.178.30:5000/clip/a.wav", volume: 40, connect: sp.connect });
     assert.equal(st, "DONE");
     assert.ok(Date.now() - t0 >= 380, "resolved only after the clip was played");
     const cmds = sp.seen.map((x) => x.header.command);
     assert.deepEqual(cmds, ["subscribe", "loadAudioClip"]);
     const load = sp.seen[1];
-    assert.equal(load.header.playerId, "RINCON_ONE");
+    assert.equal(load.header.playerId, ONE);
     assert.deepEqual(load.body, { name: "Conduit", appId: "de.tryconduit.bridge", streamUrl: "http://192.168.178.30:5000/clip/a.wav", volume: 40, priority: "LOW" });
   } finally { await sp.close(); }
 });

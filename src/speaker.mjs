@@ -4,7 +4,7 @@
 // than Alexa waits (alexa.mjs).
 import { parseWav, encodeWav } from "./speech-wav.mjs";
 import {
-  choosePlayer, createClipHost, discoverSonos, fetchLocalJson, localAddressFor, playClip,
+  PLAYER_ID, choosePlayer, createClipHost, discoverSonos, fetchLocalJson, localAddressFor, playClip, playersInRoom,
 } from "./sonos.mjs";
 
 const PLAYER_CACHE_MS = 10 * 60_000;
@@ -28,7 +28,7 @@ export function joinWavs(wavs) {
 
 /**
  * @param {object} o
- * @param {string} o.target   room name or player id (RINCON_…)
+ * @param {string} o.target   the player id (RINCON_…); a room name only finds ids, see findIds
  * @param {number} o.volume   clip volume, 1-100
  * @param {{ status: Function, speak: Function }} o.speech the bridge's speech service
  * @param {string} [o.voice]
@@ -36,6 +36,7 @@ export function joinWavs(wavs) {
  * @param {object} [o.net]    stand-ins for the network calls (tests)
  */
 export function createSpeaker({ target, volume, speech, voice, log, net = {} }) {
+  if (!PLAYER_ID.test(String(target || ""))) throw new Error("ALEXA_SPEAKER must be a Sonos player id (RINCON_…)");
   const discover = net.discover || discoverSonos;
   const fetchJson = net.fetchJson || fetchLocalJson;
   const localAddress = net.localAddress || localAddressFor;
@@ -95,6 +96,8 @@ export function createSpeaker({ target, volume, speech, voice, log, net = {} }) 
   }
 
   return {
+    /** The player id this speaker plays on. */
+    get target() { return target; },
     /** A German voice is installed, so announce() can work. */
     ready() {
       try {
@@ -116,4 +119,18 @@ export function createSpeaker({ target, volume, speech, voice, log, net = {} }) 
     },
     close() { clips.close(); },
   };
+}
+
+/**
+ * Setup help for an operator who wrote a room name: the ids of the players
+ * in that room, as the network reports them. Never rejects.
+ */
+export async function findIds(room, { discover = discoverSonos, fetchJson = fetchLocalJson } = {}) {
+  for (const ip of await discover()) {
+    try {
+      const g = await fetchJson(ip, "/api/v1/households/local/groups");
+      return playersInRoom(g?.players, room);
+    } catch { /* next speaker */ }
+  }
+  return [];
 }

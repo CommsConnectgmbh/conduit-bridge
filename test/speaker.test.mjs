@@ -6,7 +6,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { encodeWav, parseWav } from "../src/speech-wav.mjs";
-import { createSpeaker, joinWavs } from "../src/speaker.mjs";
+import { createSpeaker, findIds, joinWavs } from "../src/speaker.mjs";
+
+const ONE = "RINCON_0000000000A101400";
 
 const tone = (n, v) => encodeWav(new Float32Array(n).fill(v), 24000);
 
@@ -20,7 +22,7 @@ test("joinWavs: one clip with all segments in order", () => {
   assert.throws(() => joinWavs([tone(10, 0), encodeWav(new Float32Array(10), 16000)]), /sample rate/);
 });
 
-function rig({ players = [[{ id: "RINCON_ONE", name: "Wohnzimmer", capabilities: ["AUDIO_CLIP", "VOICE"], websocketUrl: "wss://192.168.178.23:1443/websocket/api" }]], voices = ["de"], playFails = 0, endStatus = "DONE", playMs = 0 } = {}) {
+function rig({ players = [[{ id: ONE, name: "Wohnzimmer", capabilities: ["AUDIO_CLIP", "VOICE"], websocketUrl: "wss://192.168.178.23:1443/websocket/api" }]], voices = ["de"], playFails = 0, endStatus = "DONE", playMs = 0 } = {}) {
   const calls = { discover: 0, fetch: [], play: [], publish: [], spoken: [], timeline: [] };
   const logs = [];
   let round = 0;
@@ -56,7 +58,7 @@ function rig({ players = [[{ id: "RINCON_ONE", name: "Wohnzimmer", capabilities:
       close() {},
     },
   };
-  const speaker = createSpeaker({ target: "Wohnzimmer", volume: 40, speech, log: (l, e, d) => logs.push({ l, e, d }), net });
+  const speaker = createSpeaker({ target: ONE, volume: 40, speech, log: (l, e, d) => logs.push({ l, e, d }), net });
   return { speaker, calls, logs };
 }
 
@@ -70,7 +72,7 @@ test("announce: German voice, one joined clip, played on the room's voice speake
   assert.equal(calls.publish[0].allow, "192.168.178.23", "only the chosen speaker may fetch the clip");
   assert.equal(calls.publish[0].bytes, 44 + 20 * 2);
   // 20 samples at 24 kHz: the wait for the end of playback is the clip plus a margin.
-  assert.deepEqual(calls.play, [{ websocketUrl: "wss://192.168.178.23:1443/websocket/api", playerId: "RINCON_ONE", streamUrl: "http://192.168.178.30:5000/clip/1.wav", volume: 40, playTimeoutMs: 20_001 }]);
+  assert.deepEqual(calls.play, [{ websocketUrl: "wss://192.168.178.23:1443/websocket/api", playerId: ONE, streamUrl: "http://192.168.178.30:5000/clip/1.wav", volume: 40, playTimeoutMs: 20_001 }]);
   assert.equal(calls.fetch[0].path, "/api/v1/households/local/groups");
   assert.equal(logs.at(-1).e, "speaker_announced");
 
@@ -80,8 +82,8 @@ test("announce: German voice, one joined clip, played on the room's voice speake
 });
 
 test("announce: a speaker that moved is looked up again once", async () => {
-  const moved = [{ id: "RINCON_ONE", name: "Wohnzimmer", capabilities: ["AUDIO_CLIP", "VOICE"], websocketUrl: "wss://192.168.178.99:1443/websocket/api" }];
-  const { speaker, calls } = rig({ players: [[{ id: "RINCON_ONE", name: "Wohnzimmer", capabilities: ["AUDIO_CLIP"], websocketUrl: "wss://192.168.178.23:1443/websocket/api" }], moved], playFails: 1 });
+  const moved = [{ id: ONE, name: "Wohnzimmer", capabilities: ["AUDIO_CLIP", "VOICE"], websocketUrl: "wss://192.168.178.99:1443/websocket/api" }];
+  const { speaker, calls } = rig({ players: [[{ id: ONE, name: "Wohnzimmer", capabilities: ["AUDIO_CLIP"], websocketUrl: "wss://192.168.178.23:1443/websocket/api" }], moved], playFails: 1 });
   assert.equal(await speaker.announce("Test."), true);
   assert.equal(calls.discover, 2);
   assert.equal(calls.play.length, 2);
@@ -123,4 +125,21 @@ test("announce: the next clip starts only after the previous one was played", as
     "start http://192.168.178.30:5000/clip/1.wav", "end http://192.168.178.30:5000/clip/1.wav",
     "start http://192.168.178.30:5000/clip/2.wav", "end http://192.168.178.30:5000/clip/2.wav",
   ]);
+});
+
+test("createSpeaker: a room name is refused, only a player id binds the speaker", () => {
+  const speech = { status: () => ({ ready: { tts: ["de"] }, voices: [] }), async speak() {} };
+  assert.throws(() => createSpeaker({ target: "Wohnzimmer", volume: 40, speech, log: () => {} }), /player id/);
+  assert.throws(() => createSpeaker({ target: "", volume: 40, speech, log: () => {} }), /player id/);
+  assert.equal(createSpeaker({ target: ONE, volume: 40, speech, log: () => {}, net: { clipHost: { close() {} } } }).target, ONE);
+});
+
+test("findIds: the ids in a room from the first speaker that answers; empty when none does", async () => {
+  const players = [{ id: ONE, name: "Wohnzimmer", capabilities: ["AUDIO_CLIP", "VOICE"] }];
+  const ids = await findIds("Wohnzimmer", {
+    discover: async () => ["192.168.178.5", "192.168.178.23"],
+    fetchJson: async (ip) => { if (ip === "192.168.178.5") throw new Error("down"); return { players }; },
+  });
+  assert.deepEqual(ids, [{ id: ONE, room: "Wohnzimmer", voice: true, audioClip: true }]);
+  assert.deepEqual(await findIds("Wohnzimmer", { discover: async () => [], fetchJson: async () => ({}) }), []);
 });
