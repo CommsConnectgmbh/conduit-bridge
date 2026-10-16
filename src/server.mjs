@@ -36,7 +36,8 @@ import { issuePairCode, pairPayload, CODE_TTL_MS } from "./e2e-pairing.mjs";
 import { createAlexaVerifier } from "./alexa-verify.mjs";
 import { handleAlexaRequest } from "./alexa.mjs";
 import { createAlexaSession } from "./alexa-session.mjs";
-import { createSpeaker } from "./speaker.mjs";
+import { createSpeaker, findIds } from "./speaker.mjs";
+import { PLAYER_ID } from "./sonos.mjs";
 
 /**
  * Integer from the environment, with bounds. A bare parseInt let a typo become
@@ -718,17 +719,24 @@ const ALEXA_USER_ID = (process.env.ALEXA_USER_ID || "").trim();
 const ALEXA_MAX_BODY = 64 * 1024;
 const verifyAlexa = createAlexaVerifier();
 
-// Optional: a Sonos speaker in the local network (room name or player id)
+// Optional: a Sonos speaker in the local network (its player id, RINCON_…)
 // that reads out answers taking longer than Alexa waits (speaker.mjs). Needs
 // the German voice of the bridge's speech service.
 const ALEXA_SPEAKER = (process.env.ALEXA_SPEAKER || "").trim();
 const ALEXA_SPEAKER_VOLUME = intEnv("ALEXA_SPEAKER_VOLUME", 40, 1, 100);
 // How long a handed-off question may run; nobody waits on the line for it.
 const ALEXA_TASK_TIMEOUT_MS = intEnv("ALEXA_TASK_TIMEOUT_MS", 10 * 60_000, 30_000, 60 * 60_000);
-const alexaSpeaker = ALEXA_SPEAKER
-  ? createSpeaker({ target: ALEXA_SPEAKER, volume: ALEXA_SPEAKER_VOLUME, speech, voice: (process.env.ALEXA_SPEAKER_VOICE || "").trim() || undefined, log })
-  : null;
-if (alexaSpeaker) log("info", "alexa_speaker_configured", { target: ALEXA_SPEAKER.slice(0, 64), voiceReady: alexaSpeaker.ready() });
+let alexaSpeaker = null;
+if (ALEXA_SPEAKER && PLAYER_ID.test(ALEXA_SPEAKER)) {
+  alexaSpeaker = createSpeaker({ target: ALEXA_SPEAKER, volume: ALEXA_SPEAKER_VOLUME, speech, voice: (process.env.ALEXA_SPEAKER_VOICE || "").trim() || undefined, log });
+  log("info", "alexa_speaker_configured", { player: ALEXA_SPEAKER, voiceReady: alexaSpeaker.ready() });
+} else if (ALEXA_SPEAKER) {
+  // A room name is not a safe binding (any device can claim one). Stay off
+  // and show the ids in that room, so the operator can set the right one.
+  findIds(ALEXA_SPEAKER).then((ids) => {
+    log("warn", "alexa_speaker_needs_player_id", { room: ALEXA_SPEAKER.slice(0, 64), candidates: ids.slice(0, 8) });
+  }).catch(() => {});
+}
 
 const alexaSession = createAlexaSession({
   claudeBin: CLAUDE_BIN, cwd: CWD, stateDir: LOG_DIR, model: ALEXA_MODEL, log,

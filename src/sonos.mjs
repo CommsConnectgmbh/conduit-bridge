@@ -140,8 +140,8 @@ function dn(text) {
  * `ca` exists for the tests only.
  */
 export function checkSonosCert(der, playerId, { now = Date.now(), ca } = {}) {
-  const m = /^RINCON_([0-9A-F]{12})\d{5}$/.exec(String(playerId || ""));
-  if (!m) return "not a Sonos player id";
+  if (!PLAYER_ID.test(String(playerId || ""))) return "not a Sonos player id";
+  const mac = String(playerId).slice(7, 19);
   if (!Buffer.isBuffer(der) || !der.length) return "no certificate";
   let x;
   try { x = new X509Certificate(der); } catch { return "no certificate"; }
@@ -150,36 +150,46 @@ export function checkSonosCert(der, playerId, { now = Date.now(), ca } = {}) {
   if (!signed) return "certificate not issued by Sonos";
   const issuer = dn(x.issuer), subject = dn(x.subject);
   if (issuer.CN !== SONOS_ROOT_CN) return "certificate not issued by Sonos";
-  if (subject.OU !== "Sonos Devices" || String(subject.CN).toUpperCase() !== m[1]) return "certificate belongs to another device";
+  if (subject.OU !== "Sonos Devices" || String(subject.CN).toUpperCase() !== mac) return "certificate belongs to another device";
   // validFrom/validTo strings: validFromDate exists only from Node 22.10 on.
   const from = Date.parse(x.validFrom), to = Date.parse(x.validTo);
   if (!(from <= now && now <= to)) return "certificate expired or not yet valid";
   return null;
 }
 
+/** A Sonos player id: RINCON_ + MAC address + 5 digits. */
+export const PLAYER_ID = /^RINCON_[0-9A-F]{12}\d{5}$/;
+
 /**
- * Pick the player for `target` from a household's player list.
- * `target` is a player id (RINCON_…) or a room name (case-insensitive). A
- * room can hold several players; the one with a voice assistant wins, since
- * that is the speaker the user talked to. Players without audio clips are
- * never chosen.
+ * Find player `playerId` in a household's player list. Only the address
+ * comes from this list, which any device in the network could answer: who
+ * the speaker is gets proved on its own connection (checkSonosCert), against
+ * the id the operator configured. Players without audio clips or outside the
+ * local network are never chosen.
  * @returns {{ id: string, name: string, host: string, websocketUrl: string } | null}
  */
-export function choosePlayer(players, target) {
-  const want = String(target || "").trim();
-  if (!want || !Array.isArray(players)) return null;
-  const usable = players.filter((p) => {
-    if (!p || typeof p.id !== "string" || !Array.isArray(p.capabilities) || !p.capabilities.includes("AUDIO_CLIP")) return false;
-    try {
-      const u = new URL(p.websocketUrl);
-      return u.protocol === "wss:" && isPrivateIPv4(u.hostname);
-    } catch { return false; }
-  });
-  const byId = usable.find((p) => p.id === want);
-  const inRoom = byId ? [byId] : usable.filter((p) => typeof p.name === "string" && p.name.toLowerCase() === want.toLowerCase());
-  if (!inRoom.length) return null;
-  const p = inRoom.find((x) => x.capabilities.includes("VOICE")) || inRoom[0];
-  return { id: p.id, name: p.name, host: new URL(p.websocketUrl).hostname, websocketUrl: p.websocketUrl };
+export function choosePlayer(players, playerId) {
+  if (!PLAYER_ID.test(String(playerId || "")) || !Array.isArray(players)) return null;
+  const p = players.find((x) => x && x.id === playerId);
+  if (!p || !Array.isArray(p.capabilities) || !p.capabilities.includes("AUDIO_CLIP")) return null;
+  let u;
+  try { u = new URL(p.websocketUrl); } catch { return null; }
+  if (u.protocol !== "wss:" || !isPrivateIPv4(u.hostname)) return null;
+  return { id: p.id, name: typeof p.name === "string" ? p.name : "", host: u.hostname, websocketUrl: p.websocketUrl };
+}
+
+/**
+ * Setup help: the players whose room is called `room`, for the operator to
+ * pick an id from (ALEXA_SPEAKER takes the id only). Speakers with a voice
+ * assistant first.
+ */
+export function playersInRoom(players, room) {
+  const want = String(room || "").trim().toLowerCase();
+  if (!want || !Array.isArray(players)) return [];
+  return players
+    .filter((p) => p && typeof p.id === "string" && typeof p.name === "string" && p.name.toLowerCase() === want)
+    .map((p) => ({ id: p.id, room: p.name, voice: Array.isArray(p.capabilities) && p.capabilities.includes("VOICE"), audioClip: Array.isArray(p.capabilities) && p.capabilities.includes("AUDIO_CLIP") }))
+    .sort((a, b) => Number(b.voice) - Number(a.voice));
 }
 
 /**
