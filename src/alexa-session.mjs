@@ -41,10 +41,11 @@ const SYSTEM_HINT =
  * @param {string} o.model
  * @param {(level: string, event: string, data: object) => void} o.log
  * @param {number} [o.timeoutMs] budget for the whole request, re-init included, not per spawn
+ * @param {number} [o.longTimeoutMs] the same for a question whose answer goes to a speaker (ask(q, { long: true }))
  * @param {(args: string[], opts: object) => import("node:child_process").ChildProcess} [o.spawnClaude]
  */
 export function createAlexaSession({
-  claudeBin, cwd, stateDir, model, log, timeoutMs = 26_000, spawnClaude,
+  claudeBin, cwd, stateDir, model, log, timeoutMs = 26_000, longTimeoutMs = timeoutMs, spawnClaude,
   // The bridge's permission policy (agent-policy.mjs); the default is the
   // behaviour before the policy existed.
   permissionArgs = ["--permission-mode", "bypassPermissions"],
@@ -154,10 +155,10 @@ export function createAlexaSession({
   let sessionId = load();
   let inFlight = false;
 
-  async function askLocked(query) {
+  async function askLocked(query, budgetMs) {
     const prompt = `${SYSTEM_HINT}\n\nFrage: ${query}`;
     const started = Date.now();
-    const deadline = started + timeoutMs;
+    const deadline = started + budgetMs;
     let r = null;
 
     const resumeId = sessionId;
@@ -203,14 +204,18 @@ export function createAlexaSession({
   }
 
   return {
-    /** Run one question. Resolves with { code, body }; body is { ok, text?, error? }. */
-    async ask(query) {
+    /**
+     * Run one question. Resolves with { code, body }; body is { ok, text?, error? }.
+     * `long`: nobody waits on the line, the answer is read aloud later, so the
+     * question may take up to longTimeoutMs.
+     */
+    async ask(query, { long = false } = {}) {
       if (inFlight) return { code: 429, body: { ok: false, error: "alexa-busy" } };
       // Claimed before the first await and released only in the finally:
       // concurrent --resume on one session corrupts its transcript.
       inFlight = true;
       try {
-        return await askLocked(query);
+        return await askLocked(query, long ? longTimeoutMs : timeoutMs);
       } finally {
         inFlight = false;
       }
