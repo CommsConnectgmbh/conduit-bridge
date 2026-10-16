@@ -20,8 +20,8 @@ test("joinWavs: one clip with all segments in order", () => {
   assert.throws(() => joinWavs([tone(10, 0), encodeWav(new Float32Array(10), 16000)]), /sample rate/);
 });
 
-function rig({ players = [[{ id: "RINCON_ONE", name: "Wohnzimmer", capabilities: ["AUDIO_CLIP", "VOICE"], websocketUrl: "wss://192.168.178.23:1443/websocket/api" }]], voices = ["de"], playFails = 0 } = {}) {
-  const calls = { discover: 0, fetch: [], play: [], publish: [], spoken: [] };
+function rig({ players = [[{ id: "RINCON_ONE", name: "Wohnzimmer", capabilities: ["AUDIO_CLIP", "VOICE"], websocketUrl: "wss://192.168.178.23:1443/websocket/api" }]], voices = ["de"], playFails = 0, endStatus = "DONE", playMs = 0 } = {}) {
+  const calls = { discover: 0, fetch: [], play: [], publish: [], spoken: [], timeline: [] };
   const logs = [];
   let round = 0;
   let fails = playFails;
@@ -45,9 +45,14 @@ function rig({ players = [[{ id: "RINCON_ONE", name: "Wohnzimmer", capabilities:
     async play(o) {
       calls.play.push(o);
       if (fails > 0) { fails--; round++; throw new Error("speaker closed the connection"); }
+      calls.timeline.push(`start ${o.streamUrl}`);
+      // The real playClip resolves only once the speaker reports the clip played.
+      await new Promise((r) => setTimeout(r, playMs));
+      calls.timeline.push(`end ${o.streamUrl}`);
+      return endStatus;
     },
     clipHost: {
-      async publish(wav, host) { calls.publish.push({ bytes: wav.length, host }); return `http://${host}:5000/clip/${calls.publish.length}.wav`; },
+      async publish(wav, host, allow) { calls.publish.push({ bytes: wav.length, host, allow }); return `http://${host}:5000/clip/${calls.publish.length}.wav`; },
       close() {},
     },
   };
@@ -62,8 +67,10 @@ test("announce: German voice, one joined clip, played on the room's voice speake
   assert.deepEqual(calls.spoken, [{ text: "Hier ist Conduit. Fertig.", lang: "de" }]);
   assert.equal(calls.publish.length, 1);
   assert.equal(calls.publish[0].host, "192.168.178.30");
+  assert.equal(calls.publish[0].allow, "192.168.178.23", "only the chosen speaker may fetch the clip");
   assert.equal(calls.publish[0].bytes, 44 + 20 * 2);
-  assert.deepEqual(calls.play, [{ websocketUrl: "wss://192.168.178.23:1443/websocket/api", playerId: "RINCON_ONE", streamUrl: "http://192.168.178.30:5000/clip/1.wav", volume: 40 }]);
+  // 20 samples at 24 kHz: the wait for the end of playback is the clip plus a margin.
+  assert.deepEqual(calls.play, [{ websocketUrl: "wss://192.168.178.23:1443/websocket/api", playerId: "RINCON_ONE", streamUrl: "http://192.168.178.30:5000/clip/1.wav", volume: 40, playTimeoutMs: 20_001 }]);
   assert.equal(calls.fetch[0].path, "/api/v1/households/local/groups");
   assert.equal(logs.at(-1).e, "speaker_announced");
 
@@ -92,19 +99,25 @@ test("announce: never rejects; no speaker, no voice or a dead speaker are logged
   assert.match(mute.logs.at(-1).d.err, /no voice/);
   assert.equal(mute.calls.play.length, 0);
 
+  // Accepted but not played to the end: reported, never played a second time.
+  const cut = rig({ endStatus: "DISMISSED" });
+  assert.equal(await cut.speaker.announce("Test."), false);
+  assert.equal(cut.calls.play.length, 1);
+  assert.match(cut.logs.at(-1).d.err, /DISMISSED/);
+
   const dead = rig({ playFails: 5 });
   assert.equal(await dead.speaker.announce("Test."), false);
   assert.equal(dead.calls.play.length, 2);
   assert.equal(dead.logs.at(-1).e, "speaker_failed");
 });
 
-test("announce: clips play one after another, never on top of each other", async () => {
-  const { speaker, calls } = rig();
-  const order = [];
-  const orig = speaker.announce;
-  const a = orig("Eins.").then(() => order.push(1));
-  const b = orig("Zwei.").then(() => order.push(2));
-  await Promise.all([a, b]);
-  assert.deepEqual(order, [1, 2]);
-  assert.deepEqual(calls.spoken.map((s) => s.text), ["Eins.", "Zwei."]);
+test("announce: the next clip starts only after the previous one was played", async () => {
+  const { speaker, calls } = rig({ playMs: 150 });
+  const [a, b] = await Promise.all([speaker.announce("Eins."), speaker.announce("Zwei.")]);
+  assert.equal(a, true);
+  assert.equal(b, true);
+  assert.deepEqual(calls.timeline, [
+    "start http://192.168.178.30:5000/clip/1.wav", "end http://192.168.178.30:5000/clip/1.wav",
+    "start http://192.168.178.30:5000/clip/2.wav", "end http://192.168.178.30:5000/clip/2.wav",
+  ]);
 });

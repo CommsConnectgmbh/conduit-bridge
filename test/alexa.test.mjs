@@ -68,6 +68,20 @@ test("speaker, slow answer: Alexa hands off at once, the speaker reads the answe
   assert.deepEqual(s.announced, [`${ANNOUNCE_PREFIX} Drei neue Mails, eine davon dringend.`]);
 });
 
+test("speaker: the handoff time counts from the request's arrival, signature check included", async () => {
+  const s = speakerRig();
+  const t0 = Date.now();
+  // The request came in 4.9 s ago (slow certificate download): hand off at once.
+  const out = await handleAlexaRequest(req("AskConduitIntent", "räum mein Postfach auf"), {
+    skillId: SKILL, userId: USER, log: () => {}, speaker: s.speaker, handoffMs: 5000, receivedAt: Date.now() - 4900,
+    ask: () => later(400, ok("Erledigt.")),
+  });
+  assert.equal(said(out), HANDOFF_TEXT);
+  assert.ok(Date.now() - t0 < 300, `answered after ${Date.now() - t0} ms`);
+  await s.done;
+  assert.deepEqual(s.announced, [`${ANNOUNCE_PREFIX} Erledigt.`]);
+});
+
 test("speaker: a question while a handed-off one runs is told the answer is coming", async () => {
   const s = speakerRig();
   let busy = false;

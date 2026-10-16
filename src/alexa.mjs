@@ -55,12 +55,13 @@ async function sendProgressive(payload, fetchImpl) {
  * @param {{ skillId: string, userId: string,
  *           ask: (query: string, opts?: { long?: boolean }) => Promise<{ code: number, body: any }>,
  *           speaker?: { ready: () => boolean, announce: (text: string) => Promise<boolean> },
- *           handoffMs?: number, fetchImpl?: typeof fetch, log: Function }} deps
- *   With a speaker, a question that is not answered within `handoffMs` keeps
- *   running and its answer is read aloud on the speaker later.
+ *           handoffMs?: number, receivedAt?: number, fetchImpl?: typeof fetch, log: Function }} deps
+ *   With a speaker, a question that is not answered within `handoffMs` of
+ *   `receivedAt` (when the request came in, so the signature check counts)
+ *   keeps running and its answer is read aloud on the speaker later.
  * @returns {Promise<{ status: number, body: object }>}
  */
-export async function handleAlexaRequest(payload, { skillId, userId, ask, speaker, handoffMs = HANDOFF_MS, fetchImpl = fetch, log }) {
+export async function handleAlexaRequest(payload, { skillId, userId, ask, speaker, handoffMs = HANDOFF_MS, receivedAt = Date.now(), fetchImpl = fetch, log }) {
   const incoming = payload?.session?.application?.applicationId || payload?.context?.System?.application?.applicationId;
   if (!skillId) return { status: 503, body: { error: "skill not configured" } };
   if (incoming !== skillId) return { status: 403, body: { error: "wrong skill" } };
@@ -92,7 +93,7 @@ export async function handleAlexaRequest(payload, { skillId, userId, ask, speake
   const query = questionOf(intent, payload.request?.intent?.slots?.query?.value);
   if (query === "") return { status: 200, body: speak("Ich hab dich nicht verstanden. Sag's nochmal.", false, "Was wolltest du wissen?") };
   if (query) {
-    if (speaker?.ready()) return askWithHandoff(query, { ask, speaker, handoffMs, log });
+    if (speaker?.ready()) return askWithHandoff(query, { ask, speaker, waitMs: Math.max(0, receivedAt + handoffMs - Date.now()), log });
     sendProgressive(payload, fetchImpl).catch(() => {});
     return answer(await ask(query), log);
   }
@@ -140,18 +141,18 @@ const handedOff = new WeakMap();
  * Answer within the handoff time if Claude is that quick; otherwise let the
  * question run on, end the Alexa turn and read the answer on the speaker.
  */
-async function askWithHandoff(query, { ask, speaker, handoffMs, log }) {
+async function askWithHandoff(query, { ask, speaker, waitMs, log }) {
   const job = Promise.resolve().then(() => ask(query, { long: true }))
     .catch((e) => ({ code: 500, body: { ok: false, error: String(e?.message || e) } }));
   let timer;
-  const late = new Promise((resolve) => { timer = setTimeout(() => resolve(null), handoffMs); });
+  const late = new Promise((resolve) => { timer = setTimeout(() => resolve(null), waitMs); });
   const quick = await Promise.race([job, late]);
   clearTimeout(timer);
   if (quick) {
     if (quick.code === 429 && handedOff.get(speaker)) return { status: 200, body: speak(BUSY_TEXT, true) };
     return answer(quick, log);
   }
-  log("info", "alexa_handoff", { ms: handoffMs });
+  log("info", "alexa_handoff", { waitedMs: waitMs });
   handedOff.set(speaker, (handedOff.get(speaker) || 0) + 1);
   job.finally(() => handedOff.set(speaker, handedOff.get(speaker) - 1)).then((r) => {
     if (r.code !== 200) log("warn", "alexa_answer_failed", { code: r.code, handedOff: true });

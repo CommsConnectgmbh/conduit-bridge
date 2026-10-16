@@ -746,6 +746,8 @@ const askAlexa = async (query, opts) => {
 };
 
 async function handleAlexaHttp(req, res) {
+  // Alexa's eight seconds run from here: reading and verifying the request count.
+  const receivedAt = Date.now();
   const reply = (status, body) => {
     res.writeHead(status, { "content-type": "application/json" });
     res.end(JSON.stringify(body));
@@ -769,7 +771,7 @@ async function handleAlexaHttp(req, res) {
     return reply(400, { error: "signature verification failed" });
   }
   const out = await handleAlexaRequest(payload, {
-    skillId: ALEXA_SKILL_ID, userId: ALEXA_USER_ID, ask: askAlexa, speaker: alexaSpeaker || undefined, log,
+    skillId: ALEXA_SKILL_ID, userId: ALEXA_USER_ID, ask: askAlexa, speaker: alexaSpeaker || undefined, receivedAt, log,
   });
   return reply(out.status, out.body);
 }

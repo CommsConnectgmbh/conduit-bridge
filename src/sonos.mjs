@@ -66,25 +66,56 @@ export function discoverSonos({ timeoutMs = 2500, socketFactory = () => createSo
   });
 }
 
-/** GET a JSON document from a speaker's local API. */
-export function fetchLocalJson(ip, path, { timeoutMs = 3000 } = {}) {
+/** GET a JSON document from a speaker's local API. Settles within `timeoutMs`. */
+export function fetchLocalJson(ip, path, { timeoutMs = 3000, port = 1443 } = {}) {
   return new Promise((resolve, reject) => {
     if (!isPrivateIPv4(ip)) return reject(new Error("not a local address"));
-    // The speakers present a self-signed certificate; there is no CA to check
-    // it against. The address comes from the local network and the request
-    // carries nothing secret.
-    const req = https.get({ host: ip, port: 1443, path, rejectUnauthorized: false, timeout: timeoutMs, headers: { "X-Sonos-Api-Key": SONOS_LOCAL_API_KEY } }, (res) => {
+    let settled = false;
+    const finish = (err, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (err) { req.destroy(); reject(err); } else resolve(value);
+    };
+    // Only the list of players is read here, and it carries nothing secret.
+    // Who gets a clip is decided on the speaker's own connection (playClip).
+    const req = https.get({ host: ip, port, path, rejectUnauthorized: false, headers: { "X-Sonos-Api-Key": SONOS_LOCAL_API_KEY } }, (res) => {
       let body = "";
       res.setEncoding("utf8");
-      res.on("data", (c) => { body += c; if (body.length > 256 * 1024) req.destroy(new Error("answer too large")); });
+      res.on("data", (c) => { body += c; if (body.length > 256 * 1024) finish(new Error("answer too large")); });
+      res.on("error", (e) => finish(e));
+      res.on("aborted", () => finish(new Error("answer cut off")));
+      res.on("close", () => finish(new Error("answer cut off")));
       res.on("end", () => {
-        if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
-        try { resolve(JSON.parse(body)); } catch { reject(new Error("not JSON")); }
+        if (res.statusCode !== 200) return finish(new Error(`HTTP ${res.statusCode}`));
+        try { finish(null, JSON.parse(body)); } catch { finish(new Error("not JSON")); }
       });
     });
-    req.on("timeout", () => req.destroy(new Error("timeout")));
-    req.on("error", reject);
+    // One deadline for connect, headers and body together.
+    const timer = setTimeout(() => finish(new Error("timeout")), timeoutMs);
+    req.on("error", (e) => finish(e));
   });
+}
+
+const SONOS_ROOT_CN = "Sonos Device Authentication Root CA";
+
+/**
+ * Does the certificate a speaker presented belong to player `playerId`?
+ * Sonos issues every player a certificate from its device CA with the
+ * player's MAC address as common name (RINCON_<MAC>01400). The CA itself is
+ * not published, so the chain cannot be verified: this check turns away any
+ * device that is not presenting a certificate for this very player, but not
+ * one that forges all of these fields. Returns null or the reason.
+ */
+export function checkSonosCert(cert, playerId, now = Date.now()) {
+  const m = /^RINCON_([0-9A-F]{12})\d{5}$/.exec(String(playerId || ""));
+  if (!m) return "not a Sonos player id";
+  if (!cert || !cert.subject || !cert.issuer) return "no certificate";
+  if (cert.issuer.CN !== SONOS_ROOT_CN || cert.issuer.O !== "Sonos, Inc") return "certificate not issued by Sonos";
+  if (cert.subject.OU !== "Sonos Devices" || String(cert.subject.CN).toUpperCase() !== m[1]) return "certificate belongs to another device";
+  const from = Date.parse(cert.valid_from), to = Date.parse(cert.valid_to);
+  if (!(from <= now && now <= to)) return "certificate expired or not yet valid";
+  return null;
 }
 
 /**
@@ -131,14 +162,16 @@ export function localAddressFor(ip) {
 }
 
 /**
- * Serves WAV clips on the local network under random one-time paths. The
- * listener opens with the first pending clip and closes when none is left.
+ * Serves WAV clips on the local network under random one-time paths, each to
+ * the one speaker it is meant for. The listener opens with the first pending
+ * clip and closes when none is left.
  */
 export function createClipHost({ ttlMs = 5 * 60_000, log = () => {} } = {}) {
-  const clips = new Map(); // token -> { wav, timer }
-  let server = null;
+  const clips = new Map(); // token -> { wav, allow, timer }
+  let server = null;     // set only once it listens
   let boundHost = null;
   let port = 0;
+  let starting = null;   // { host, promise } while a listen is under way
 
   function maybeClose() {
     if (clips.size || !server) return;
@@ -157,40 +190,58 @@ export function createClipHost({ ttlMs = 5 * 60_000, log = () => {} } = {}) {
     maybeClose();
   }
 
+  function handle(req, res) {
+    const m = /^\/clip\/([0-9a-f]{32})\.wav$/.exec(req.url || "");
+    const c = m && clips.get(m[1]);
+    // Only the speaker the clip was sent to gets it, whoever else learns the URL.
+    if (!c || c.allow !== req.socket.remoteAddress || (req.method !== "GET" && req.method !== "HEAD")) {
+      return res.writeHead(404).end();
+    }
+    res.writeHead(200, { "content-type": "audio/wav", "content-length": c.wav.length, "cache-control": "no-store" });
+    if (req.method === "HEAD") return res.end();
+    // A speaker may fetch twice (probe, then play); the clip stays until
+    // its time is up.
+    res.end(c.wav);
+    log("info", "speaker_clip_fetched", { bytes: c.wav.length });
+  }
+
   async function listen(host) {
     if (server && boundHost === host) return;
+    if (starting?.host === host) return starting.promise;
     if (server) {
       // The route to the speaker changed (another network): pending clips on
       // the old address could not be fetched anyway.
       for (const t of [...clips.keys()]) drop(t);
     }
-    server = http.createServer((req, res) => {
-      const m = /^\/clip\/([0-9a-f]{32})\.wav$/.exec(req.url || "");
-      const c = m && clips.get(m[1]);
-      if (!c || (req.method !== "GET" && req.method !== "HEAD")) return res.writeHead(404).end();
-      res.writeHead(200, { "content-type": "audio/wav", "content-length": c.wav.length, "cache-control": "no-store" });
-      if (req.method === "HEAD") return res.end();
-      // A speaker may fetch twice (probe, then play); the clip stays until
-      // its time is up.
-      res.end(c.wav);
-      log("info", "speaker_clip_fetched", { bytes: c.wav.length });
+    const candidate = http.createServer(handle);
+    const promise = new Promise((resolve, reject) => {
+      candidate.once("error", reject);
+      candidate.listen(0, host, () => { candidate.off("error", reject); resolve(); });
     });
-    boundHost = host;
-    await new Promise((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(0, host, () => { server.off("error", reject); port = server.address().port; resolve(); });
-    });
+    starting = { host, promise };
+    try {
+      await promise;
+      server = candidate;
+      boundHost = host;
+      port = candidate.address().port;
+    } catch (e) {
+      try { candidate.close(); } catch {}
+      throw e;
+    } finally {
+      if (starting?.promise === promise) starting = null;
+    }
   }
 
   return {
-    /** Make `wav` fetchable from `host` (a local address); resolves with its URL. */
-    async publish(wav, host) {
+    /** Make `wav` fetchable from `host` (a local address) by `allow` only; resolves with its URL. */
+    async publish(wav, host, allow) {
       if (!isPrivateIPv4(host)) throw new Error("clips are only served on a local address");
+      if (!isPrivateIPv4(allow)) throw new Error("clips are only served to a speaker in the local network");
       await listen(host);
       const token = randomBytes(16).toString("hex");
       const timer = setTimeout(() => drop(token), ttlMs);
       timer.unref?.();
-      clips.set(token, { wav, timer });
+      clips.set(token, { wav, allow, timer });
       return `http://${host}:${port}/clip/${token}.wav`;
     },
     get open() { return !!server; },
@@ -198,43 +249,76 @@ export function createClipHost({ ttlMs = 5 * 60_000, log = () => {} } = {}) {
   };
 }
 
+const CLIP_DONE = new Set(["DONE", "ERROR", "DISMISSED"]);
+
 /**
- * Ask a player to play `streamUrl` as an audio clip. Resolves once the
- * speaker accepted it; rejects when it refuses or does not answer.
+ * Play `streamUrl` as an audio clip on a player and wait until it has been
+ * played. Rejects if the speaker cannot be reached, is not the player
+ * (checkSonosCert) or refuses the clip: then nothing was played and trying
+ * again is safe. Once the clip is accepted it resolves with its final status
+ * ("DONE", "ERROR", "DISMISSED", or "UNKNOWN" when no status came within
+ * `playTimeoutMs`).
  */
-export function playClip({ websocketUrl, playerId, streamUrl, volume, timeoutMs = 5000, connect }) {
+export function playClip({ websocketUrl, playerId, streamUrl, volume, timeoutMs = 5000, playTimeoutMs = 60_000, connect }) {
   return new Promise((resolve, reject) => {
     const ws = connect
       ? connect(websocketUrl)
       : new WebSocket(websocketUrl, "v1.api.smartspeaker.audio", {
         headers: { "X-Sonos-Api-Key": SONOS_LOCAL_API_KEY },
-        // Self-signed speaker certificate, see fetchLocalJson.
+        // The device CA is not public; the certificate is checked by hand on
+        // "upgrade", before anything is sent.
         rejectUnauthorized: false,
         handshakeTimeout: timeoutMs,
       });
+    const subId = randomBytes(4).toString("hex");
     const cmdId = randomBytes(4).toString("hex");
+    let clipId = null;
+    let verified = !!connect; // stand-in connections in tests are plain
     let settled = false;
-    const finish = (err) => {
+    let timer = setTimeout(() => finish(new Error("speaker did not answer")), timeoutMs);
+    function finish(err, status) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      try { ws.close(); } catch {}
-      err ? reject(err) : resolve();
-    };
-    const timer = setTimeout(() => finish(new Error("speaker did not answer")), timeoutMs);
+      try { ws.terminate ? ws.terminate() : ws.close(); } catch {}
+      if (clipId && !err) return resolve(status);
+      // After acceptance an error ends the wait, but the clip is not repeated.
+      if (clipId) return resolve("UNKNOWN");
+      reject(err);
+    }
+    ws.on("upgrade", (res) => {
+      if (connect) return;
+      const why = checkSonosCert(res.socket?.getPeerCertificate?.(), playerId);
+      if (why) return finish(new Error(`speaker not trusted: ${why}`));
+      verified = true;
+    });
     ws.on("open", () => {
+      if (!verified) return finish(new Error("speaker not trusted: no certificate"));
+      // Status events tell when the clip has been played.
+      ws.send(JSON.stringify([{ namespace: "audioClip:1", command: "subscribe", playerId, cmdId: subId }, {}]));
       ws.send(JSON.stringify([
         { namespace: "audioClip:1", command: "loadAudioClip", playerId, cmdId },
-        { name: "Conduit", appId: "de.tryconduit.bridge", streamUrl, volume, priority: "LOW", clipType: "CUSTOM" },
+        { name: "Conduit", appId: "de.tryconduit.bridge", streamUrl, volume, priority: "LOW" },
       ]));
     });
     ws.on("message", (raw) => {
       let msg;
       try { msg = JSON.parse(raw.toString()); } catch { return; }
       const [header, body] = Array.isArray(msg) ? msg : [];
-      if (header?.cmdId !== cmdId) return;
-      if (header.success === true && header.response === "loadAudioClip") return finish();
-      finish(new Error(`speaker refused the clip: ${String(body?.errorCode || body?.reason || "unknown").slice(0, 80)}`));
+      if (!header) return;
+      if (header.cmdId === cmdId) {
+        if (header.success !== true || header.response !== "loadAudioClip" || typeof body?.id !== "string") {
+          return finish(new Error(`speaker refused the clip: ${String(body?.errorCode || body?.reason || "unknown").slice(0, 80)}`));
+        }
+        clipId = body.id;
+        clearTimeout(timer);
+        timer = setTimeout(() => finish(null, "UNKNOWN"), playTimeoutMs);
+        return;
+      }
+      if (clipId && header.type === "audioClipStatus") {
+        const mine = (body?.audioClips || []).find((c) => c?.id === clipId);
+        if (mine && CLIP_DONE.has(mine.status)) finish(null, mine.status);
+      }
     });
     ws.on("error", (e) => finish(e));
     ws.on("close", () => finish(new Error("speaker closed the connection")));

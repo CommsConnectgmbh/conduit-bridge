@@ -71,22 +71,27 @@ export function createSpeaker({ target, volume, speech, voice, log, net = {} }) 
   async function announceNow(text) {
     const started = Date.now();
     const wav = await synthesize(text);
+    // Data bytes over the header's byte rate: how long the speaker will be busy.
+    const seconds = (wav.length - 44) / (wav.readUInt32LE(28) || 48000);
     let player = await findPlayer(false);
     if (!player) throw new Error("speaker not found");
     const send = async (p) => {
-      const url = await clips.publish(wav, await localAddress(p.host));
-      await play({ websocketUrl: p.websocketUrl, playerId: p.id, streamUrl: url, volume });
+      const url = await clips.publish(wav, await localAddress(p.host), p.host);
+      return play({ websocketUrl: p.websocketUrl, playerId: p.id, streamUrl: url, volume, playTimeoutMs: Math.ceil(seconds * 1000) + 20_000 });
     };
+    let status;
     try {
-      await send(player);
+      status = await send(player);
     } catch (e) {
-      // A cached address can be stale (DHCP, speaker restarted): look again once.
+      // Nothing was played. A cached address can be stale (DHCP, speaker
+      // restarted): look again once.
       const again = await findPlayer(true);
       if (!again) throw e;
       player = again;
-      await send(player);
+      status = await send(player);
     }
-    log("info", "speaker_announced", { room: player.name, chars: text.length, ms: Date.now() - started });
+    if (status !== "DONE") throw new Error(`clip ended as ${status}`);
+    log("info", "speaker_announced", { room: player.name, chars: text.length, seconds: Math.round(seconds), ms: Date.now() - started });
   }
 
   return {
@@ -97,7 +102,10 @@ export function createSpeaker({ target, volume, speech, voice, log, net = {} }) 
         return voice ? s.voices.some((v) => v.id === voice) : s.ready.tts.includes("de");
       } catch { return false; }
     },
-    /** Read `text` aloud; one clip at a time. Resolves true or false, never rejects. */
+    /**
+     * Read `text` aloud; the next clip starts only after the previous one was
+     * played. Resolves true or false, never rejects.
+     */
     announce(text) {
       const job = queue.then(() => announceNow(text)).then(() => true, (e) => {
         log("warn", "speaker_failed", { err: String(e?.message || e).slice(0, 200) });
