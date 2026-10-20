@@ -607,6 +607,16 @@ function isAllowedPath(p) {
   return false;
 }
 
+// Where a turn runs. The roots were checked when the cwd was set (PATCH), but
+// a symlink in the path can be retargeted afterwards, so the check (on the
+// resolved path, see isAllowedPath) is repeated at every spawn. A cwd that no
+// longer passes falls back to the default. The path itself stays as the user
+// set it: the CLIs key their conversations by it.
+function sessionSpawnCwd(sess) {
+  const p = sess?.cwd;
+  return p && isValidCwd(p) && isAllowedPath(p) ? p : CWD;
+}
+
 // Persistent across reboots — `/tmp` gets wiped, which silently broke old
 // transcripts that referenced a saved image. The dir is per-user (the bridge
 // runs under the local account) so the user can also grep their own pastes.
@@ -1859,7 +1869,7 @@ function spawnInflight(rt, sess, prompt, assistantId, userMessageId = null, engi
 // On an early failure it transparently falls back to a one-shot spawn so the
 // user always gets an answer even if the warm path misbehaves.
 function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null) {
-  const spawnCwd = (sess.cwd && isValidCwd(sess.cwd)) ? sess.cwd : CWD;
+  const spawnCwd = sessionSpawnCwd(sess);
 
   const inflight = {
     assistantId, userMessageId, content: "", done: false, errorMsg: null,
@@ -2327,7 +2337,7 @@ function runInflightTurn(engine, rt, sess, prompt, assistantId, userMessageId = 
 
   // Die eine Verzweigung nach Transport. Was danach kommt, ist für beide Wege
   // derselbe Code — deshalb steht sie hier und nicht in zwei Funktionen.
-  const spawnCwd = (sess.cwd && isValidCwd(sess.cwd)) ? sess.cwd : CWD;
+  const spawnCwd = sessionSpawnCwd(sess);
   let proc;
   try {
     if (engine.transport === "http") {
