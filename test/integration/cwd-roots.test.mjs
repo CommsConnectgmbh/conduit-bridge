@@ -20,6 +20,7 @@ let proc, dir, port, pairPort, logs = "";
 const freePort = () => new Promise((res) => { const s = net.createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => res(p)); }); });
 
 before(async () => {
+  if (process.platform === "win32") return;
   dir = mkdtempSync(join(tmpdir(), "conduit-cwd-"));
   for (const d of ["home", "root/real", "outside"]) mkdirSync(join(dir, d), { recursive: true });
   symlinkSync(join(dir, "root/real"), join(dir, "root/link"));
@@ -54,6 +55,7 @@ out({ type: "result", subtype: "success", is_error: false, usage: { input_tokens
 });
 
 after(async () => {
+  if (!dir) return;
   if (proc && proc.exitCode === null && proc.signalCode === null) {
     const exited = new Promise((r) => proc.once("exit", r));
     proc.kill("SIGTERM");
@@ -62,7 +64,9 @@ after(async () => {
   rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
-test("a cwd whose symlink is retargeted outside the roots is not used for the next turn", async () => {
+// POSIX only: FILE_SEARCH_ROOTS and session cwds are absolute POSIX paths, and
+// Windows cannot start the shebang stand-in CLI.
+test("a cwd whose symlink is retargeted outside the roots is not used for the next turn", { skip: process.platform === "win32" }, async () => {
   const j = await (await fetch(`http://127.0.0.1:${pairPort}/api/pair/new`, { method: "POST" })).json();
   const p = JSON.parse(Buffer.from(new URL(j.url).hash.slice(1), "base64url").toString());
   const bridgeKey = Uint8Array.from(Buffer.from(p.k, "base64url"));
