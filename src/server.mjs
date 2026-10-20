@@ -609,12 +609,17 @@ function isAllowedPath(p) {
 
 // Where a turn runs. The roots were checked when the cwd was set (PATCH), but
 // a symlink in the path can be retargeted afterwards, so the check (on the
-// resolved path, see isAllowedPath) is repeated at every spawn. A cwd that no
-// longer passes falls back to the default. The path itself stays as the user
-// set it: the CLIs key their conversations by it.
+// resolved path, see isAllowedPath) is repeated at every spawn, and the agent
+// starts in the resolved directory, so a retarget between check and spawn
+// cannot move it. A cwd that no longer passes falls back to the default. The
+// CLIs see the resolved path either way (a process's cwd is always physical).
 function sessionSpawnCwd(sess) {
   const p = sess?.cwd;
-  return p && isValidCwd(p) && isAllowedPath(p) ? p : CWD;
+  if (!p || !isValidCwd(p) || !isAllowedPath(p)) return CWD;
+  try {
+    const real = realpathSync(p);
+    return isAllowedPath(real) ? real : CWD;
+  } catch { return CWD; }
 }
 
 // Persistent across reboots — `/tmp` gets wiped, which silently broke old
