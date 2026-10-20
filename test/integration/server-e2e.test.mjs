@@ -5,7 +5,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, readFileSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, statSync, mkdirSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,6 +24,11 @@ const REAL_SPEECH = !!(process.env.CONDUIT_TEST_SPEECH_MODELS && process.env.CON
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), "conduit-itest-"));
   port = await freePort(); pairPort = await freePort();
+  // An install left behind by an older version: world-readable directories
+  // and files the bridge must tighten on start.
+  for (const d of ["db", "logs", "paste"]) { mkdirSync(join(dir, d), { recursive: true }); chmodSync(join(dir, d), 0o755); }
+  writeFileSync(join(dir, "paste", "1700000000000-old.txt"), "old paste"); chmodSync(join(dir, "paste", "1700000000000-old.txt"), 0o644);
+  writeFileSync(join(dir, "logs", "bridge.log.1"), "{}\n"); chmodSync(join(dir, "logs", "bridge.log.1"), 0o644);
   proc = spawn(process.execPath, [fileURLToPath(new URL("../../src/server.mjs", import.meta.url))], {
     env: {
       PATH: process.env.PATH, HOME: dir, BRIDGE_PORT: String(port), PAIR_PORT: String(pairPort),
@@ -147,6 +152,72 @@ test("pair via the loopback page, then RPC and chat inside the session", async (
   assert.match(speak.body.error, /no voice installed/);
   assert.equal((await call("DELETE", "/api/speech/models/nope")).head.status, 404);
   await session.goaway();
+});
+
+test("a malformed request target gets a 400 and the bridge keeps running", async () => {
+  for (const target of ["//[", "http://[::1", "//%"]) {
+    const reply = await new Promise((res, rej) => {
+      const sock = net.connect(port, "127.0.0.1", () => sock.write(`GET ${target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n`));
+      let buf = ""; sock.on("data", (d) => { buf += d; }); sock.on("end", () => res(buf)); sock.on("error", rej);
+    });
+    assert.match(reply, /^HTTP\/1\.1 400 /, `${target}: ${reply.slice(0, 80)}`);
+    const h = await fetch(`http://127.0.0.1:${port}/healthz`);
+    assert.equal(h.status, 200, `bridge died after ${target}`);
+  }
+  assert.equal(proc.exitCode, null);
+});
+
+test("chat database, logs and pastes are owner-only, old installs included", { skip: process.platform === "win32" }, () => {
+  const mode = (...p) => statSync(join(dir, ...p)).mode & 0o777;
+  for (const d of [["db"], ["logs"], ["paste"]]) assert.equal(mode(...d), 0o700, d.join("/"));
+  for (const f of [["db", "db.sqlite"], ["logs", "bridge.log"], ["logs", "bridge.log.1"], ["paste", "1700000000000-old.txt"]]) {
+    assert.equal(mode(...f), 0o600, f.join("/"));
+  }
+});
+
+test("a device revoked after minting a pairing code cannot pair again with that code", async () => {
+  const open = () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/e2e`, [SUBPROTOCOL], { headers: { host: HOST } });
+    ws.binaryType = "arraybuffer";
+    return { ready: new Promise((res, rej) => { ws.once("open", res); ws.once("error", rej); }),
+      transport: { send: (b) => ws.send(b), close: () => ws.close(), get bufferedAmount() { return ws.bufferedAmount; },
+        onMessage: (cb) => ws.on("message", (d) => cb(new Uint8Array(d))), onClose: (cb) => ws.on("close", cb) } };
+  };
+  const call = async (session, method, path) => {
+    const ch = await session.open(KIND.RPC, { method, path, headers: {} });
+    const parts = []; const done = new Promise((res) => { ch.on("data", (p) => parts.push(Uint8Array.from(p))); ch.on("end", res); });
+    await ch.end(); await done;
+    const all = Buffer.concat(parts); const n = all.readUInt32BE(0);
+    return { head: JSON.parse(all.subarray(4, 4 + n)), body: JSON.parse(all.subarray(4 + n)) };
+  };
+  const codeFrom = (url) => {
+    const p = JSON.parse(Buffer.from(new URL(url).hash.slice(1), "base64url").toString());
+    return { codeId: Uint8Array.from(Buffer.from(p.i, "base64url")), psk: Uint8Array.from(Buffer.from(p.p, "base64url")) };
+  };
+  const pair = async (dev, code, label) => {
+    const c = open(); await c.ready;
+    return connect({ transport: c.transport, host: HOST, device: dev, bridgeKey, hello: { v: 1, client: "web", label }, pair: code, options: { handshakeTimeoutMs: 1500 } });
+  };
+  const loopCode = async () => codeFrom((await (await fetch(`http://127.0.0.1:${pairPort}/api/pair/new`, { method: "POST" })).json()).url);
+  // The owner's device and device X, both paired through the loopback QR.
+  const owner = await generateKeyPair();
+  const po = await pair(owner, await loopCode(), "owner");
+  const x = await generateKeyPair();
+  const px = await pair(x, await loopCode(), "x");
+  // X mints a code for later, then the owner revokes X.
+  const minted = await call(px.session, "POST", "/api/e2e/pair-code");
+  assert.equal(minted.head.status, 200);
+  const kicked = new Promise((res) => px.session.on("close", res));
+  const rv = await call(po.session, "DELETE", `/api/e2e/devices/${px.hello.device_id}`);
+  assert.equal(rv.body.revoked, true);
+  await kicked;
+  // The pre-revocation code is dead: X cannot re-pair with it.
+  await assert.rejects(pair(x, codeFrom(minted.body.url), "x-again"));
+  const devs = await call(po.session, "GET", "/api/e2e/devices");
+  const rowX = devs.body.devices.find((d) => d.id === px.hello.device_id);
+  assert.equal(rowX.revoked, true);
+  assert.equal(rowX.pairedVia, "localhost");
+  await po.session.goaway();
 });
 
 test("bridge log contains no email address and no home path", () => {

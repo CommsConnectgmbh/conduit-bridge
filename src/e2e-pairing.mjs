@@ -8,6 +8,10 @@
 //
 // Codes are single-use, expire after three minutes, and are bound to the
 // account email they were issued for. At most a handful exist at a time.
+//
+// A code minted by a paired device stays tied to that device: revoking the
+// device drops its open codes (revokeCodesIssuedBy), and the endpoint refuses a
+// device-issued code whose issuer is gone or revoked when it is redeemed.
 
 import { randomBytes } from "node:crypto";
 
@@ -56,6 +60,13 @@ export function consumePairCode(codeId) {
   if (!c) return null;
   codes.delete(key);
   return c;
+}
+
+/** Drop every open code minted by `issuedBy` (e.g. "device:<id>"); returns how many. */
+export function revokeCodesIssuedBy(issuedBy) {
+  let n = 0;
+  for (const [id, c] of codes) if (c.issuedBy === issuedBy) { codes.delete(id); n += 1; }
+  return n;
 }
 
 /**

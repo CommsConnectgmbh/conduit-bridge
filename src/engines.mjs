@@ -97,7 +97,7 @@ const CLAUDE = {
 
   buildArgs({ prompt, model, resumeId, sessionId }) {
     const args = [
-      "-p", prompt,
+      "-p",
       "--model", model,
       "--output-format", "stream-json",
       "--verbose",
@@ -108,6 +108,9 @@ const CLAUDE = {
     // ein UUID ist (die CLI akzeptiert nichts anderes).
     if (resumeId) args.push("--resume", resumeId);
     else if (sessionId) args.push("--session-id", sessionId);
+    // Der Prompt kommt vom Gerät. Hinter `--` ist er immer Positionsargument:
+    // ein Text wie „--permission-mode …" kann die Policy nicht überschreiben.
+    args.push("--", prompt);
     return args;
   },
 
@@ -225,14 +228,17 @@ const ANTIGRAVITY = {
   },
 
   buildArgs({ prompt, model, resumeId }) {
+    // agy liest `-p` als Option MIT Wert und kennt kein `--`. Werte vom Gerät
+    // (Prompt, Modell) hängen deshalb per `=` fest an ihrer Option: so kann ein
+    // Prompt oder Modellname, der mit „-" beginnt, nie selbst zur Option werden.
     const args = [
-      "-p", prompt,
+      `--print=${prompt}`,
       "--output-format", "stream-json",
       // Voreinstellung --dangerously-skip-permissions; siehe agent-policy.mjs.
       ...agyPermissionArgs(AGENT_POLICY.gemini),
     ];
-    if (model && model !== "default") args.push("--model", model);
-    if (resumeId) args.push("--conversation", resumeId);
+    if (model && model !== "default") args.push(`--model=${model}`);
+    if (resumeId) args.push(`--conversation=${resumeId}`);
     return args;
   },
 

@@ -1,6 +1,6 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, appendFileSync, statSync, writeFileSync, realpathSync } from "node:fs";
+import { existsSync, appendFileSync, statSync, writeFileSync, realpathSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID, createHash } from "node:crypto";
@@ -21,7 +21,7 @@ import {
   searchHistory,
 } from "./db.mjs";
 import {
-  addE2eDevice, getE2eDevice, listE2eDevices, revokeE2eDevice, touchE2eDevice,
+  addE2eDevice, getE2eDevice, getE2eDeviceById, listE2eDevices, revokeE2eDevice, touchE2eDevice,
   db as historyDb,
 } from "./db.mjs";
 import {
@@ -29,10 +29,11 @@ import {
   rotateOwnLog, rotateServiceLogs,
 } from "./housekeeping.mjs";
 import { loadIdentity } from "./e2e-identity.mjs";
+import { ensurePrivateDir, tightenFilesIn, PRIVATE_FILE_MODE } from "./private-fs.mjs";
 import { createE2eEndpoint } from "./e2e-endpoint.mjs";
 import { encodeMessage } from "./e2e-messages.mjs";
 import { createSpeechService, SpeechError, LIMITS as SPEECH_LIMITS } from "./speech-service.mjs";
-import { issuePairCode, pairPayload, CODE_TTL_MS } from "./e2e-pairing.mjs";
+import { issuePairCode, pairPayload, revokeCodesIssuedBy, CODE_TTL_MS } from "./e2e-pairing.mjs";
 import { createAlexaVerifier } from "./alexa-verify.mjs";
 import { handleAlexaRequest } from "./alexa.mjs";
 import { createAlexaSession } from "./alexa-session.mjs";
@@ -326,7 +327,14 @@ if (isWildcardHost(HOST)) {
   console.error("[security] BRIDGE_HOST=0.0.0.0 exposes the bridge to the LAN — refusing to start. Use 127.0.0.1.");
   process.exit(1);
 }
-if (!existsSync(LOG_DIR)) mkdirSync(LOG_DIR, { recursive: true });
+// Logs, the paste directory and the service logs are owner-only (0700/0600),
+// and installs from older versions are corrected on every start.
+ensurePrivateDir(LOG_DIR);
+tightenFilesIn(LOG_DIR, (n) => n.startsWith("bridge.log"));
+if (HOUSEKEEPING.serviceLogDir && existsSync(HOUSEKEEPING.serviceLogDir)) {
+  ensurePrivateDir(HOUSEKEEPING.serviceLogDir);
+  tightenFilesIn(HOUSEKEEPING.serviceLogDir);
+}
 
 // Warn (don't refuse — this is a personal-machine tool and a wide root is a
 // legitimate choice) when the mention/cwd scope is the whole home directory or
@@ -392,7 +400,7 @@ const log = (level, msg, meta = {}) => {
   // CONDUIT_LOG_STDOUT=0 keeps it to bridge.log alone.
   if (HOUSEKEEPING.logStdout) process.stdout.write(line);
   rotateLogIfNeeded();
-  try { appendFileSync(LOG_FILE, line); } catch {}
+  try { appendFileSync(LOG_FILE, line, { mode: PRIVATE_FILE_MODE }); } catch {}
 };
 
 /** sessionRuntime: sid -> { claudeSessionId, lastUsed, child? } */
@@ -464,8 +472,32 @@ async function readJson(req) {
   });
 }
 
-const server = http.createServer(async (req, res) => {
-  const u = new URL(req.url, "http://localhost");
+// One bad request must never take the bridge down: a request target that is
+// not a valid URL path (for example `//[`) used to throw from `new URL()`
+// before any Host or auth check, and the rejected promise ended the process.
+// The target is parsed defensively, and anything a handler throws ends that
+// request with a 500 instead of the process.
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch((e) => {
+    log("error", "request_failed", { err: String(e?.message || e).slice(0, 160) });
+    try {
+      if (!res.headersSent) res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: "internal error" }));
+    } catch { try { res.destroy(); } catch {} }
+  });
+});
+
+/** The request target as a URL, or null when it cannot be parsed. */
+function parseRequestTarget(target) {
+  try { return new URL(String(target || "/"), "http://localhost"); } catch { return null; }
+}
+
+async function handleRequest(req, res) {
+  const u = parseRequestTarget(req.url);
+  if (!u) {
+    res.writeHead(400, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "bad request target" }));
+  }
   // Resolve the allowed CORS origin once for this request; reused by json(),
   // the OPTIONS preflight and /healthz below so they never disagree.
   res._corsOrigin = corsOrigin(req);
@@ -515,7 +547,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   res.writeHead(404).end();
-});
+}
 
 // Roots a session's working directory may be set to. Defaults to CLAUDE_CWD;
 // override with FILE_SEARCH_ROOTS as a colon-separated list of absolute paths.
@@ -579,6 +611,8 @@ function isAllowedPath(p) {
 // transcripts that referenced a saved image. The dir is per-user (the bridge
 // runs under the local account) so the user can also grep their own pastes.
 const PASTE_DIR = process.env.PASTE_DIR || join(homedir(), "Library/conduit-bridge/pastes");
+// Uploads saved by an older version may still be world-readable.
+if (existsSync(PASTE_DIR)) { ensurePrivateDir(PASTE_DIR); tightenFilesIn(PASTE_DIR); }
 const PASTE_MAX_BYTES = 25 * 1024 * 1024; // 25 MB
 // 30 days by default (CONDUIT_PASTE_RETENTION_DAYS, 0 keeps them) — keeps DB
 // references valid for a sane window.
@@ -673,7 +707,7 @@ async function handlePasteUpload(req, res, auth) {
   }
 
   try {
-    if (!existsSync(PASTE_DIR)) mkdirSync(PASTE_DIR, { recursive: true });
+    ensurePrivateDir(PASTE_DIR);
 
     const chunks = [];
     let received = 0;
@@ -687,7 +721,7 @@ async function handlePasteUpload(req, res, auth) {
 
     const name = `${Date.now()}-${randomUUID().slice(0, 8)}${ext}`;
     const filePath = join(PASTE_DIR, name);
-    writeFileSync(filePath, fileBuf);
+    writeFileSync(filePath, fileBuf, { mode: PRIVATE_FILE_MODE });
 
     log("info", "paste_saved", { email: auth.email, path: filePath, bytes: fileBuf.length });
     // Best-effort age sweep so the paste dir doesn't grow unbounded. Cheap (a
@@ -826,8 +860,8 @@ function escapeHtml(x) {
  * Link the QR encodes. Everything secret sits in the fragment, which browsers
  * never send to the server: the app reads it locally and pairs end to end.
  */
-function e2ePairLink(issuedBy) {
-  const { codeId, psk, exp } = issuePairCode({ email: resolveOwnerEmail(), issuedBy });
+function e2ePairLink(issuedBy, email = resolveOwnerEmail()) {
+  const { codeId, psk, exp } = issuePairCode({ email, issuedBy });
   const payload = pairPayload({ host: PAIR_PUBLIC_HOST, bridgeKey: IDENTITY.publicKey, codeId, psk, exp });
   return { url: `${pairAppBase()}/pair#${b64url(JSON.stringify(payload))}`, payload, exp };
 }
@@ -983,12 +1017,15 @@ async function handleApi(req, res, u, auth) {
       const target = listE2eDevices(email).find((r) => r.device_id === dm[1]);
       const revoked = revokeE2eDevice(dm[1], email);
       if (target && revoked) e2e.kickDevice(target.pubkey);
-      log("info", "e2e_device_revoked", { device: dm[1], by: auth.deviceId, revoked });
+      // Codes the device minted before it was revoked must not bring it back.
+      const codesDropped = target ? revokeCodesIssuedBy(`device:${target.device_id}`) : 0;
+      log("info", "e2e_device_revoked", { device: dm[1], by: auth.deviceId, revoked, codesDropped });
       return json(res, 200, { ok: true, revoked: !!revoked });
     }
   }
   if (path === "/api/e2e/pair-code" && req.method === "POST") {
-    const { url, payload, exp } = e2ePairLink(`device:${auth.deviceId}`);
+    // Bound to the session's own account, not to whoever owns the bridge now.
+    const { url, payload, exp } = e2ePairLink(`device:${auth.deviceId}`, auth.email);
     log("info", "pair_code_new", { by: auth.deviceId });
     return json(res, 200, { ok: true, url, payload, expiresAt: exp });
   }
@@ -1288,6 +1325,7 @@ const e2e = createE2eEndpoint({
   version: BRIDGE_VERSION,
   devices: {
     get: (pubkey) => getE2eDevice(pubkey),
+    byId: (deviceId) => getE2eDeviceById(deviceId),
     add: (rec) => addE2eDevice(rec),
     touch: (pubkey) => touchE2eDevice(pubkey),
   },

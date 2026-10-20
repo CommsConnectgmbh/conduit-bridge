@@ -48,6 +48,8 @@ Model downloads and the speech runtime are pinned by SHA-256 in the signed bridg
 
 Paths for an installation by `install.sh`; on Windows the same names under `%USERPROFILE%`.
 
+Since 3.1.2 the bridge keeps the chat database, attachments and logs owner-only (directories 0700, files 0600) and corrects older installs on every start. On Windows the user profile's ACL applies instead.
+
 | Data | Path | Content | Kept |
 |---|---|---|---|
 | Chat history | `~/.conduit/bridge/db.sqlite` (+ `-wal`, `-shm`) | Chats (account e-mail, title, working directory, engine, model, token and cost counters, CLI session ids), full prompt and answer text, the audit trail of tool steps (input up to 4,000 and output up to 6,000 characters), paired devices | Until the user deletes the chat, or `CONDUIT_RETENTION_DAYS` |

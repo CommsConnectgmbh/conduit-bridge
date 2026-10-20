@@ -1,6 +1,6 @@
 {
   "name": "conduit-bridge",
-  "version": "3.1.1",
+  "version": "3.1.2",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,7 +9,7 @@
     "test": "node --test \"test/**/*.test.mjs\""
   },
   "dependencies": {
-    "ws": "8.18.0"
+    "ws": "8.22.0"
   },
   "optionalDependencies": {
     "qrcode": "^1.5.4"
