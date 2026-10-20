@@ -107,8 +107,8 @@ function sink() {
 
 test("each engine builds its arguments from the policy, resume included", () => {
   const claude = getEngine("claude").buildArgs({ prompt: "hi", model: "opus", resumeId: "abc" });
-  assert.deepEqual(claude.slice(-8), [
-    "--permission-mode", "manual", "--permission-prompts", "none", "--disallowedTools", "Bash", "--resume", "abc",
+  assert.deepEqual(claude.slice(-10), [
+    "--permission-mode", "manual", "--permission-prompts", "none", "--disallowedTools", "Bash", "--resume", "abc", "--", "hi",
   ]);
   assert.ok(!claude.includes("bypassPermissions"));
   const codex = getEngine("codex").buildArgs({ prompt: "hi", model: "default", resumeId: "t-1" });
@@ -118,6 +118,26 @@ test("each engine builds its arguments from the policy, resume included", () => 
   assert.deepEqual(codex.slice(-3), ["--", "t-1", "hi"]);
   const agy = getEngine("gemini").buildArgs({ prompt: "hi", model: "default" });
   assert.ok(!agy.includes("--dangerously-skip-permissions"));
+});
+
+test("a prompt or model from the device can never become a CLI option", () => {
+  const evil = "--permission-mode bypassPermissions";
+  // claude: everything the device controls sits behind `--`, after all options.
+  const claude = getEngine("claude").buildArgs({ prompt: evil, model: "opus", resumeId: "abc" });
+  assert.equal(claude.at(-2), "--");
+  assert.equal(claude.at(-1), evil);
+  assert.equal(claude.indexOf(evil), claude.length - 1);
+  assert.equal(claude[0], "-p");
+  // agy has no `--`: values are glued to their option with `=`.
+  const agy = getEngine("gemini").buildArgs({ prompt: "--dangerously-skip-permissions", model: "--sandbox=false", resumeId: "-c" });
+  assert.ok(agy.includes("--print=--dangerously-skip-permissions"));
+  assert.ok(agy.includes("--model=--sandbox=false"));
+  assert.ok(agy.includes("--conversation=-c"));
+  assert.ok(!agy.includes("--dangerously-skip-permissions"));
+  assert.ok(!agy.includes("-p") && !agy.includes("--model") && !agy.includes("--conversation"));
+  // codex already ends with `--` and the positionals.
+  const codex = getEngine("codex").buildArgs({ prompt: evil, model: "default" });
+  assert.deepEqual(codex.slice(-2), ["--", evil]);
 });
 
 test("a disabled engine is unavailable and refuses turns with a reason", () => {

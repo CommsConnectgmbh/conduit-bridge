@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import WebSocket from "ws";
 import { createE2eEndpoint, deviceIdFor } from "../../src/e2e-endpoint.mjs";
-import { issuePairCode, _resetPairCodes } from "../../src/e2e-pairing.mjs";
+import { issuePairCode, revokeCodesIssuedBy, pskFor, _resetPairCodes } from "../../src/e2e-pairing.mjs";
 import { generateKeyPair } from "../../src/e2e-noise.mjs";
 import { connect, KIND, SUBPROTOCOL, GOAWAY } from "../../src/e2e.mjs";
 import { encodeMessage, MessageReader } from "../../src/e2e-messages.mjs";
@@ -17,6 +17,7 @@ const endpoint = createE2eEndpoint({
   host: () => HOST, identity, version: "9.9.9",
   devices: {
     get: (k) => devices.get(k) || null,
+    byId: (id) => [...devices.values()].find((d) => d.device_id === id) || null,
     add: (r) => devices.set(r.pubkey, { pubkey: r.pubkey, device_id: r.deviceId, email: r.email, label: r.label, revoked_at: null }),
     touch: () => {},
   },
@@ -125,6 +126,52 @@ test("revoking a device ends its live sessions and blocks reconnects", async () 
   assert.equal((await closed).code, GOAWAY.REVOKED);
   const t2 = wsTransport(); await t2.ready;
   await assert.rejects(connect({ transport: t2, host: HOST, device, bridgeKey: identity.publicKey, hello: {}, options: { handshakeTimeoutMs: 800 } }));
+});
+
+test("a code minted by a revoked device cannot pair anything, least of all the revoked key", async () => {
+  // Runs after the revoke test above: `device` is revoked now.
+  const key = Buffer.from(device.publicKey).toString("hex");
+  assert.ok(devices.get(key).revoked_at);
+  const issuedBy = `device:${deviceIdFor(device.publicKey)}`;
+  const pairWith = async (dev, code) => {
+    const t = wsTransport(); await t.ready;
+    return connect({ transport: t, host: HOST, device: dev, bridgeKey: identity.publicKey, hello: { v: 1, label: "x" },
+      pair: { codeId: code.codeId, psk: code.psk }, options: { handshakeTimeoutMs: 800 } });
+  };
+  // The revoked device re-pairing itself with a code it minted earlier.
+  _resetPairCodes();
+  await assert.rejects(pairWith(device, issuePairCode({ email, issuedBy })));
+  assert.ok(devices.get(key).revoked_at, "revoked key must stay revoked");
+  // A fresh key with the revoked issuer's code is refused as well.
+  const other = await generateKeyPair();
+  await assert.rejects(pairWith(other, issuePairCode({ email, issuedBy })));
+  assert.equal(devices.get(Buffer.from(other.publicKey).toString("hex")), undefined);
+  // A code from a live device must not re-authorise a revoked key either.
+  const live = await generateKeyPair();
+  const liveKey = Buffer.from(live.publicKey).toString("hex");
+  devices.set(liveKey, { pubkey: liveKey, device_id: deviceIdFor(live.publicKey), email, label: "live", revoked_at: null });
+  await assert.rejects(pairWith(device, issuePairCode({ email, issuedBy: `device:${deviceIdFor(live.publicKey)}` })));
+  assert.ok(devices.get(key).revoked_at);
+  // ...while it still works for a new device.
+  const fresh = await generateKeyPair();
+  const ok = await pairWith(fresh, issuePairCode({ email, issuedBy: `device:${deviceIdFor(live.publicKey)}` }));
+  assert.equal(ok.hello.paired, true);
+  await ok.session.goaway();
+  // The owner's loopback QR is the one way back for a revoked key.
+  const back = await pairWith(device, issuePairCode({ email, issuedBy: "localhost" }));
+  assert.equal(back.hello.paired, true);
+  await back.session.goaway();
+});
+
+test("revoking an issuer drops the codes it minted", () => {
+  _resetPairCodes();
+  const a = issuePairCode({ email, issuedBy: "device:aaaaaaaaaaaaaaaa" });
+  const b = issuePairCode({ email, issuedBy: "device:aaaaaaaaaaaaaaaa" });
+  const c = issuePairCode({ email, issuedBy: "localhost" });
+  assert.equal(revokeCodesIssuedBy("device:aaaaaaaaaaaaaaaa"), 2);
+  assert.equal(pskFor(a.codeId), null);
+  assert.equal(pskFor(b.codeId), null);
+  assert.ok(pskFor(c.codeId));
 });
 
 test("clients without the e2e subprotocol are refused (no downgrade)", async () => {

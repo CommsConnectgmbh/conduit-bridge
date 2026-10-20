@@ -1,13 +1,17 @@
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { mkdirSync } from "node:fs";
+import { ensurePrivateDir, tightenFile } from "./private-fs.mjs";
 
 const DB_DIR = process.env.DB_DIR || join(homedir(), "Library/conduit-bridge");
-mkdirSync(DB_DIR, { recursive: true });
+// Chat history is the most private thing the bridge stores: owner-only, and
+// installs from older versions are corrected here on every start.
+ensurePrivateDir(DB_DIR);
 const DB_PATH = join(DB_DIR, "db.sqlite");
 
 export const db = new DatabaseSync(DB_PATH);
+// SQLite gives the -wal and -shm files the mode of the database file.
+for (const f of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`]) tightenFile(f);
 // Two bridge processes can briefly overlap (a self-update restart), and WAL
 // allows that — but without a busy timeout every concurrent write throws
 // SQLITE_BUSY immediately, which surfaces as a wave of failed turns rather than
@@ -215,6 +219,7 @@ const EQ = {
       paired_via = excluded.paired_via, last_seen = excluded.last_seen, revoked_at = NULL
   `),
   get: db.prepare(`SELECT * FROM e2e_devices WHERE pubkey = ?`),
+  getById: db.prepare(`SELECT * FROM e2e_devices WHERE device_id = ?`),
   list: db.prepare(`SELECT * FROM e2e_devices WHERE email = ? ORDER BY created_at DESC LIMIT 200`),
   listAll: db.prepare(`SELECT * FROM e2e_devices ORDER BY created_at DESC LIMIT 500`),
   revoke: db.prepare(`UPDATE e2e_devices SET revoked_at = ? WHERE device_id = ? AND email = ? AND revoked_at IS NULL`),
@@ -231,6 +236,11 @@ export function addE2eDevice({ pubkey, deviceId, email, label, platform, pairedV
 /** The device row for a key, or null. Callers must check revoked_at. */
 export function getE2eDevice(pubkey) {
   return EQ.get.get(pubkey) || null;
+}
+
+/** The device row for a device id, or null. Callers must check revoked_at. */
+export function getE2eDeviceById(deviceId) {
+  return EQ.getById.get(deviceId) || null;
 }
 
 export function listE2eDevices(email) {

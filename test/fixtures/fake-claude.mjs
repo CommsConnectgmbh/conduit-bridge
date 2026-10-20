@@ -26,7 +26,11 @@ if (argv[0] === "auth") {
   process.exit(0);
 }
 
-const prompt = opt("-p");
+// The prompt is the positional argument behind `--`, as the bridge passes it
+// (`-p` itself is only the print flag). Options after `--` are not options.
+const dd = argv.indexOf("--");
+const prompt = dd === -1 ? null : argv[dd + 1];
+if (dd !== -1) argv.length = dd;
 const resume = opt("--resume");
 const sessionId = opt("--session-id");
 appendFileSync(join(HOME, "calls.jsonl"), JSON.stringify({ resume, sessionId, cwd: process.cwd(), model: opt("--model") }) + "\n");

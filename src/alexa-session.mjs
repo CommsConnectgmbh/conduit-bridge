@@ -100,8 +100,9 @@ export function createAlexaSession({
 
   /** One CLI run. Resolves exactly once; never rejects. */
   function runClaude(prompt, sessionArgs, budgetMs) {
-    const args = ["-p", prompt, "--model", model, "--output-format", "stream-json", "--verbose",
-      ...permissionArgs, ...sessionArgs];
+    // The prompt is spoken text: behind `--` it can never be read as an option.
+    const args = ["-p", "--model", model, "--output-format", "stream-json", "--verbose",
+      ...permissionArgs, ...sessionArgs, "--", prompt];
     return new Promise((resolve) => {
       let child;
       try {

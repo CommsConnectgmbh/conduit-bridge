@@ -31,7 +31,7 @@ const hex = (b) => Buffer.from(b).toString("hex");
  *   host: () => string,                     tunnel host the session is bound to
  *   identity: import("./e2e-noise.mjs").KeyPair,
  *   version: string,
- *   devices: { get(pubkeyHex): any, add(rec): void, touch(pubkeyHex): void },
+ *   devices: { get(pubkeyHex): any, byId(deviceId): any, add(rec): void, touch(pubkeyHex): void },
  *   handleHttp: (req, res, auth) => Promise<void>,
  *   handleChat: (ws, sid) => boolean,        returns false to refuse the sid
  *   log: (level, msg, meta?) => void,
@@ -96,6 +96,12 @@ export function createE2eEndpoint(deps) {
     const { session, deviceKey } = result;
     const key = hex(deviceKey);
     const device = deps.devices.get(key);
+    // The handshake is async: a revoke that landed while it ran must still win.
+    if (!device || device.revoked_at) {
+      deps.log("warn", "e2e_revoked_during_handshake", { device: device?.device_id || null });
+      session.goaway(GOAWAY.REVOKED, "revoked");
+      return;
+    }
     const set = sessionsByDevice.get(key) || new Set();
     sessionsByDevice.set(key, set);
     set.add(session);
@@ -128,6 +134,20 @@ export function createE2eEndpoint(deps) {
       const code = consumePairCode(codeId);
       if (!code) return null;
       const deviceId = deviceIdFor(deviceKey);
+      if (code.issuedBy.startsWith("device:")) {
+        // A code minted by a paired device is only as good as that device.
+        const issuer = deps.devices.byId(code.issuedBy.slice("device:".length));
+        if (!issuer || issuer.revoked_at || issuer.email !== code.email) {
+          deps.log("warn", "e2e_pair_issuer_revoked", { device: deviceId });
+          return null;
+        }
+        // A revoked key comes back only through the owner's loopback QR, never
+        // through a code some device handed out.
+        if (deps.devices.get(key)?.revoked_at) {
+          deps.log("warn", "e2e_pair_revoked_key", { device: deviceId });
+          return null;
+        }
+      }
       deps.devices.add({
         pubkey: key, deviceId, email: code.email,
         label: String(hello?.label || "Device").slice(0, 80),
