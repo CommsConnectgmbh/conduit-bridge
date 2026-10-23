@@ -124,8 +124,11 @@ const CLAUDE = {
       sink.onConversationId(ev.session_id);
     } else if (ev.type === "assistant" && ev.message?.content) {
       for (const block of ev.message.content) {
-        if (block.type === "text" && typeof block.text === "string") sink.onChunk(block.text);
-        else if (block.type === "tool_use") sink.onToolStart(block);
+        // Jeder Textblock ist ein eigener Absatz (Text → Tool → Text, oder
+        // zwei Blöcke in einer Nachricht); leere Blöcke fügen nichts ein.
+        if (block.type === "text") {
+          if (typeof block.text === "string" && block.text) sink.onChunk(sink.hasContent() ? `\n\n${block.text}` : block.text);
+        } else if (block.type === "tool_use") sink.onToolStart(block);
       }
     } else if (ev.type === "user" && ev.message?.content) {
       for (const block of ev.message.content) {

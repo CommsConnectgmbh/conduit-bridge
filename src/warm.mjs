@@ -127,6 +127,13 @@ export function createWarmPool({
     log("info", "warm_exit", { sid: p.sid, code, signal });
   }
 
+  function emitText(t, txt) {
+    const sep = t.newBlock && t.sawText ? "\n\n" : "";
+    t.newBlock = false;
+    t.sawText = true;
+    t.handlers.onChunk?.(sep + txt);
+  }
+
   function routeEvent(p, line) {
     let ev;
     try { ev = JSON.parse(line); } catch { return; }
@@ -139,12 +146,20 @@ export function createWarmPool({
     }
     if (!t || t.finished) return;
 
+    // A new text block (after a tool call, or a second one in the same
+    // message) is its own paragraph. The separator goes in front of its first
+    // non-empty delta, so an empty block adds nothing and the deltas inside a
+    // block stay exactly as streamed.
+    if (ev.type === "stream_event" && ev.event?.type === "content_block_start") {
+      if (ev.event.content_block?.type === "text") t.newBlock = true;
+      return;
+    }
     // Token-level streaming: incremental text deltas.
     if (ev.type === "stream_event" && ev.event?.type === "content_block_delta") {
       const txt = ev.event.delta?.text;
       if (typeof txt === "string" && txt) {
+        emitText(t, txt);
         t.sawDelta = true;
-        t.handlers.onChunk?.(txt);
       }
       return;
     }
@@ -154,8 +169,9 @@ export function createWarmPool({
       for (const block of ev.message.content) {
         if (block.type === "tool_use") {
           t.handlers.onToolUse?.(block);
-        } else if (block.type === "text" && !t.sawDelta && typeof block.text === "string") {
-          t.handlers.onChunk?.(block.text);
+        } else if (block.type === "text" && !t.sawDelta && typeof block.text === "string" && block.text) {
+          t.newBlock = true;
+          emitText(t, block.text);
         }
       }
       return;
