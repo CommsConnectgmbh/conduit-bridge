@@ -122,7 +122,7 @@ export function createE2eEndpoint(deps) {
         deps.log("error", "e2e_rpc_failed", { device: device.device_id, err: String(e?.message || e).slice(0, 120) });
         ch.close(CLOSE.ERROR, "internal error");
       });
-      if (ch.kind === KIND.CHAT) return serveChat(ch, auth);
+      if (ch.kind === KIND.CHAT) return serveChat(ch, auth, () => transport.lastRxAt);
       ch.close(CLOSE.REFUSED, "unsupported channel kind");
     });
   }
@@ -208,9 +208,9 @@ export function createE2eEndpoint(deps) {
 
   // ── chat: the existing socket handler on a channel ─────────────────────────
 
-  function serveChat(ch, auth) {
+  function serveChat(ch, auth, peerActiveAt) {
     const sid = String(ch.params.sid || "");
-    const ws = new ChannelSocket(ch, { ...auth, sid });
+    const ws = new ChannelSocket(ch, { ...auth, sid }, peerActiveAt);
     if (!/^[A-Za-z0-9_-]{8,100}$/.test(sid) || !deps.handleChat(ws, sid)) {
       ch.close(CLOSE.REFUSED, "session refused");
     }
@@ -221,18 +221,24 @@ export function createE2eEndpoint(deps) {
 
 /** `ws` WebSocket as a session transport. Text frames end the connection. */
 function wsTransport(ws) {
-  return {
+  const t = {
+    // When the device last sent anything on this connection (any session
+    // frame, including its keepalive pongs). A chat channel inside the session
+    // counts that as the device being there; see ChannelSocket.peerActiveAt.
+    lastRxAt: Date.now(),
     send(bytes) { ws.send(bytes, { binary: true }); },
     close() { try { ws.terminate(); } catch { /* gone */ } },
     get bufferedAmount() { return ws.bufferedAmount; },
     onMessage(cb) {
       ws.on("message", (data, isBinary) => {
         if (!isBinary) { try { ws.terminate(); } catch { /* gone */ } return; }
+        t.lastRxAt = Date.now();
         cb(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
       });
     },
     onClose(cb) { ws.on("close", cb); ws.on("error", () => {}); },
   };
+  return t;
 }
 
 /**
@@ -299,12 +305,15 @@ export class E2eResponse {
 export class ChannelSocket {
   #ch; #listeners = { message: [], close: [], pong: [] };
   #closed = false;
+  #peerActiveAt;
   isAlive = true;
   lastTrafficAt = Date.now();
 
-  constructor(ch, auth) {
+  /** @param {() => number} [peerActiveAt] when the session last heard from the device */
+  constructor(ch, auth, peerActiveAt = null) {
     this.#ch = ch;
     this.auth = auth;
+    this.#peerActiveAt = peerActiveAt;
     const reader = new MessageReader({
       maxBytes: LIMITS.chatMessageBytes,
       onMessage: (m) => {
@@ -326,6 +335,17 @@ export class ChannelSocket {
     this.#ch.write(encodeMessage(new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength))).catch(() => this.terminate());
   }
   ping() { this.lastTrafficAt = Date.now(); for (const cb of this.#listeners.pong) cb(); }
+  /**
+   * When the device was last heard from on the session that carries this
+   * channel. A chat channel is quiet between turns — the app only writes when
+   * the user sends something — while the session keeps itself alive with its
+   * own pings. Judging the channel by its own traffic alone closed every idle
+   * chat after about 90 seconds although the device was still connected.
+   */
+  peerActiveAt() {
+    if (this.#closed || this.#ch.closed) return 0;
+    try { return Number(this.#peerActiveAt?.()) || 0; } catch { return 0; }
+  }
   close() { this.#ch.close(CLOSE.NORMAL, "").catch?.(() => {}); this.#fireClose(); }
   terminate() { this.#ch.close(CLOSE.ERROR, "terminated").catch?.(() => {}); this.#fireClose(); }
   #fireClose() {

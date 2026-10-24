@@ -18,8 +18,9 @@ import {
   sessionOwner,
   latestSessionEmail,
   userMessageExists, assistantAfter, setMessageStatus, listSessionAudit, getAuditStep,
-  searchHistory,
+  searchHistory, closeStaleTurns, auditForAssistant, closeRunningAuditFor,
 } from "./db.mjs";
+import { createJournal, journalDirFromEnv } from "./journal.mjs";
 import {
   addE2eDevice, getE2eDevice, getE2eDeviceById, listE2eDevices, revokeE2eDevice, touchE2eDevice,
   db as historyDb,
@@ -176,7 +177,10 @@ const IDLE_TTL_MS = 12 * 60 * 60 * 1000; // 12h in-memory state
 // Keep child alive long enough for the user to come back and re-attach via
 // {type:"attach"}. The answer streams into the DB regardless; the grace timer
 // is a safety net for truly orphaned runaway tool-runs.
-const ORPHAN_CHILD_GRACE_MS = 30 * 60_000; // 30 min
+// Kept as a safety limit, but configurable: a long agent run on the one-shot
+// path is otherwise cut off 30 min after the phone went to sleep. The turn is
+// recorded as an error ("orphan") either way, never as a finished answer.
+const ORPHAN_CHILD_GRACE_MS = intEnv("CONDUIT_ORPHAN_GRACE_MS", 30 * 60_000, 60_000, 7 * 24 * 3600_000);
 const INFLIGHT_DONE_TTL_MS = 5 * 60_000;   // keep finished inflight around for late attach
 const MAX_BUF = 1_000_000;
 const LOG_FILE = join(LOG_DIR, "bridge.log");
@@ -190,7 +194,11 @@ const HOUSEKEEPING = readHousekeepingPolicy(process.env, {
 for (const err of HOUSEKEEPING.errors) console.error(`[conduit] ${err}`);
 const MAX_LOG_BYTES = HOUSEKEEPING.logMaxBytes;
 const MAX_LOG_FILES = HOUSEKEEPING.logFiles;
-const WS_PONG_TIMEOUT_MS = 75_000;       // terminate WS if no client traffic
+// Terminate a chat socket after this long without hearing from the device.
+// "Hearing" includes the E2E session's own keepalive (see ChannelSocket.
+// peerActiveAt); configurable only so tests need not wait 90 s.
+const WS_PONG_TIMEOUT_MS = intEnv("CONDUIT_CHAT_SILENT_MS", 75_000, 1000, 3600_000);
+const WS_WATCH_INTERVAL_MS = Math.min(15_000, Math.max(250, Math.floor(WS_PONG_TIMEOUT_MS / 3)));
 const CHILD_STALL_MS = intEnv("CONDUIT_TURN_STALL_MS", 900_000, 1000, 24 * 3600_000); // no stdout for this long → kill claude
 const CHILD_HEARTBEAT_MS = 10_000;       // tick interval for the "still working" heartbeat
 const CHILD_HEARTBEAT_MIN_SILENCE_MS = 3_000; // only emit once silence exceeds this, so lively chunks aren't drowned in beats
@@ -406,6 +414,16 @@ const log = (level, msg, meta = {}) => {
 /** sessionRuntime: sid -> { claudeSessionId, lastUsed, child? } */
 const runtime = new Map();
 
+// Automatic per-session task journal: bridge metadata plus filtered agent
+// checkpoints (see journal.mjs). The raw checkpoint files agents write stay in
+// a private folder next to the database; only the filtered copy reaches the
+// journal folder, which may be a shared one (CONDUIT_JOURNAL_DIR).
+const journal = createJournal({
+  dir: journalDirFromEnv(process.env, join(process.env.DB_DIR || join(homedir(), "Library/conduit-bridge"), "journal")),
+  checkpointDir: join(process.env.DB_DIR || join(homedir(), "Library/conduit-bridge"), "checkpoints"),
+  log,
+});
+
 // Local speech (speech-service.mjs). Holds nothing until a model is used.
 const speech = createSpeechService({ log });
 // 125 s of 48 kHz PCM16 mono plus the header; the app sends 16 kHz.
@@ -417,7 +435,7 @@ const TRANSCRIBE_MAX_BYTES = SPEECH_LIMITS.sttSeconds * 48000 * 2 + 4096;
 const warmPool = USE_WARM
   ? createWarmPool({
       claudeBin: CLAUDE_BIN, model: MODEL, defaultCwd: CWD,
-      env: process.env, log, isUuid,
+      env: process.env, envFor: (sid) => agentEnvFor(sid), systemPromptFor: (sid) => agentContextFor(sid), log, isUuid,
       maxWarm: WARM_MAX, idleMs: WARM_IDLE_MS, stallMs: CHILD_STALL_MS,
     })
   : null;
@@ -1011,6 +1029,12 @@ async function handleApi(req, res, u, auth) {
         available: updateAvailable,
       },
       activeChildren: [...runtime.values()].filter((r) => r.inflight?.proc || r.inflight?.warm).length,
+      // Whether the automatic journal is being written. A failure shows here
+      // instead of the journal silently going quiet.
+      journal: journal.status(),
+      // Features a client can rely on: turnStatus on every turn frame, the
+      // /messages and /inflight fields.
+      features: { turnStatus: 1 },
     });
   }
 
@@ -1219,7 +1243,17 @@ async function handleApi(req, res, u, auth) {
       const steps = listSessionAudit(sid, email) || [];
       return json(res, 200, {
         ok: true,
-        messages: msgs.map((r) => ({ id: r.id, role: r.role, content: r.content, ts: r.ts, model: r.model || null })),
+        // turnStatus/turnError: how each answer ended (see TURN_STATES in
+        // db.mjs). null on user rows; "unknown" on answers an older bridge
+        // stored without recording the end — those are not claimed as success.
+        messages: msgs.map((r) => ({
+          id: r.id, role: r.role, content: r.content, ts: r.ts, model: r.model || null,
+          replyTo: r.reply_to || null,
+          turnStatus: r.role === "assistant" ? (r.turn_status || "unknown") : null,
+          turnError: r.role === "assistant" && r.turn_status !== "ok"
+            ? (r.turn_error || (r.turn_status ? null : TURN_MESSAGES.legacy))
+            : null,
+        })),
         steps: steps.map((r) => ({
           id: r.id,
           assistantId: r.assistant_id,
@@ -1251,9 +1285,11 @@ async function handleApi(req, res, u, auth) {
         ok: true,
         inflight: true,
         assistantMessageId: inf.assistantId,
+        userMessageId: inf.userMessageId || null,
         content: inf.content,
         done: !!inf.done,
         running: !inf.done,
+        turnStatus: turnStateOf(inf),
         error: inf.errorMsg || null,
       });
     }
@@ -1264,6 +1300,12 @@ async function handleApi(req, res, u, auth) {
       // anyway would let any authenticated caller SIGTERM a foreign session's
       // live child and wipe its reconnect state.
       if (!r.changes) return json(res, 404, { ok: false, error: "not found" });
+      if (journal.enabled) {
+        journal.sessionEvent(sid, "deleted");
+        // The agent's raw checkpoint file goes with the chat; the filtered
+        // journal stays (it is the record that the chat existed and ended).
+        journal.forgetCheckpoints(sid);
+      }
       const rt = runtime.get(sid);
       if (rt?.inflight && !rt.inflight.done) {
         // Mark BEFORE stopping the warm proc. warmPool.stop() surfaces as
@@ -1452,6 +1494,7 @@ function maybeFlushQueue(rt) {
     userMessageId: next.userMessageId,
     assistantMessageId: next.assistantId,
     queueLength: rt.promptQueue.length,
+    turnStatus: "running",
   });
   log("info", "queue_flush_start", { sid: rt.sid, remaining: rt.promptQueue.length });
   spawnInflight(rt, next.sess, next.content, next.assistantId, next.userMessageId, next.engine, next.model);
@@ -1496,6 +1539,7 @@ function armTurnDeadline(rt, inflight, stop) {
   inflight.deadlineTimer = setTimeout(() => {
     if (rt.inflight !== inflight || inflight.done) return;
     inflight.abortedByStall = true;   // reported as an abort, not a clean done
+    inflight.deadlineHit = true;
     inflight.errorMsg = `Stopped after the hard limit of ${Math.round(MAX_TURN_MS / 60000)} minutes.`;
     log("warn", "turn_deadline_exceeded", { sid: rt.sid, ms: MAX_TURN_MS });
     broadcast(rt, { type: "error", message: inflight.errorMsg, assistantMessageId: inflight.assistantId });
@@ -1522,6 +1566,12 @@ function killInflight(rt, reason) {
   // that stale kill happens to make room for a fresh turn, not to abandon work.
   if (reason === "client_stop" && rt.promptQueue?.length) {
     log("info", "queue_cleared_on_stop", { sid: rt.sid, count: rt.promptQueue.length });
+    // Their placeholders were written as 'queued'; left alone they would read
+    // as still waiting forever.
+    for (const q of rt.promptQueue) {
+      recordTurnEnd(rt, { assistantId: q.assistantId, userMessageId: q.userMessageId, engine: q.engine, model: q.model, content: "" },
+        "not_started", { error: "Cancelled with Stop before it started. It was not run.", kind: "stopped" });
+    }
     rt.promptQueue = [];
     broadcast(rt, { type: "queue_cleared" });
   }
@@ -1610,6 +1660,8 @@ function toolSummary(input) {
 // the answer text, this is now the ONLY record of what a turn did — the client
 // builds its collapsed "what happened" summary from these.
 function emitActivityStart(rt, inflight, block) {
+  // From here on the turn may have had side effects: no automatic re-run.
+  inflight.toolsStarted = (inflight.toolsStarted || 0) + 1;
   const summary = toolSummary(block?.input);
   const id = block?.id || null;
   if (id) {
@@ -1643,6 +1695,10 @@ function emitActivityEnd(rt, inflight, block) {
     durationMs,
   });
   recordAuditEnd(rt.sid, block?.tool_use_id, !block?.is_error, out.text, out.bytes, durationMs);
+  // A finished tool step is where an agent saves a checkpoint (it writes the
+  // file with a tool). Picked up right away, so a crash a minute later still
+  // leaves it in the journal.
+  if (journal.enabled) { try { journal.ingestCheckpoint(rt.sid, { assistantId: inflight.assistantId }); } catch {} }
 }
 
 // Delta/snapshot guard: Claude CLI can emit either real deltas or cumulative
@@ -1712,7 +1768,77 @@ function buildHeartbeat(inflight, silentMs, warm) {
  */
 function markStreamError(rt, inflight, msg) {
   inflight.errorMsg = inflight.errorMsg || msg || "Claude reported an error";
-  try { setMessageStatus(rt.sid, inflight.assistantId, "error"); } catch {}
+  inflight.errorKind = inflight.errorKind || "agent_error";
+  try { setMessageStatus(rt.sid, inflight.assistantId, "error", inflight.errorMsg); } catch {}
+}
+
+// What a replay says about a turn the bridge can no longer finish. Never
+// "please wait" and never success: these turns are over.
+const TURN_MESSAGES = {
+  interrupted: "The bridge restarted while this answer was running. It was not repeated automatically, because its tools may already have run. Check the result, then send it again if needed.",
+  notStarted: "The bridge restarted before this message was started. It was not run. Please send it again.",
+  unknown: "The outcome of this answer is unknown. It was not repeated automatically. Check the result, then send it again if needed.",
+  noRecord: "This message reached the bridge before, but no answer was recorded. It was not run again. Check the current result and saved work log before continuing.",
+  emptyAfterTools: "The agent ran tools but sent no text. It was not repeated automatically, because those tools may have had effects.",
+  signal: "The agent process was ended from outside before it finished. The answer is incomplete and was not repeated automatically.",
+  legacy: "This answer was stored by an older bridge version that did not record how it ended. It was not run again.",
+};
+
+/** The error text for a turn that was stopped, by why it was stopped. */
+function stopMessage(reason) {
+  if (reason === "client_stop") return "Stopped. The answer is incomplete.";
+  if (reason === "orphan") return `Stopped after ${Math.round(ORPHAN_CHILD_GRACE_MS / 60000)} minutes without a connected app (safety limit). The answer is incomplete.`;
+  return "Interrupted. The answer is incomplete.";
+}
+function stopKind(reason) {
+  if (reason === "client_stop") return "stopped";
+  if (reason === "orphan") return "orphan";
+  if (reason === "dead_on_new_prompt") return "superseded";
+  if (reason === "session_delete") return "deleted";
+  return "interrupted";
+}
+
+/** The terminal state of a turn as a replay should report it. */
+function turnStateOf(inf) {
+  if (!inf.done) return "running";
+  return inf.finalState || (inf.errorMsg ? "error" : "ok");
+}
+
+/** A turn was accepted: persist the state and journal it. */
+function recordTurnAccepted(rt, t) {
+  if (t.state === "running") {
+    try { setMessageStatus(rt.sid, t.assistantId, "running"); } catch {}
+  }
+  if (journal.enabled) journal.turnAccepted(rt.sid, { ...t, ts: Date.now() });
+}
+
+/**
+ * A turn reached its end: persist state + error text, journal the outcome.
+ * Every terminal path goes through here so the DB, the replay and the journal
+ * cannot disagree about how a turn ended.
+ */
+function recordTurnEnd(rt, inflight, state, { error = null, kind = null } = {}) {
+  if (inflight.recordedEnd) return;
+  inflight.recordedEnd = true;
+  inflight.finalState = state;
+  try { setMessageStatus(rt.sid, inflight.assistantId, state, state === "ok" ? null : (error || inflight.errorMsg || null)); } catch {}
+  // A failed turn's open steps are over too. Not for 'ok': a clean finish has
+  // delivered every tool result already.
+  if (state !== "ok") closeRunningAuditFor(rt.sid, inflight.assistantId);
+  if (!journal.enabled) return;
+  // A checkpoint saved in the last step, before the end is journaled.
+  try { journal.ingestCheckpoint(rt.sid, { assistantId: inflight.assistantId }); } catch {}
+  journal.turnFinished(rt.sid, {
+    state, kind,
+    assistantId: inflight.assistantId,
+    userMessageId: inflight.userMessageId,
+    engine: inflight.engine || rt.engine,
+    model: inflight.model || rt.model,
+    startedAt: inflight.startedAt,
+    chars: (inflight.content || "").length,
+    steps: auditForAssistant(rt.sid, inflight.assistantId),
+    ts: Date.now(),
+  });
 }
 
 /**
@@ -1839,11 +1965,11 @@ function spawnInflight(rt, sess, prompt, assistantId, userMessageId = null, engi
   // this point this turn is not yet counted — hence >= against the ceiling.
   if (activeTurnCount() >= MAX_CONCURRENT_TURNS) {
     log("warn", "turn_rejected_at_capacity", { sid: rt.sid, active: MAX_CONCURRENT_TURNS });
-    broadcast(rt, {
-      type: "error",
-      message: "Too many runs at once. Please wait a moment and send again.",
-      assistantMessageId: assistantId,
-    });
+    const message = "Too many runs at once. Please wait a moment and send again.";
+    // Without a recorded end the placeholder stayed open, and a later replay
+    // could not tell this refusal from a turn that was still coming.
+    recordTurnEnd(rt, { assistantId, userMessageId, engine, model, startedAt: Date.now(), content: "" }, "error", { error: message, kind: "capacity" });
+    broadcast(rt, { type: "error", message, assistantMessageId: assistantId, turnStatus: "error" });
     return;
   }
   // Kennung → Registry-Eintrag. Ein unbekannter Wert (alter Client, alte
@@ -1855,8 +1981,8 @@ function spawnInflight(rt, sess, prompt, assistantId, userMessageId = null, engi
   const blocked = enginePolicyBlock(engineDef);
   if (blocked) {
     log("warn", "turn_blocked_by_policy", { sid: rt.sid, engine: engineDef.id });
-    try { setMessageStatus(rt.sid, assistantId, "error"); } catch {}
-    broadcast(rt, { type: "error", message: blocked, assistantMessageId: assistantId });
+    recordTurnEnd(rt, { assistantId, userMessageId, engine: engineDef.id, model, startedAt: Date.now(), content: "" }, "error", { error: blocked, kind: "policy" });
+    broadcast(rt, { type: "error", message: blocked, assistantMessageId: assistantId, turnStatus: "error" });
     maybeFlushQueue(rt);
     return;
   }
@@ -1864,6 +1990,9 @@ function spawnInflight(rt, sess, prompt, assistantId, userMessageId = null, engi
   // Turns: nur eine CLI, die einen langlebigen Prozess mit stream-json-Eingabe
   // beherrscht, kann darüber laufen. Ist er abgeschaltet (CONDUIT_WARM=0),
   // nimmt auch sie den Ein-Turn-Prozess-Pfad.
+  // Persisted BEFORE anything is spawned: from this point a crash must read as
+  // "interrupted" (tools may have run), not as "never started".
+  recordTurnAccepted(rt, { state: "running", assistantId, userMessageId, engine: engineDef.id, model: model || rt.model || sess.model });
   if (engineDef.usesWarmPool && warmPool) {
     return spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId);
   }
@@ -1878,6 +2007,7 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null) 
 
   const inflight = {
     assistantId, userMessageId, content: "", done: false, errorMsg: null,
+    engine: CLAUDE_ENGINE.id, model: rt.model || sess?.model || null,
     proc: null,             // warm: the pool owns the long-lived process
     warm: true, stopRequested: false, fellBack: false,
     lastOutputAt: Date.now(),
@@ -1894,7 +2024,7 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null) 
     if (inflight.stallTimer) { clearTimeout(inflight.stallTimer); inflight.stallTimer = null; }
     if (inflight.heartbeatTimer) { clearInterval(inflight.heartbeatTimer); inflight.heartbeatTimer = null; }
   };
-  const finishTurn = (errorMsg) => {
+  const finishTurn = (errorMsg, kind = null) => {
     if (inflight.done) return;
     // A warm turn that ends cleanly with zero assistant content is NOT a
     // success: the DB row stays empty, the client renders a blank bubble, and
@@ -1904,7 +2034,11 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null) 
     // path — that gives the user a real answer instead of a silent dead card.
     // `fellBack` guards against a double-fallback loop (the onError path below
     // already sets it for the empty-error case).
-    if (!errorMsg && inflight.content === "" && !inflight.fellBack
+    //
+    // Only while no tool has started: a turn that ran tools but wrote no text
+    // may already have changed files or sent something, and running the prompt
+    // again would do it twice.
+    if (!errorMsg && inflight.content === "" && !inflight.fellBack && !inflight.toolsStarted
         && !inflight.stopRequested && rt.inflight === inflight) {
       inflight.fellBack = true;
       clearTimers();
@@ -1918,10 +2052,13 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null) 
     // If we somehow still end up here with an empty content and no error, do
     // NOT persist 'ok' — that is exactly the leere-Bubble bug. Convert it to
     // a visible error so the client shows a retry state, not a dead card.
-    const finalError = errorMsg || (inflight.content === "" && !inflight.stopRequested
-      ? CLAUDE_ENGINE.messages.emptyTurn
-      : null);
-    try { setMessageStatus(rt.sid, inflight.assistantId, finalError ? "error" : "ok"); } catch {}
+    let finalKind = kind;
+    let finalError = errorMsg;
+    if (!finalError && inflight.content === "" && !inflight.stopRequested) {
+      finalError = inflight.toolsStarted ? TURN_MESSAGES.emptyAfterTools : CLAUDE_ENGINE.messages.emptyTurn;
+      finalKind = inflight.toolsStarted ? "empty_after_tools" : "empty";
+    }
+    recordTurnEnd(rt, inflight, finalError ? "error" : "ok", { error: finalError, kind: finalError ? (finalKind || "agent_error") : null });
     // If this inflight was already replaced by a newer turn (it was killed as a
     // dead-on-new-prompt and its warm process only exited afterwards), its late
     // done/error must NOT be broadcast — the client would apply that terminal
@@ -1934,9 +2071,9 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null) 
     }
     if (finalError) {
       inflight.errorMsg = finalError;
-      broadcast(rt, { type: "error", message: finalError, assistantMessageId: inflight.assistantId });
+      broadcast(rt, { type: "error", message: finalError, assistantMessageId: inflight.assistantId, turnStatus: inflight.finalState });
     } else {
-      broadcast(rt, { type: "done", assistantMessageId: inflight.assistantId });
+      broadcast(rt, { type: "done", assistantMessageId: inflight.assistantId, turnStatus: "ok" });
     }
     log("info", "claude_done", { sid: rt.sid, warm: true, err: !!finalError });
     if (rt.inflightClearTimer) clearTimeout(rt.inflightClearTimer);
@@ -1948,7 +2085,7 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null) 
     maybeFlushQueue(rt);
   };
 
-  armTurnDeadline(rt, inflight, () => warmPool.stop(rt.sid));
+  armTurnDeadline(rt, inflight, () => { inflight.stopRequested = true; warmPool.stop(rt.sid); });
   const armStall = () => {
     inflight.lastOutputAt = Date.now();
     if (inflight.stallTimer) clearTimeout(inflight.stallTimer);
@@ -1961,7 +2098,7 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null) 
       if (!inflight.done) {
         warmPool.stop(rt.sid);
         log("warn", "child_killed", { sid: rt.sid, reason: "stall", warm: true });
-        finishTurn(CLAUDE_ENGINE.messages.stall);
+        finishTurn(CLAUDE_ENGINE.messages.stall, "stall");
       }
     }, CHILD_STALL_MS);
     inflight.stallTimer.unref?.();
@@ -1996,16 +2133,18 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null) 
       onDone: () => finishTurn(null),
       onError: (msg, info) => {
         if (inflight.stopRequested) {
-          finishTurn(inflight.abortedByStop === "client_stop"
-            ? "Stopped. The answer is incomplete."
-            : null);
+          // Every stop is reported as one. Passing null for anything but a
+          // user stop recorded an interrupted turn (deadline, superseded,
+          // shutdown) as a finished answer.
+          finishTurn(inflight.deadlineHit ? inflight.errorMsg : stopMessage(inflight.abortedByStop),
+            inflight.deadlineHit ? "deadline" : stopKind(inflight.abortedByStop));
           return;
         }
         // A stall is a *terminal* verdict from the pool watchdog, not an early
         // warm failure. Retrying it through the one-shot path re-ran a prompt
         // that had already been executing for 15 minutes — with
         // bypassPermissions, so any side effects happened a second time.
-        if (info?.stall || info?.terminal) { finishTurn(msg); return; }
+        if (info?.stall || info?.terminal) { finishTurn(msg, info?.stall ? "stall" : "agent_error"); return; }
         // Warm turn died before producing any output → transparently retry once
         // via the one-shot path so the user still gets an answer.
         // The supersede guard belongs here too. Without it a late error from a
@@ -2014,7 +2153,9 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null) 
         // then re-ran the old prompt through the one-shot path, executing its
         // side effects a second time.
         if (rt.inflight !== inflight) { clearTimers(); return; }
-        if (inflight.content === "" && !inflight.done && !inflight.fellBack) {
+        // Same rule as the empty-turn fallback: once a tool has started, the
+        // prompt is never run a second time.
+        if (inflight.content === "" && !inflight.done && !inflight.fellBack && !inflight.toolsStarted) {
           inflight.fellBack = true;
           clearTimers();
           log("warn", "warm_fallback_oneshot", { sid: rt.sid, reason: String(msg).slice(0, 120) });
@@ -2022,7 +2163,7 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null) 
           runInflightTurn(CLAUDE_ENGINE, rt, sess, prompt, assistantId, userMessageId);
           return;
         }
-        finishTurn(msg);
+        finishTurn(msg, "agent_error");
       },
     },
   });
@@ -2037,9 +2178,27 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null) 
  * kennt nur noch dieses Handle und nicht mehr die Frage, ob dahinter ein
  * Kindprozess oder eine offene HTTP-Antwort steckt.
  */
-function startChildTransport(engine, { cwd, args, hooks }) {
+/** Extra environment for an agent run in session `sid`: where that session's
+ *  journal and checkpoint file are. */
+function agentEnvFor(sid) {
+  try { return journal.agentEnv(sid); } catch { return {}; }
+}
+
+/** What an agent of session `sid` is told about the journal (paths, how to
+ *  save a checkpoint, where the last saved one is). Fixed bridge text and
+ *  paths only, never checkpoint content (see journal.agentContext). Given to
+ *  Claude as an appended system prompt and to Codex ahead of the prompt,
+ *  marked as bridge context; an environment variable
+ *  alone is something the agent would never look at. Not given to engines
+ *  without tools (nothing to save) or to Gemini (no internal data there). */
+function agentContextFor(sid) {
+  try { return journal.agentContext(sid); } catch { return null; }
+}
+const ENGINES_WITH_JOURNAL_CONTEXT = new Set(["claude", "codex"]);
+
+function startChildTransport(engine, { cwd, args, hooks, sid = null }) {
   const child = spawn(engine.bin, args, {
-    cwd, env: { ...process.env, FORCE_COLOR: "0" },
+    cwd, env: { ...process.env, ...(sid ? agentEnvFor(sid) : {}), FORCE_COLOR: "0" },
     stdio: ["ignore", "pipe", "pipe"],
   });
   // See the Alexa path: decode across chunk boundaries, not per chunk.
@@ -2192,7 +2351,13 @@ function runInflightTurn(engine, rt, sess, prompt, assistantId, userMessageId = 
   // jetzt auch ins Runtime-Objekt — sonst sucht der nächste Turn sie dort
   // vergeblich und fängt die Unterhaltung von vorn an.
   if (resumeId) rt[engine.conversation.rtField] = resumeId;
-  const finalPrompt = engine.preparePrompt({ prompt, sid: rt.sid, email: sess?.user_email, userMessageId, resumeId });
+  const journalContext = ENGINES_WITH_JOURNAL_CONTEXT.has(engine.id) ? agentContextFor(rt.sid) : null;
+  let finalPrompt = engine.preparePrompt({ prompt, sid: rt.sid, email: sess?.user_email, userMessageId, resumeId });
+  // Codex has no system-prompt option for `exec`; the context goes ahead of
+  // the prompt, marked as coming from the bridge.
+  if (journalContext && engine.id === "codex") {
+    finalPrompt = `[Conduit bridge context, not part of the user's message]\n${journalContext}\n[End of Conduit bridge context]\n\n${finalPrompt}`;
+  }
 
   // `len` misst den Prompt des Nutzers, nicht den womöglich um den bisherigen
   // Verlauf erweiterten Text: die Zahl im Log soll das sein, was er abgeschickt hat.
@@ -2217,6 +2382,7 @@ function runInflightTurn(engine, rt, sess, prompt, assistantId, userMessageId = 
     stallTimer: null,
     heartbeatTimer: null,
     engine: engine.id,
+    model: targetModel || null,
   };
   // Einmal pro Turn gebaut, nicht pro gelesener Zeile: ein Agent-Lauf schickt
   // tausende Events durch diesen Pfad.
@@ -2258,6 +2424,12 @@ function runInflightTurn(engine, rt, sess, prompt, assistantId, userMessageId = 
       // Superseded by a newer turn (killed as dead-on-new-prompt, exited late) →
       // swallow the terminal frame so it can't truncate the live turn.
       if (rt.inflight !== inflight) {
+        // Its row still needs an end, or it stays "running" until the next
+        // restart and is then misreported as cut off by that restart.
+        recordTurnEnd(rt, inflight, "error", {
+          error: inflight.errorMsg || stopMessage(inflight.abortedByStop),
+          kind: inflight.abortedByStop ? stopKind(inflight.abortedByStop) : "superseded",
+        });
         log("info", engine.logs.done, { sid: rt.sid, code, signal, superseded: true });
         return;
       }
@@ -2273,35 +2445,48 @@ function runInflightTurn(engine, rt, sess, prompt, assistantId, userMessageId = 
       // zero content is not a success. This is the LAST retry path (we may have
       // arrived here from the warm-fallback), so we don't retry again — we just
       // stop lying about the outcome and surface a visible error.
+      //
+      // Only an exit code of 0 counts as a clean end. Every stop the bridge
+      // itself makes is marked (abortedByStop / abortedByStall / shutdown), so
+      // a signal without a mark came from outside — a user's `kill`, the OS, a
+      // crashing parent — and the answer is cut off even when text arrived.
+      const exitSignal = signal || (code === 130 || code === 137 || code === 143 ? `exit ${code}` : null);
       const emptyOK = !inflight.abortedByStall && !inflight.abortedByStop
-        && !inflight.errorMsg && (code === 0 || signal === "SIGTERM")
-        && inflight.content === "";
-      // Persist the verdict so a retry after a restart replays the truth rather
-      // than reporting every stored answer as a clean success.
-      try {
-        setMessageStatus(rt.sid, inflight.assistantId,
-          (inflight.abortedByStall || inflight.abortedByStop || inflight.errorMsg || (code !== 0 && signal !== "SIGTERM") || emptyOK) ? "error" : "ok");
-      } catch {}
+        && !inflight.errorMsg && code === 0 && inflight.content === "";
+      // Work out the verdict first, then persist it (state + message + journal)
+      // in one place, so a retry after a restart replays the truth rather than
+      // reporting every stored answer as a clean success.
+      let kind = null;
+      let state = null;
       if (inflight.abortedByStop) {
-        inflight.errorMsg = inflight.errorMsg || "Stopped. The answer is incomplete.";
-        broadcast(rt, { type: "error", message: inflight.errorMsg, assistantMessageId: inflight.assistantId });
+        inflight.errorMsg = inflight.errorMsg || stopMessage(inflight.abortedByStop);
+        kind = stopKind(inflight.abortedByStop);
       } else if (inflight.abortedByStall) {
         // Killed by the stall watchdog: the answer is truncated. SIGTERM would
         // otherwise fall into the `done` branch below and the client would show
         // a half-written answer as complete.
         inflight.errorMsg = inflight.errorMsg || engine.messages.stallIncomplete;
-        broadcast(rt, { type: "error", message: inflight.errorMsg, assistantMessageId: inflight.assistantId });
+        kind = inflight.deadlineHit ? "deadline" : "stall";
       } else if (inflight.errorMsg) {
-        broadcast(rt, { type: "error", message: inflight.errorMsg, assistantMessageId: inflight.assistantId });
-      } else if (code !== 0 && signal !== "SIGTERM") {
+        kind = inflight.errorKind || "agent_error";
+      } else if (exitSignal) {
+        inflight.errorMsg = TURN_MESSAGES.signal;
+        kind = "signal";
+        state = "interrupted";
+        log("warn", "child_ended_by_signal", { sid: rt.sid, code, signal });
+      } else if (code !== 0) {
         inflight.errorMsg = engine.messages.exit(code, inflight.stderrBuf.trim().slice(0, 600) || "unbekannt");
-        broadcast(rt, { type: "error", message: inflight.errorMsg, assistantMessageId: inflight.assistantId });
+        kind = "exit";
       } else if (emptyOK) {
-        inflight.errorMsg = engine.messages.emptyTurn;
+        inflight.errorMsg = inflight.toolsStarted ? TURN_MESSAGES.emptyAfterTools : engine.messages.emptyTurn;
+        kind = inflight.toolsStarted ? "empty_after_tools" : "empty";
         log("warn", engine.logs.emptyTurn, { sid: rt.sid, code, signal });
-        broadcast(rt, { type: "error", message: inflight.errorMsg, assistantMessageId: inflight.assistantId });
+      }
+      recordTurnEnd(rt, inflight, state || (inflight.errorMsg ? "error" : "ok"), { error: inflight.errorMsg, kind });
+      if (inflight.errorMsg) {
+        broadcast(rt, { type: "error", message: inflight.errorMsg, assistantMessageId: inflight.assistantId, turnStatus: inflight.finalState });
       } else {
-        broadcast(rt, { type: "done", assistantMessageId: inflight.assistantId });
+        broadcast(rt, { type: "done", assistantMessageId: inflight.assistantId, turnStatus: "ok" });
       }
       log("info", engine.logs.done, { sid: rt.sid, code, signal });
       // Keep the finished inflight around briefly so a slightly-late reconnect can
@@ -2322,8 +2507,8 @@ function runInflightTurn(engine, rt, sess, prompt, assistantId, userMessageId = 
       if (inflight.wrappedUp) return;
       inflight.wrappedUp = true;
       inflight.errorMsg = engine.messages.procError(msg);
-      try { setMessageStatus(rt.sid, inflight.assistantId, "error"); } catch {}
-      broadcast(rt, { type: "error", message: inflight.errorMsg, assistantMessageId: inflight.assistantId });
+      recordTurnEnd(rt, inflight, "error", { error: inflight.errorMsg, kind: "spawn" });
+      broadcast(rt, { type: "error", message: inflight.errorMsg, assistantMessageId: inflight.assistantId, turnStatus: "error" });
       inflight.done = true;
       inflight.proc = null;
       if (rt.inflight !== inflight) return;
@@ -2363,13 +2548,16 @@ function runInflightTurn(engine, rt, sess, prompt, assistantId, userMessageId = 
         // Nur eine UUID taugt als vorgegebene Session-Id; der PWA-Fallback erzeugt
         // im unsicheren Kontext ein "id-<ts>-<rand>", das die CLI zurückweist.
         sessionId: isUuid(rt.sid) ? rt.sid : null,
+        systemAppend: engine.id === "claude" ? journalContext : null,
       });
-      proc = startChildTransport(engine, { cwd: spawnCwd, args, hooks });
+      proc = startChildTransport(engine, { cwd: spawnCwd, args, hooks, sid: ENGINES_WITH_JOURNAL_CONTEXT.has(engine.id) ? rt.sid : null });
     }
   } catch (e) {
     // Without the wrap-up the queue would sit here forever: no inflight is ever
     // created, so nothing later calls maybeFlushQueue.
-    broadcast(rt, { type: "error", message: engine.messages.spawnFailed(e.message), assistantMessageId: assistantId });
+    inflight.errorMsg = engine.messages.spawnFailed(e.message);
+    recordTurnEnd(rt, inflight, "error", { error: inflight.errorMsg, kind: "spawn" });
+    broadcast(rt, { type: "error", message: inflight.errorMsg, assistantMessageId: assistantId, turnStatus: "error" });
     rt.inflight = null;
     maybeFlushQueue(rt);
     return;
@@ -2448,13 +2636,18 @@ function handleSocket(ws) {
     rt.orphanKillTimer = null;
   }
 
-  // Detect client gone: if no ping/pong/message for ~75s, terminate this WS.
+  // Detect client gone: nothing from the device for ~75s, neither on this
+  // channel nor on the session carrying it. Counting only the channel's own
+  // frames ended every idle chat after ~90 s (19.10. 18:16–18:30 in bridge.log):
+  // the app writes on the chat channel only when the user sends something, and
+  // the session's keepalive never reached this check.
   const clientWatch = setInterval(() => {
-    if (Date.now() - ws.lastTrafficAt > WS_PONG_TIMEOUT_MS) {
-      log("warn", "ws_silent_client_terminate", { sid });
+    const heard = Math.max(ws.lastTrafficAt || 0, typeof ws.peerActiveAt === "function" ? ws.peerActiveAt() : 0);
+    if (Date.now() - heard > WS_PONG_TIMEOUT_MS) {
+      log("warn", "ws_silent_client_terminate", { sid, silentMs: Date.now() - heard });
       try { ws.terminate(); } catch {}
     }
-  }, 15_000);
+  }, WS_WATCH_INTERVAL_MS);
   clientWatch.unref();
 
   // NOTE: the body is wrapped in try/catch (see the end of this handler). This
@@ -2490,17 +2683,24 @@ function handleSocket(ws) {
       const inf = rt.inflight;
       const queueLength = rt.promptQueue?.length || 0;
       if (inf) {
+        // turnStatus/error ride on the snapshot itself, so a client can settle
+        // the turn from this one frame. The terminal frame still follows for
+        // clients that predate these fields.
+        const turnStatus = turnStateOf(inf);
         send({
           type: "resumed",
           assistantMessageId: inf.assistantId,
+          userMessageId: inf.userMessageId || null,
           content: inf.content,
           seq: inf.seq || 0,
           done: inf.done,
+          turnStatus,
+          error: inf.done ? (inf.errorMsg || null) : null,
           queueLength,
         });
         if (inf.done) {
-          if (inf.errorMsg) send({ type: "error", message: inf.errorMsg, assistantMessageId: inf.assistantId });
-          else send({ type: "done", assistantMessageId: inf.assistantId });
+          if (inf.errorMsg) send({ type: "error", message: inf.errorMsg, assistantMessageId: inf.assistantId, turnStatus });
+          else send({ type: "done", assistantMessageId: inf.assistantId, turnStatus });
         }
       } else {
         send({ type: "idle", queueLength });
@@ -2543,7 +2743,9 @@ function handleSocket(ws) {
       const replay = retryOutcome(rt, sid, msg.userMessageId);
       if (replay) {
         log("info", "prompt_retry_replayed", { sid, kind: replay.kind });
-        if (replay.kind === "queued") {
+        if (replay.kind === "unknown") {
+          send({ type: "error", assistantMessageId: msg.assistantMessageId, userMessageId: msg.userMessageId, message: TURN_MESSAGES.noRecord, turnStatus: "unknown" });
+        } else if (replay.kind === "queued") {
           send({
             type: "queued",
             userMessageId: msg.userMessageId,
@@ -2551,18 +2753,24 @@ function handleSocket(ws) {
             // The actual slot, not the queue length — a replay in the middle
             // reported everyone else's backlog as its own position.
             queuePosition: rt.promptQueue.findIndex((q) => q.userMessageId === msg.userMessageId) + 1,
+            turnStatus: "queued",
           });
         } else {
+          const done = replay.kind === "finished";
           send({
             type: "resumed",
             assistantMessageId: replay.assistantId,
+            userMessageId: msg.userMessageId,
             content: replay.content || "",
-            done: replay.kind === "finished",
+            ...(done ? {} : { seq: replay.seq || 0 }),
+            done,
+            turnStatus: replay.status,
+            error: done && replay.errored ? replay.error : null,
             queueLength: rt.promptQueue?.length || 0,
           });
-          if (replay.kind === "finished") {
-            if (replay.errored) send({ type: "error", message: "This answer ended with an error.", assistantMessageId: replay.assistantId });
-            else send({ type: "done", assistantMessageId: replay.assistantId });
+          if (done) {
+            if (replay.errored) send({ type: "error", message: replay.error, assistantMessageId: replay.assistantId, turnStatus: replay.status });
+            else send({ type: "done", assistantMessageId: replay.assistantId, turnStatus: replay.status });
           }
         }
         return;
@@ -2606,7 +2814,8 @@ function handleSocket(ws) {
             try { insertUserMessage(sid, qUser, msg.content); } catch { /* dup id ignored */ }
             const qAsst = newAssistantId(sid, msg.assistantMessageId, qUser, targetModel);
             rt.promptQueue.push({ content: msg.content, userMessageId: qUser, assistantId: qAsst, sess: sess2, engine: targetEngine, model: targetModel });
-            broadcast(rt, { type: "queued", userMessageId: qUser, assistantMessageId: qAsst, queuePosition: rt.promptQueue.length });
+            recordTurnAccepted(rt, { state: "queued", assistantId: qAsst, userMessageId: qUser, engine: targetEngine, model: targetModel, queuePosition: rt.promptQueue.length });
+            broadcast(rt, { type: "queued", userMessageId: qUser, assistantMessageId: qAsst, queuePosition: rt.promptQueue.length, turnStatus: "queued" });
             rt.inflight = null;
             maybeFlushQueue(rt);
             return;
@@ -2643,11 +2852,13 @@ function handleSocket(ws) {
             engine: targetEngine,
             model: targetModel,
           });
+          recordTurnAccepted(rt, { state: "queued", assistantId: qAssistantId, userMessageId: qUserMsgId, engine: targetEngine, model: targetModel, queuePosition: rt.promptQueue.length });
           broadcast(rt, {
             type: "queued",
             userMessageId: qUserMsgId,
             assistantMessageId: qAssistantId,
             queuePosition: rt.promptQueue.length,
+            turnStatus: "queued",
           });
           log("info", "prompt_queued", { sid, position: rt.promptQueue.length, engine: targetEngine });
           return;
@@ -2676,7 +2887,7 @@ function handleSocket(ws) {
 
       const assistantId = newAssistantId(sid, msg.assistantMessageId, userMsgId, targetModel);
 
-      broadcast(rt, { type: "started", userMessageId: userMsgId, assistantMessageId: assistantId, engine: targetEngine });
+      broadcast(rt, { type: "started", userMessageId: userMsgId, assistantMessageId: assistantId, engine: targetEngine, turnStatus: "running" });
 
       // Prefer the row's value: after a delete + recreate, rt still held the old
       // session's claude id and the new chat resumed inside the deleted one's
@@ -2714,7 +2925,10 @@ function handleSocket(ws) {
       rt.orphanKillTimer = setTimeout(() => {
         rt.orphanKillTimer = null;
         if (guarded && rt.inflight?.proc === guarded && !rt.inflight.done) {
-          log("warn", "killing_orphan_child_no_reconnect", { sid });
+          log("warn", "killing_orphan_child_no_reconnect", { sid, graceMs: ORPHAN_CHILD_GRACE_MS });
+          // Marked like every other stop. Unmarked, the SIGTERM exit fell into
+          // the `done` branch and a cut-off answer was stored as finished.
+          rt.inflight.abortedByStop = "orphan";
           guarded.stop("orphan");
         }
       }, ORPHAN_CHILD_GRACE_MS);
@@ -2750,23 +2964,41 @@ function retryOutcome(rt, sid, userMessageId) {
   if (queued) return { kind: "queued", assistantId: queued.assistantId };
   const inf = rt.inflight;
   if (inf && !inf.done && inf.userMessageId === userMessageId) {
-    return { kind: "running", assistantId: inf.assistantId, content: inf.content };
+    return { kind: "running", assistantId: inf.assistantId, content: inf.content, seq: inf.seq || 0, status: "running" };
   }
   const prior = assistantAfter(sid, userMessageId);
   if (prior) {
+    const st = prior.turn_status;
+    if (st === "ok") {
+      return { kind: "finished", assistantId: prior.id, content: prior.content || "", status: "ok", errored: false };
+    }
+    // NULL: written by a bridge before 3.2 — either a finished answer from
+    // before the column existed or a placeholder a crash left open. Nothing
+    // tells them apart, so it is replayed as "unknown", never as a success.
+    // Still marked queued/running, but neither in the queue nor live (checked
+    // above): nothing in this process is going to finish it. Same answer;
+    // never run it again, its tools may already have run.
+    const status = st == null || st === "queued" || st === "running" ? "unknown" : st;
+    const fallback = {
+      error: "This answer ended with an error.",
+      interrupted: TURN_MESSAGES.interrupted,
+      not_started: TURN_MESSAGES.notStarted,
+      unknown: st == null ? TURN_MESSAGES.legacy : TURN_MESSAGES.unknown,
+    }[status] || TURN_MESSAGES.unknown;
     return {
       kind: "finished",
       assistantId: prior.id,
       content: prior.content || "",
-      // A turn that ended in an error must not be replayed as a clean answer.
-      // Rows written before turn_status existed carry null; those are replayed
-      // as finished, which is how they behaved before this column.
-      errored: prior.turn_status === "error",
+      status,
+      errored: true,
+      error: prior.turn_error || fallback,
     };
   }
-  // Accepted before but no answer row survived (crash between insert and
-  // placeholder). Let it run — re-executing beats silently answering nothing.
-  return null;
+  // Accepted before but no answer row survived. This used to run the prompt
+  // again ("re-executing beats silently answering nothing") — but a failed
+  // placeholder insert does not stop the turn from running, so that could do
+  // everything a second time. Report it instead; the user decides.
+  return { kind: "unknown" };
 }
 
 function newAssistantId(sid, wanted, replyTo = null, model = null) {
@@ -2893,7 +3125,35 @@ function killAllInflightChildren() {
   }
 }
 
+/**
+ * Record every turn this process is about to abandon. The process is going
+ * away (SIGTERM, self-update, watchdog exit), so a running turn is
+ * interrupted — tools may have run, it is never repeated automatically — and a
+ * queued one never started. The startup sweep catches the cases that never
+ * reach here (SIGKILL, power loss).
+ */
+let runtimeClosed = false;
+function closeRuntimeTurns(kind) {
+  if (runtimeClosed) return;
+  runtimeClosed = true;
+  for (const rt of runtime.values()) {
+    try {
+      const inf = rt.inflight;
+      if (inf && !inf.done) {
+        // Not marked done: the kill below still has to reach its process.
+        recordTurnEnd(rt, inf, "interrupted", { error: TURN_MESSAGES.interrupted, kind });
+      }
+      for (const q of rt.promptQueue || []) {
+        recordTurnEnd(rt, { assistantId: q.assistantId, userMessageId: q.userMessageId, engine: q.engine, model: q.model, content: "" },
+          "not_started", { error: TURN_MESSAGES.notStarted, kind });
+      }
+      rt.promptQueue = [];
+    } catch {}
+  }
+}
+
 function shutdown(sig) {
+  try { closeRuntimeTurns("bridge_shutdown"); } catch {}
   try { alexaSpeaker?.close(); } catch {}
   try { speech.close(); } catch {}
   try { warmPool?.killAll(); } catch {}
@@ -2904,12 +3164,51 @@ function shutdown(sig) {
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("exit", () => {
+  try { closeRuntimeTurns("bridge_shutdown"); } catch {}
   try { warmPool?.killAll(); } catch {}
   try { killAllInflightChildren(); } catch {}
 });
 
+/**
+ * Turns a previous process left queued or running can never finish now. Close
+ * them so a reconnecting app that resends a prompt gets "interrupted" / "not
+ * started" — never a stale "running", and never a clean finish it did not have.
+ *
+ * Runs only once this process owns the port (from the listen callback). Run
+ * before it, a second bridge started by mistake against the same database
+ * closed the turns the FIRST one was still running, and only then died on
+ * EADDRINUSE. The callback runs before any connection is handled, so no frame
+ * can see the stale state.
+ */
+function closeTurnsLeftByPreviousProcess() {
+  const stale = closeStaleTurns({ interrupted: TURN_MESSAGES.interrupted, notStarted: TURN_MESSAGES.notStarted });
+  if (!stale.length) return;
+  log("warn", "turns_closed_after_restart", {
+    interrupted: stale.filter((r) => r.turn_status === "running").length,
+    notStarted: stale.filter((r) => r.turn_status === "queued").length,
+  });
+  if (!journal.enabled) return;
+  for (const r of stale) {
+    try {
+      // A checkpoint the agent saved just before the crash.
+      journal.ingestCheckpoint(r.session_id, { assistantId: r.id });
+      journal.turnFinished(r.session_id, {
+        state: r.turn_status === "queued" ? "not_started" : "interrupted",
+        kind: "bridge_restart",
+        assistantId: r.id,
+        userMessageId: r.reply_to,
+        model: r.model,
+        startedAt: r.ts,
+        chars: r.chars,
+        steps: auditForAssistant(r.session_id, r.id),
+      });
+    } catch {}
+  }
+}
+
 server.listen(PORT, HOST, () => {
   log("info", "bridge_listening", { host: HOST, port: PORT, version: BRIDGE_VERSION, claude: CLAUDE_BIN, cwd: CWD, warm: USE_WARM, db: process.env.DB_DIR || "~/Library/conduit-bridge" });
+  try { closeTurnsLeftByPreviousProcess(); } catch (e) { log("error", "turn_sweep_failed", { err: String(e?.message || e).slice(0, 120) }); }
   // A row left 'running' at boot was orphaned by the previous process dying
   // mid-tool (crash/kill/self-update). Close them so the audit trail has no
   // permanently ambiguous entries.

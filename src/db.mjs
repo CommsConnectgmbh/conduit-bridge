@@ -131,6 +131,10 @@ for (const ddl of [
   "ALTER TABLE sessions ADD COLUMN agy_conversation_id TEXT",
   "ALTER TABLE sessions ADD COLUMN codex_thread_id TEXT",
   "ALTER TABLE messages ADD COLUMN model TEXT",
+  // The message a failed turn reported, so a replay after a reconnect (or a
+  // history load after a restart) can say what went wrong instead of a generic
+  // "ended with an error". Bridge-generated text only, never tool output.
+  "ALTER TABLE messages ADD COLUMN turn_error TEXT",
 ]) {
   try { db.exec(ddl); } catch { /* column already present */ }
 }
@@ -162,10 +166,29 @@ const Q = {
   `),
   deleteSession: db.prepare(`DELETE FROM sessions WHERE id = ? AND user_email = ?`),
   insertMessage: db.prepare(`INSERT INTO messages (id, session_id, role, content, ts) VALUES (?, ?, ?, ?, ?)`),
-  insertAssistant: db.prepare(`INSERT INTO messages (id, session_id, role, content, ts, reply_to, model) VALUES (?, ?, 'assistant', '', ?, ?, ?)`),
-  setMessageStatus: db.prepare(`UPDATE messages SET turn_status = ? WHERE id = ? AND session_id = ?`),
-  assistantFor: db.prepare(`SELECT id, content, turn_status, model FROM messages WHERE session_id = ? AND reply_to = ? ORDER BY ts ASC LIMIT 1`),
-  listMessages: db.prepare(`SELECT id, role, content, ts, reply_to, model FROM messages WHERE session_id = ? ORDER BY ts ASC`),
+  insertAssistant: db.prepare(`INSERT INTO messages (id, session_id, role, content, ts, reply_to, model, turn_status) VALUES (?, ?, 'assistant', '', ?, ?, ?, ?)`),
+  // A clean 'ok' may only replace a non-terminal state. Late writers exist (a
+  // superseded turn's process exiting after the fact, the close handler running
+  // after a stream error was already recorded), and none of them may turn a
+  // recorded failure into a success.
+  setMessageStatus: db.prepare(`
+    UPDATE messages SET turn_status = ?1, turn_error = ?2
+    WHERE id = ?3 AND session_id = ?4
+      AND (?1 <> 'ok' OR turn_status IS NULL OR turn_status IN ('queued', 'running'))
+  `),
+  assistantFor: db.prepare(`SELECT id, content, turn_status, turn_error, model FROM messages WHERE session_id = ? AND reply_to = ? ORDER BY ts ASC LIMIT 1`),
+  getAssistantTurn: db.prepare(`SELECT id, session_id, reply_to, ts, model, turn_status, turn_error, length(content) AS chars FROM messages WHERE id = ? AND session_id = ? AND role = 'assistant'`),
+  listMessages: db.prepare(`SELECT id, role, content, ts, reply_to, model, turn_status, turn_error FROM messages WHERE session_id = ? ORDER BY ts ASC`),
+  // Turns a previous process left open. Read first (for the journal), then
+  // closed in one statement each.
+  listOpenTurns: db.prepare(`SELECT id, session_id, reply_to, ts, model, turn_status, length(content) AS chars FROM messages WHERE role = 'assistant' AND turn_status IN ('queued', 'running')`),
+  closeOpenTurns: db.prepare(`
+    UPDATE messages SET
+      turn_status = CASE turn_status WHEN 'queued' THEN 'not_started' ELSE 'interrupted' END,
+      turn_error = CASE turn_status WHEN 'queued' THEN ?1 ELSE ?2 END
+    WHERE role = 'assistant' AND turn_status IN ('queued', 'running')
+  `),
+  auditForAssistant: db.prepare(`SELECT tool, status, ts FROM audit_log WHERE session_id = ? AND assistant_id = ? ORDER BY ts ASC LIMIT 2000`),
   getMessageInSession: db.prepare(`SELECT id FROM messages WHERE id = ? AND session_id = ?`),
   appendAssistant: db.prepare(`UPDATE messages SET content = content || ? WHERE id = ? AND session_id = ?`),
   insertAudit: db.prepare(`INSERT INTO audit_log (id, session_id, assistant_id, tool_use_id, ts, tool, summary, status, input_full) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)`),
@@ -177,6 +200,7 @@ const Q = {
     WHERE a.id = ? AND s.user_email = ?
   `),
   sweepRunningAudit: db.prepare(`UPDATE audit_log SET status = 'interrupted' WHERE status = 'running'`),
+  closeRunningAuditFor: db.prepare(`UPDATE audit_log SET status = 'interrupted' WHERE session_id = ? AND assistant_id = ? AND status = 'running'`),
   // Tool steps of one session, oldest first, for rebuilding the per-message
   // "what this turn did" summary when a transcript is loaded from history.
   // Rows predating assistant_id (or written by an interrupted turn) have no
@@ -536,16 +560,69 @@ export function insertUserMessage(sid, msgId, content) {
   try { Q.touchSession.run(now, sid); } catch {}
 }
 
-export function insertAssistantPlaceholder(sid, msgId, replyTo = null, model = null) {
+/**
+ * Turn states stored in messages.turn_status. The row is written with a state
+ * from the start, so a process that dies at any point leaves something a
+ * restart can recognise as unfinished — a NULL placeholder used to read as a
+ * clean, finished answer.
+ *
+ *   queued       accepted, waiting behind a running turn (queue is in memory)
+ *   running      handed to an agent; tools may be executing
+ *   ok           finished cleanly
+ *   error        finished with an error, or stopped (turn_error says which)
+ *   interrupted  the bridge went away while it was running; never repeated
+ *                automatically because its tools may already have had effects
+ *   not_started  the bridge went away while it was still queued; it never ran
+ *
+ * NULL is a row written before this column was filled; treated as legacy.
+ */
+export const TURN_STATES = Object.freeze(["queued", "running", "ok", "error", "interrupted", "not_started"]);
+export const OPEN_TURN_STATES = Object.freeze(["queued", "running"]);
+
+export function insertAssistantPlaceholder(sid, msgId, replyTo = null, model = null, status = "queued") {
   const now = Date.now();
-  Q.insertAssistant.run(msgId, sid, now, replyTo, model);
+  Q.insertAssistant.run(msgId, sid, now, replyTo, model, status);
   try { Q.touchSession.run(now, sid); } catch {}
 }
 
-/** Record how a turn ended, so a later retry can replay the truth. */
-export function setMessageStatus(sid, msgId, status) {
-  try { Q.setMessageStatus.run(status, msgId, sid); } catch { /* row may be gone */ }
+/** Record a turn's state, so a later retry or history load can replay the
+ *  truth. `error` is the bridge's own message for a failed turn. Returns
+ *  whether a row changed (false also when 'ok' would overwrite a failure). */
+export function setMessageStatus(sid, msgId, status, error = null) {
+  let changed = false;
+  try { changed = Q.setMessageStatus.run(status, error == null ? null : String(error).slice(0, 2000), msgId, sid).changes > 0; } catch { /* row may be gone */ }
   try { Q.touchSession.run(Date.now(), sid); } catch {}
+  return changed;
+}
+
+/** One assistant turn's stored state, or null. */
+export function getAssistantTurn(sid, msgId) {
+  try { return Q.getAssistantTurn.get(msgId, sid) || null; } catch { return null; }
+}
+
+/**
+ * Close every turn a previous process left queued or running. Nothing can
+ * still be executing them: the process that owned them is gone. Returns the
+ * rows as they were, so the caller can journal what was lost.
+ */
+export function closeStaleTurns(messages = {}) {
+  let rows = [];
+  try { rows = Q.listOpenTurns.all(); } catch { return []; }
+  if (!rows.length) return [];
+  try { Q.closeOpenTurns.run(messages.notStarted ?? null, messages.interrupted ?? null); } catch { return []; }
+  return rows;
+}
+
+/** A turn ended: any of its steps still 'running' never got a result and
+ *  never will. Without this a failed turn kept a spinning step in history
+ *  until the next restart swept it. */
+export function closeRunningAuditFor(sid, assistantId) {
+  try { return Q.closeRunningAuditFor.run(sid, assistantId).changes || 0; } catch { return 0; }
+}
+
+/** Tool steps recorded for one assistant turn, oldest first (for the journal). */
+export function auditForAssistant(sid, assistantId) {
+  try { return Q.auditForAssistant.all(sid, assistantId); } catch { return []; }
 }
 
 /**
