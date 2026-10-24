@@ -26,6 +26,10 @@ export function createWarmPool({
   model,
   defaultCwd,
   env,
+  // Per-session additions to `env` (e.g. CONDUIT_JOURNAL_FILE).
+  envFor = null,
+  // Per-session text for --append-system-prompt (journal + checkpoint file).
+  systemPromptFor = null,
   log,
   isUuid,
   maxWarm = 4,
@@ -89,7 +93,7 @@ export function createWarmPool({
         // retries the same prompt through the one-shot spawn — re-running a
         // turn that had already been executing for the whole stall window.
         t.handlers.onError?.(
-          `The answer stalled for ${secs}s without any sign of life. Stopped. Just send the message again.`,
+          `The answer stalled for ${secs}s without new output and was stopped. Check the current result and saved work log before continuing.`,
           { stall: true },
         );
         killProc(p, "stall");
@@ -261,6 +265,8 @@ export function createWarmPool({
       ...getEngine("claude").permissionArgs(),
     ];
     if (targetModel) args.push("--model", targetModel);
+    const systemAppend = systemPromptFor ? systemPromptFor(sid) : null;
+    if (systemAppend) args.push("--append-system-prompt", systemAppend);
 
     const resumeId = sess?.claude_session_id;
     if (resumeId) args.push("--resume", resumeId);
@@ -268,7 +274,7 @@ export function createWarmPool({
 
     const child = spawn(claudeBin, args, {
       cwd,
-      env: { ...env, FORCE_COLOR: "0" },
+      env: { ...env, ...(envFor ? envFor(sid) : {}), FORCE_COLOR: "0" },
       stdio: ["pipe", "pipe", "pipe"],
     });
     const p = {

@@ -95,7 +95,7 @@ const CLAUDE = {
   // bleibt bypassPermissions; siehe agent-policy.mjs.
   permissionArgs() { return claudePermissionArgs(AGENT_POLICY.claude); },
 
-  buildArgs({ prompt, model, resumeId, sessionId }) {
+  buildArgs({ prompt, model, resumeId, sessionId, systemAppend = null }) {
     const args = [
       "-p",
       "--model", model,
@@ -103,6 +103,8 @@ const CLAUDE = {
       "--verbose",
       ...this.permissionArgs(),
     ];
+    // Bridge context (journal + checkpoint file), never text from the device.
+    if (systemAppend) args.push("--append-system-prompt", systemAppend);
     // --resume setzt auf der bestehenden CLI-Session auf; ohne eine solche
     // darf die Session-Id nur vorgegeben werden, wenn unsere sid überhaupt
     // ein UUID ist (die CLI akzeptiert nichts anderes).
@@ -168,7 +170,7 @@ const CLAUDE = {
     stallIncomplete: "Claude stopped responding. The answer is incomplete.",
     exit: (code, tail) => `claude exit ${code}: ${tail}`,
     procError: (m) => `claude error: ${m}`,
-    emptyTurn: "Empty answer: Claude finished without any text. Please send again.",
+    emptyTurn: "Claude finished without response text. Check the current result and work log before continuing.",
   },
 };
 
@@ -316,7 +318,7 @@ const ANTIGRAVITY = {
     stallIncomplete: "Antigravity stopped responding. The answer is incomplete.",
     exit: (code, tail) => `agy exit ${code}: ${tail}`,
     procError: (m) => `agy error: ${m}`,
-    emptyTurn: "Empty answer: Antigravity finished without any text. Please send again.",
+    emptyTurn: "Antigravity finished without response text. Check the current result and work log before continuing.",
   },
 };
 
@@ -561,7 +563,7 @@ const CODEX = {
     stallIncomplete: "Codex stopped responding. The answer is incomplete.",
     exit: (code, tail) => `codex exit ${code}: ${tail}`,
     procError: (m) => `codex error: ${m}`,
-    emptyTurn: "Empty answer: Codex finished without any text. Please send again.",
+    emptyTurn: "Codex finished without response text. Check the current result and work log before continuing.",
   },
 };
 
@@ -784,7 +786,7 @@ const OLLAMA = {
     stallIncomplete: "The local model stopped responding. The answer is incomplete.",
     exit: (code, tail) => `Ollama answered with ${code}: ${tail}`,
     procError: (m) => `Ollama is not reachable: ${m}`,
-    emptyTurn: "Empty answer: the local model finished without any text. Please send again.",
+    emptyTurn: "The local model finished without response text. Check the current result and work log before continuing.",
   },
 };
 
