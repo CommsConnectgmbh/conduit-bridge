@@ -8,6 +8,7 @@ import { StringDecoder } from "node:string_decoder";
 import { createWarmPool } from "./warm.mjs";
 import { checkAndStage, isSupervised, readVersion, DEFAULT_INSTALL_DIR } from "./selfupdate.mjs";
 import { readUpdatePolicy, inUpdateWindow, updateWindowKey } from "./update-policy.mjs";
+import { createUpdateRunner, countBusyWork } from "./update-runner.mjs";
 import { resolveEngine, getEngine, engineCatalog, DEFAULT_ENGINE_ID, AGENT_POLICY, enginePolicyBlock, deniedNotice } from "./engines.mjs";
 import { policySummary } from "./agent-policy.mjs";
 import {
@@ -260,9 +261,6 @@ const IDENTITY_FINGERPRINT = createHash("sha256").update(IDENTITY.publicKey).dig
 const UPDATE_POLICY = readUpdatePolicy();
 const SELFUPDATE = UPDATE_POLICY.mode !== "off";
 for (const err of UPDATE_POLICY.errors) console.error(`[conduit] ${err}`);
-// Newest signed release seen on the origin and not installed (notify mode, pin,
-// or waiting for the window). Shown in /api/status.
-let updateAvailable = null;
 const APP_BASE = (process.env.PAIR_APP_BASE || process.env.CONDUIT_APP_BASE || "https://app.tryconduit.de").replace(/\/+$/, "");
 // The 3.x channel. /bridge.tar.gz stays frozen on the 3.0.0 stepping stone for
 // bridges older than 3.0 (see selfupdate.mjs).
@@ -447,7 +445,7 @@ setInterval(() => {
     // dass diese Kehrschleife Runtime-Einträge mit laufendem Turn wegräumte.
     // Einmal weg, ist der Turn für activeTurns() unsichtbar und ein
     // Selbst-Update startete mitten in die Arbeit hinein.
-    const busy = !!(s.inflight && !s.inflight.done && (s.inflight.proc || s.inflight.warm));
+    const busy = !!(s.inflight && !s.inflight.done);
     const pending = !!(s.promptQueue && s.promptQueue.length);
     if (now - s.lastUsed > IDLE_TTL_MS && !busy && !pending) {
       runtime.delete(sid);
@@ -1026,7 +1024,12 @@ async function handleApi(req, res, u, auth) {
         mode: UPDATE_POLICY.mode,
         pin: UPDATE_POLICY.pin,
         window: UPDATE_POLICY.window?.label || null,
-        available: updateAvailable,
+        // Newest signed release seen on the origin and not installed (notify
+        // mode, pin, or waiting for the window).
+        available: updateRunner.status().available,
+        // Installed on disk, waiting for an idle bridge (and the window) to
+        // restart into it. `version` above stays the one actually running.
+        pendingRestart: updateRunner.status().pendingRestart,
       },
       activeChildren: [...runtime.values()].filter((r) => r.inflight?.proc || r.inflight?.warm).length,
       // Whether the automatic journal is being written. A failure shows here
@@ -3025,70 +3028,29 @@ function cryptoRandom() {
   return [...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// Number of sessions with a live Claude run in flight (same set healthz reports).
+// Everything a restart would destroy: unfinished turns in every stage, queued
+// prompts and the Alexa slot (see countBusyWork).
 function activeTurns() {
-  // Counts everything a restart would destroy, not just running turns: queued
-  // prompts live in memory only (their user message is already in the DB, so
-  // losing them leaves a question with a permanently empty answer), and an open
-  // PTY is an interactive session the user is sitting in front of.
-  let n = 0;
-  for (const r of runtime.values()) {
-    // `done` matters: a finished inflight lingers for INFLIGHT_DONE_TTL_MS so a
-    // late reconnect can still read it. Counting those kept the bridge "busy"
-    // for five minutes after every turn, so on a normally used machine the
-    // self-update never found a quiet moment and security fixes never landed.
-    if ((r.inflight?.proc || r.inflight?.warm) && !r.inflight.done) n++;
-    n += r.promptQueue?.length || 0;
-  }
-  // The Alexa slot runs outside `runtime`; a restart mid-turn kills it.
-  if (alexaSession.busy) n++;
-  return n;
+  return countBusyWork(runtime, { alexaBusy: alexaSession.busy });
 }
 
 // Pull a newer bridge from the origin and, if we got one, restart to apply it.
-// Skipped while any turn is in flight so an update never interrupts a live chat;
-// the next tick retries. Without a supervisor we leave the new files applied for
-// the next manual restart instead of exiting into a stopped bridge.
-let selfUpdateRunning = false;
-// With a maintenance window the timer ticks every few minutes and the check
-// runs once per window; this remembers which window already had its check.
-let lastUpdateWindowKey = null;
-async function maybeSelfUpdate() {
-  if (!SELFUPDATE || selfUpdateRunning) return;
-  // Reporting changes nothing on this machine, so it needs no window. Only
-  // installing waits for it.
-  const installing = UPDATE_POLICY.mode === "install";
-  const win = installing ? UPDATE_POLICY.window : null;
-  if (win) {
-    const now = new Date();
-    if (!inUpdateWindow(win, now)) return;
-    if (lastUpdateWindowKey === updateWindowKey(win, now)) return;
-  }
-  if (activeTurns() > 0) return;
-  selfUpdateRunning = true;
-  try {
-    const r = await checkAndStage({ url: UPDATE_URL, log, apply: installing, maxVersion: UPDATE_POLICY.pin });
-    // The window is used up once the origin gave a definite answer (newer
-    // release installed or held, or nothing newer). A busy bridge (above), a
-    // failed download or a rejected package tries again on the next tick.
-    if (win && (r.updated || r.available || r.reason === "up-to-date")) lastUpdateWindowKey = updateWindowKey(win, new Date());
-    if (r.available) updateAvailable = r.to;
-    else if (r.reason === "up-to-date") updateAvailable = null;
-    if (!r.updated) { log("info", "selfupdate_checked", { running: r.from, origin: r.to, mode: UPDATE_POLICY.mode, held: !!r.held }); return; }
-    updateAvailable = null;
-    log("info", "selfupdate_done", r);
-    if (activeTurns() > 0) return;             // a turn started during npm install
-    if (isSupervised()) {
-      log("info", "selfupdate_restart", { to: r.to });
-      shutdown("selfupdate");                  // supervisor relaunches with new code
-    } else {
-      log("warn", "selfupdate_needs_restart", { to: r.to, hint: "no supervisor — restart to apply" });
-    }
-  } catch (e) {
-    log("warn", "selfupdate_error", { err: String(e?.message || e) });
-  } finally {
-    selfUpdateRunning = false;
-  }
+// Never while work is in progress: a release applied while a turn started
+// keeps its restart pending until the bridge is idle (update-runner.mjs).
+// Without a supervisor the new files stay applied for the next manual restart
+// instead of exiting into a stopped bridge.
+const updateRunner = createUpdateRunner({
+  policy: UPDATE_POLICY,
+  check: ({ apply, maxVersion }) => checkAndStage({ url: UPDATE_URL, log, apply, maxVersion }),
+  busy: activeTurns,
+  isSupervised,
+  restart: () => shutdown("selfupdate"),      // supervisor relaunches with new code
+  log,
+  inWindow: inUpdateWindow,
+  windowKey: updateWindowKey,
+});
+function maybeSelfUpdate() {
+  return updateRunner.tick();
 }
 
 // Retention and service log rotation, hourly and once shortly after boot.
