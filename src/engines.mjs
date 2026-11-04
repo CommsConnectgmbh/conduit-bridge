@@ -38,6 +38,22 @@ function binExecutable(bin) {
 }
 
 // --- Claude -----------------------------------------------------------------
+
+/**
+ * Whether a Claude `result` event closes a turn the CLI queued by itself
+ * rather than the prompt the bridge sent. Claude 2.1.310 runs such turns —
+ * e.g. the notifications of background tasks that a killed process left
+ * behind — on `--resume`, ahead of the prompt, and closes each with its own
+ * `result`, tagged `origin: { kind: "task-notification" }` (also
+ * "auto-continuation", "plugin", "channel", "peer"). Only "human" or no
+ * origin at all is a prompt; read as one, that early result ended the turn
+ * as empty while the process was still about to answer it.
+ */
+export function isQueuedTurnResult(ev) {
+  const kind = ev?.origin?.kind;
+  return typeof kind === "string" && kind !== "human";
+}
+
 const CLAUDE = {
   id: "claude",
   // Der Name, den der Client in der Engine-Auswahl zeigt.
@@ -136,7 +152,10 @@ const CLAUDE = {
       for (const block of ev.message.content) {
         if (block.type === "tool_result") sink.onToolEnd(block);
       }
-    } else if (ev.type === "result") {
+    } else if (ev.type === "result" && !isQueuedTurnResult(ev)) {
+      // Das Ergebnis eines von der CLI selbst eingereihten Turns (siehe
+      // isQueuedTurnResult) sagt über den Prompt nichts: weder Fehler noch
+      // Verbrauch noch abgelehnte Werkzeuge.
       // Was die Rechte-Einstellung abgelehnt hat, steht gesammelt im
       // Ergebnis-Event (claude 2.1.295: permission_denials[].tool_name).
       if (Array.isArray(ev.permission_denials) && ev.permission_denials.length) {

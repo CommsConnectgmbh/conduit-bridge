@@ -6,6 +6,9 @@
 //   - a resend of a message the bridge has no answer row for is not run again;
 //   - a warm turn that already ran tools is never retried through the
 //     one-shot path;
+//   - the result of a turn the CLI queued by itself (background task
+//     notifications on --resume) does not end the prompt's turn, and never
+//     starts a second process on the same conversation;
 //   - the automatic journal records all of it, owner-only, and leaks no
 //     prompt, tool input/output, answer text, secret or private path.
 // POSIX only: the stand-in CLI is a shebang script.
@@ -132,7 +135,7 @@ before(async () => {
   fakeLog = join(dir, "fake-runs.jsonl");
   const fake = join(dir, "fake-claude.mjs");
   writeFileSync(fake, `#!${process.execPath}
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 if (process.argv[2] === "auth") { process.stdout.write(JSON.stringify({ loggedIn: true }) + "\\n"); process.exit(0); }
 const LOG = ${JSON.stringify(fakeLog)};
@@ -152,6 +155,27 @@ function run(raw) {
   appendFileSync(LOG, JSON.stringify({ pid: process.pid, warm, tag, sc, journal: process.env.CONDUIT_JOURNAL_FILE || null,
     checkpoint: process.env.CONDUIT_CHECKPOINT_FILE || null, sys: si >= 0 ? process.argv[si + 1] : null }) + "\\n");
   if (sc === "ok") { text("answer " + tag); result(); }
+  else if (sc === "empty-warm") {
+    // A warm process that really ends the prompt without text, stays up and
+    // ignores SIGTERM (as claude does while it winds down MCP servers and
+    // tools); the one-shot retry records whether that process is still alive
+    // when it starts, then answers.
+    if (warm) { process.on("SIGTERM", () => {}); result(); return "hang"; }
+    const w = readFileSync(LOG, "utf8").trim().split("\\n").map((l) => JSON.parse(l)).find((r) => r.warm && r.tag === tag);
+    let warmAlive = false;
+    try { process.kill(w.pid, 0); warmAlive = true; } catch { /* gone */ }
+    appendFileSync(LOG, JSON.stringify({ pid: process.pid, probe: true, tag, warmAlive }) + "\\n");
+    text("answer " + tag); result();
+  }
+  else if (sc === "queued-first") {
+    // What claude 2.1.310 does on --resume when the killed process left
+    // background tasks behind: it first runs their notifications as a turn of
+    // its own and closes it with an empty result, then answers the prompt.
+    out({ type: "result", subtype: "success", is_error: false, num_turns: 0, result: "", result_index: 0,
+      origin: { kind: "task-notification" }, usage: { input_tokens: 0, output_tokens: 0 } });
+    setTimeout(() => { text("answer " + tag); result(); }, 400);
+    return "hang";
+  }
   else if (sc === "secret") {
     toolUse("t-secret", { command: "cat " + PRIVATE_PATH + "/.env # " + SECRET });
     toolResult("t-secret", "TOKEN=" + SECRET);
@@ -334,6 +358,47 @@ test("warm turns that already ran tools are never retried through the one-shot p
   assert.equal(assistantRow(hist.body.messages, "a-P6").turnStatus, "error");
   assert.equal(assistantRow(hist.body.messages, "a-P7").turnStatus, "error");
   assert.equal(assistantRow(hist.body.messages, "a-P8").turnStatus, "ok");
+  await c.close();
+});
+
+test("a queued task-notification result does not end the warm turn or start a second process", { skip: !POSIX }, async () => {
+  const c = await client();
+  const before = fakeRuns().length;
+  await c.prompt("P8b", "queued-first");
+  const t = await c.waitFor(isTerminal("a-P8b"), "P8b terminal");
+  assert.equal(t.type, "done", JSON.stringify(t));
+  await sleep(500);
+  const chunks = c.frames.filter((f) => f.type === "chunk" && f.assistantMessageId === "a-P8b").map((f) => f.text).join("");
+  assert.equal(chunks, "answer P8b");
+  // Exactly one run of the prompt, in the warm process. The bug re-ran it
+  // through a one-shot `claude -p --resume <same id>` next to it.
+  const runs = runsOf("P8b");
+  assert.equal(runs.length, 1, "P8b ran more than once: " + JSON.stringify(runs));
+  assert.equal(runs[0].warm, true);
+  assert.equal(fakeRuns().length, before + 1);
+  assert.doesNotMatch(bridge.logs.text, /warm_empty_turn_fallback/);
+  const hist = await c.call("GET", `/api/sessions/${SID}/messages`);
+  const row = assistantRow(hist.body.messages, "a-P8b");
+  assert.equal(row.turnStatus, "ok");
+  assert.equal(row.content, "answer P8b");
+  await c.close();
+});
+
+test("the empty-turn retry never runs next to the live warm process", { skip: !POSIX }, async () => {
+  const c = await client();
+  await c.prompt("P8c", "empty-warm");
+  const t = await c.waitFor(isTerminal("a-P8c"), "P8c terminal");
+  assert.equal(t.type, "done", JSON.stringify(t));
+  const runs = runsOf("P8c").filter((r) => !r.probe);
+  assert.deepEqual(runs.map((r) => r.warm), [true, false]);
+  // The warm process ignored SIGTERM; the one-shot retry still started only
+  // after it had exited (SIGKILL), never next to it.
+  const probe = runsOf("P8c").find((r) => r.probe);
+  assert.equal(probe.warmAlive, false, "one-shot retry started while the warm process was still alive");
+  // The next prompt gets a fresh warm process again.
+  await c.prompt("P8d", "ok");
+  assert.equal((await c.waitFor(isTerminal("a-P8d"), "P8d terminal")).type, "done");
+  assert.equal(runsOf("P8d")[0].warm, true);
   await c.close();
 });
 
@@ -527,7 +592,7 @@ test("the journal is owner-only, separate, complete and leaks nothing", { skip: 
 
   // Agents were told where their session's journal is.
   const expected = join(journalDir, `Conduit-Journal-${SID}.md`);
-  for (const r of fakeRuns()) {
+  for (const r of fakeRuns().filter((x) => !x.probe)) {
     assert.equal(r.journal, expected, JSON.stringify(r));
     assert.ok(r.sys && r.sys.includes(expected), `agent context missing for ${r.tag}`);
   }

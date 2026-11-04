@@ -2027,6 +2027,33 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null) 
     if (inflight.stallTimer) { clearTimeout(inflight.stallTimer); inflight.stallTimer = null; }
     if (inflight.heartbeatTimer) { clearInterval(inflight.heartbeatTimer); inflight.heartbeatTimer = null; }
   };
+  // Re-run the prompt through a one-shot spawn. Never next to a warm process
+  // of this session: both would --resume the same conversation, and the warm
+  // one may still be working on this very prompt (an early result it emitted
+  // was not the prompt's). One process per conversation, so the warm one is
+  // retired and the one-shot starts only after it has EXITED — SIGTERM alone
+  // leaves it up to 2s, longer if it ignores the signal. Until then the turn
+  // stays current, so a new prompt queues behind it and Stop still reaches it.
+  // The next warm turn respawns with --resume.
+  const fallBackToOneShot = async () => {
+    inflight.fellBack = true;
+    clearTimers();
+    let exited = false;
+    try { exited = await warmPool.retire(rt.sid); }
+    catch (e) { log("error", "warm_retire_failed", { sid: rt.sid, err: String(e?.message || e).slice(0, 200) }); }
+    if (rt.inflight !== inflight || inflight.done || rt.deleted) return;
+    if (inflight.stopRequested) {
+      finishTurn(stopMessage(inflight.abortedByStop), stopKind(inflight.abortedByStop));
+      return;
+    }
+    if (!exited) {
+      log("error", "warm_retire_timeout", { sid: rt.sid });
+      finishTurn(CLAUDE_ENGINE.messages.emptyTurn, "empty");
+      return;
+    }
+    rt.inflight = null;
+    runInflightTurn(CLAUDE_ENGINE, rt, sess, prompt, assistantId, userMessageId);
+  };
   const finishTurn = (errorMsg, kind = null) => {
     if (inflight.done) return;
     // A warm turn that ends cleanly with zero assistant content is NOT a
@@ -2043,11 +2070,8 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null) 
     // again would do it twice.
     if (!errorMsg && inflight.content === "" && !inflight.fellBack && !inflight.toolsStarted
         && !inflight.stopRequested && rt.inflight === inflight) {
-      inflight.fellBack = true;
-      clearTimers();
       log("warn", "warm_empty_turn_fallback", { sid: rt.sid });
-      rt.inflight = null;
-      runInflightTurn(CLAUDE_ENGINE, rt, sess, prompt, assistantId, userMessageId);
+      fallBackToOneShot();
       return;
     }
     clearTimers();
@@ -2159,11 +2183,8 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null) 
         // Same rule as the empty-turn fallback: once a tool has started, the
         // prompt is never run a second time.
         if (inflight.content === "" && !inflight.done && !inflight.fellBack && !inflight.toolsStarted) {
-          inflight.fellBack = true;
-          clearTimers();
           log("warn", "warm_fallback_oneshot", { sid: rt.sid, reason: String(msg).slice(0, 120) });
-          rt.inflight = null;
-          runInflightTurn(CLAUDE_ENGINE, rt, sess, prompt, assistantId, userMessageId);
+          fallBackToOneShot();
           return;
         }
         finishTurn(msg, "agent_error");
