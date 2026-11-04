@@ -1,6 +1,8 @@
 # Conduit Bridge
 
-The part of [Conduit](https://tryconduit.de) that runs on your own computer. It connects the Conduit apps to your AI tools: Claude Code, Gemini through Antigravity, OpenAI Codex, or a local model through Ollama. Chat history is stored locally in SQLite.
+Use your computer’s AI tools from your phone, tablet or browser with [Conduit](https://tryconduit.de).
+
+This repository contains the bridge that runs on your own computer. It connects the Conduit apps to Claude Code, Gemini through Antigravity, OpenAI Codex, or a local model through Ollama. Chat history is stored locally in SQLite.
 
 The bridge runs on macOS, Linux and Windows with Node.js 22.5 or newer.
 
@@ -59,6 +61,12 @@ Optional speech recognition and synthesis run on your computer:
 Models and pronunciation files are downloaded on demand and pinned by SHA-256. Native runtime dependencies use exact versions and integrity hashes from the signed bridge package. Speech support depends on the operating system and CPU architecture; see [speech-runtime.mjs](src/speech-runtime.mjs).
 
 The parity tools compare pronunciation against the Python originals. The [German results](tools/parity-de/PARITY.md) document Unicode differences and deliberate reading changes. English checks are in [tools/parity-en](tools/parity-en).
+
+## Feedback
+
+For setup feedback and bugs, [open an issue](https://github.com/CommsConnectgmbh/conduit-bridge/issues/new). Include your operating system, bridge version and the step that failed.
+
+If the bridge is useful to you, [give this repository a star](https://github.com/CommsConnectgmbh/conduit-bridge).
 
 ## Development
 
