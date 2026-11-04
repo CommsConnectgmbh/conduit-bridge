@@ -111,3 +111,19 @@ test("one-shot CLAUDE.readEvent: one paragraph per text block, no duplicates", (
   for (const ev of [...screenshot, assistant(text(""), text("A."), text("B."))]) claude.readEvent(ev, sink);
   assert.equal(content, `${screenshotText}\n\nA.\n\nB.`);
 });
+
+test("one-shot CLAUDE.readEvent: a result of a CLI-queued turn says nothing about the prompt", () => {
+  const claude = getEngine("claude");
+  const seen = { errors: [], usage: 0, denied: 0 };
+  const sink = {
+    hasContent: () => false, onChunk() {}, onToolStart() {}, onToolEnd() {}, onConversationId() {},
+    onPermissionDenied: () => { seen.denied++; }, onError: (m) => seen.errors.push(m), onUsage: () => { seen.usage++; },
+  };
+  claude.readEvent({ type: "result", is_error: true, result: "notification failed", num_turns: 0,
+    origin: { kind: "task-notification" }, permission_denials: [{ tool_name: "Bash" }] }, sink);
+  assert.deepEqual(seen, { errors: [], usage: 0, denied: 0 });
+  // A prompt's result, with or without an explicit human origin, still counts.
+  claude.readEvent({ type: "result", is_error: false, usage: {} }, sink);
+  claude.readEvent({ type: "result", is_error: true, result: "boom", origin: { kind: "human" } }, sink);
+  assert.deepEqual(seen, { errors: ["boom"], usage: 2, denied: 0 });
+});

@@ -13,7 +13,7 @@
 // The pool is LRU-capped and idle-evicts. A turn that dies unexpectedly surfaces
 // via handlers.onError so the caller can fall back to a one-shot spawn.
 
-import { getEngine } from "./engines.mjs";
+import { getEngine, isQueuedTurnResult } from "./engines.mjs";
 const resolveClaudeModel = (m) => getEngine("claude").resolveModel(m);
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
@@ -42,6 +42,8 @@ export function createWarmPool({
 }) {
   /** sid -> proc */
   const procs = new Map();
+  /** Killed procs whose process has not exited yet (SIGKILL follows after 2s). */
+  const dying = new Set();
 
   function killProc(p, reason) {
     if (!p) return;
@@ -53,6 +55,7 @@ export function createWarmPool({
     p.killReason = reason;
     p.alive = false;
     if (procs.get(p.sid) === p) procs.delete(p.sid);
+    if (!p.exitedAt) dying.add(p);
     try { p.child.stdin.end(); } catch {}
     try { p.child.kill("SIGTERM"); } catch {}
     const t = setTimeout(() => { try { p.child.kill("SIGKILL"); } catch {} }, 2000);
@@ -113,6 +116,8 @@ export function createWarmPool({
     } catch { /* best effort */ }
     p.alive = false;
     if (procs.get(p.sid) === p) procs.delete(p.sid);
+    dying.delete(p);
+    if (!p.exitedAt) { p.exitedAt = Date.now(); p.markExited(); }
     const t = p.turn;
     p.turn = null;
     p.busy = false;
@@ -122,7 +127,8 @@ export function createWarmPool({
       // terminal, not "the warm path failed early". Without this the caller
       // retries the prompt through a one-shot spawn and the stop button
       // re-runs the very thing it was pressed to cancel.
-      const deliberate = p.killReason === "stop" || p.killReason === "shutdown" || p.killReason === "evict";
+      const deliberate = p.killReason === "stop" || p.killReason === "shutdown" || p.killReason === "evict"
+        || p.killReason === "retire";
       t.handlers.onError?.(
         `warm claude exited (code ${code}${signal ? ", " + signal : ""}): ${p.stderrBuf.trim().slice(0, 300) || "unbekannt"}`,
         deliberate ? { terminal: true, reason: p.killReason } : undefined,
@@ -187,6 +193,15 @@ export function createWarmPool({
       for (const block of ev.message.content) {
         if (block.type === "tool_result") t.handlers.onToolResult?.(block);
       }
+      return;
+    }
+    if (ev.type === "result" && isQueuedTurnResult(ev)) {
+      // A turn the CLI queued by itself ended (on --resume: the notifications
+      // of background tasks the previous process left behind), not the prompt.
+      // Taken as the prompt's end, the turn read as empty, the caller re-ran
+      // the prompt through a one-shot spawn with the same --resume id, and two
+      // agents worked the same chat while this process went on answering.
+      log("info", "warm_queued_result_ignored", { sid: p.sid, origin: String(ev.origin.kind).slice(0, 40) });
       return;
     }
     if (ev.type === "result") {
@@ -286,7 +301,9 @@ export function createWarmPool({
       // Decode across chunk boundaries; a split multi-byte character would
       // otherwise land in the transcript as U+FFFD.
       outDecoder: new StringDecoder("utf8"),
+      exitedAt: 0, markExited: null, exited: null,
     };
+    p.exited = new Promise((resolve) => { p.markExited = resolve; });
     procs.set(sid, p);
     child.stdout.on("data", (d) => onStdout(p, d));
     child.stderr.on("data", (d) => {
@@ -357,6 +374,23 @@ export function createWarmPool({
     return true;
   }
 
+  /**
+   * Stop every process of `sid` — the live one and any still dying from an
+   * earlier kill — and resolve once all of them have exited: true, or false if
+   * one is still there after `timeoutMs`. For callers that start another
+   * process on the same conversation and must not run next to this one.
+   */
+  async function retire(sid, timeoutMs = 5000) {
+    const p = procs.get(sid);
+    if (p) killProc(p, "retire");
+    const waiting = [...dying].filter((d) => d.sid === sid).map((d) => d.exited);
+    if (!waiting.length) return true;
+    let timer;
+    const timedOut = new Promise((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); timer.unref?.(); });
+    try { return await Promise.race([Promise.all(waiting).then(() => true), timedOut]); }
+    finally { clearTimeout(timer); }
+  }
+
   function has(sid) {
     const p = procs.get(sid);
     return !!(p && p.alive);
@@ -367,5 +401,5 @@ export function createWarmPool({
     return { warm: procs.size, busy: [...procs.values()].filter((p) => p.busy).length };
   }
 
-  return { runTurn, stop, has, killAll, stats };
+  return { runTurn, stop, retire, has, killAll, stats };
 }
