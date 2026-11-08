@@ -191,6 +191,11 @@ function run(raw) {
     toolUse("t-nt-" + tag, { command: "touch " + PRIVATE_PATH + "/file" });
     toolResult("t-nt-" + tag, "ok");
     result();
+  } else if (sc === "slow") {
+    // Finishes on its own after a few seconds, like a normal short run.
+    text("partial");
+    setTimeout(() => { text("answer " + tag); result(); process.exit(0); }, 3000);
+    return "hang";
   } else if (sc === "partial-hang") {
     text("partial answer");
     setInterval(() => {}, 1000);
@@ -649,7 +654,7 @@ test("with CONDUIT_ORPHAN_GRACE_MS the limit counts only time without ANY app co
   const c2 = await client();
   const hist = await c2.call("GET", `/api/sessions/${SID}/messages`);
   const row = assistantRow(hist.body.messages, "a-O2");
-  assert.notEqual(row.turnStatus, "done", "a cut-off answer was stored as finished");
+  assert.equal(row.turnStatus, "error", "a cut-off answer was stored as finished");
   assert.match(row.turnError || "", /no app was connected/);
   await c2.close();
   await stopBridge("SIGTERM");
@@ -673,7 +678,38 @@ test("with CONDUIT_ORPHAN_GRACE_MS a queued prompt is not started after the limi
   const c2 = await client();
   const hist = await c2.call("GET", `/api/sessions/${SID}/messages`);
   assert.equal(assistantRow(hist.body.messages, "a-O4").turnStatus, "not_started");
+  assert.equal(assistantRow(hist.body.messages, "a-O3").turnStatus, "error");
   assert.match(assistantRow(hist.body.messages, "a-O3").turnError || "", /no app was connected/);
+  await c2.close();
+  await stopBridge("SIGTERM");
+  killFakes();
+});
+
+test("with CONDUIT_ORPHAN_GRACE_MS a queued turn started after a normal finish stays covered by the limit", { skip: !POSIX, timeout: 240_000 }, async () => {
+  const GRACE = 60_000;
+  bridge = await startBridge({ warm: false, env: { CONDUIT_ORPHAN_GRACE_MS: String(GRACE) } });
+  const c = await client();
+  await c.prompt("O5", "slow");
+  await c.waitFor((f) => f.type === "chunk" && f.assistantMessageId === "a-O5", "O5 running");
+  await c.prompt("O6", "hang");
+  await c.waitFor((f) => f.assistantMessageId === "a-O6", "O6 queued");
+  const goneAt = Date.now();
+  await c.close(); // the app is gone before O5 finishes and O6 starts
+  // O5 ends by itself; the queue then starts O6 with nobody connected.
+  const t1 = Date.now();
+  while (runsOf("O6").length === 0 && Date.now() - t1 < 20_000) await sleep(200);
+  assert.equal(runsOf("O6").length, 1, "the queued turn did not start after the first one finished");
+  assert.ok(fakeAlive("O6"), "the queued turn is not running");
+  const t0 = Date.now();
+  while (fakeAlive("O6") && Date.now() - t0 < GRACE + 30_000) await sleep(500);
+  assert.ok(!fakeAlive("O6"), "the queued turn escaped the configured limit");
+  assert.ok(Date.now() - goneAt >= GRACE - 1_000, "stopped before the full grace without any app connection");
+  const c2 = await client();
+  const hist = await c2.call("GET", `/api/sessions/${SID}/messages`);
+  assert.equal(assistantRow(hist.body.messages, "a-O5").turnStatus, "ok", "the first turn should have finished normally");
+  const row = assistantRow(hist.body.messages, "a-O6");
+  assert.equal(row.turnStatus, "error", "a cut-off answer was stored as finished");
+  assert.match(row.turnError || "", /no app was connected/);
   await c2.close();
   await stopBridge("SIGTERM");
   killFakes();
