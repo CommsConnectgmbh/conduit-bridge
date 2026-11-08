@@ -22,6 +22,7 @@ import {
   searchHistory, closeStaleTurns, auditForAssistant, closeRunningAuditFor,
 } from "./db.mjs";
 import { createJournal, journalDirFromEnv } from "./journal.mjs";
+import { normaliseOrphanGrace, orphanDecision, ORPHAN_GRACE_MAX_MS } from "./orphan-guard.mjs";
 import {
   addE2eDevice, getE2eDevice, getE2eDeviceById, listE2eDevices, revokeE2eDevice, touchE2eDevice,
   db as historyDb,
@@ -174,14 +175,14 @@ function maybeProbeClaude() {
 }
 const LOG_DIR = process.env.LOG_DIR || join(homedir(), "Library/Logs/conduit-bridge");
 const IDLE_TTL_MS = 12 * 60 * 60 * 1000; // 12h in-memory state
-// V2.2: mobile WS often dies on backgrounding / network handoff (FRA→MUC etc).
-// Keep child alive long enough for the user to come back and re-attach via
-// {type:"attach"}. The answer streams into the DB regardless; the grace timer
-// is a safety net for truly orphaned runaway tool-runs.
-// Kept as a safety limit, but configurable: a long agent run on the one-shot
-// path is otherwise cut off 30 min after the phone went to sleep. The turn is
-// recorded as an error ("orphan") either way, never as a finished answer.
-const ORPHAN_CHILD_GRACE_MS = intEnv("CONDUIT_ORPHAN_GRACE_MS", 30 * 60_000, 60_000, 7 * 24 * 3600_000);
+// Mobile WS often dies on backgrounding / network handoff. The answer streams
+// into the DB regardless and is replayed on the next {type:"attach"}, so a
+// sleeping phone is no reason to end a run. Hung runs are caught by the stall
+// watchdog, looping ones by the opt-in CONDUIT_MAX_TURN_MS. The orphan limit
+// is therefore off by default (0). When set, it stops a run only after the
+// OWNER has had no app connection at all for that long — not merely this chat
+// (see orphan-guard.mjs). Such a stop is recorded as an error ("orphan").
+const ORPHAN_CHILD_GRACE_MS = normaliseOrphanGrace(intEnv("CONDUIT_ORPHAN_GRACE_MS", 0, 0, ORPHAN_GRACE_MAX_MS));
 const INFLIGHT_DONE_TTL_MS = 5 * 60_000;   // keep finished inflight around for late attach
 const MAX_BUF = 1_000_000;
 const LOG_FILE = join(LOG_DIR, "bridge.log");
@@ -1380,6 +1381,7 @@ async function handleApi(req, res, u, auth) {
 // (chat) and /pty endpoints with bearer tokens are gone; chat runs as a
 // channel inside the session.
 const e2e = createE2eEndpoint({
+  onAccountAway: (email) => { if (!ownerConnected(email)) ownerLastSeenAt.set(email, Date.now()); },
   host: () => PAIR_PUBLIC_HOST,
   identity: IDENTITY,
   version: BRIDGE_VERSION,
@@ -1567,13 +1569,18 @@ function killInflight(rt, reason) {
   // User pressed stop → also drop everything they had queued up. A new prompt
   // arriving mid-turn (reason: "stale_on_new_prompt") must NOT clear the queue —
   // that stale kill happens to make room for a fresh turn, not to abandon work.
-  if (reason === "client_stop" && rt.promptQueue?.length) {
-    log("info", "queue_cleared_on_stop", { sid: rt.sid, count: rt.promptQueue.length });
+  // The optional orphan limit does the same: it exists to end unobserved work,
+  // so starting the next queued prompt right after it would defeat it.
+  if ((reason === "client_stop" || reason === "orphan") && rt.promptQueue?.length) {
+    log("info", "queue_cleared_on_stop", { sid: rt.sid, count: rt.promptQueue.length, reason });
     // Their placeholders were written as 'queued'; left alone they would read
     // as still waiting forever.
+    const why = reason === "orphan"
+      ? { error: "Not started: no app was connected to the bridge for the configured limit (CONDUIT_ORPHAN_GRACE_MS). It was not run.", kind: "orphan" }
+      : { error: "Cancelled with Stop before it started. It was not run.", kind: "stopped" };
     for (const q of rt.promptQueue) {
       recordTurnEnd(rt, { assistantId: q.assistantId, userMessageId: q.userMessageId, engine: q.engine, model: q.model, content: "" },
-        "not_started", { error: "Cancelled with Stop before it started. It was not run.", kind: "stopped" });
+        "not_started", why);
     }
     rt.promptQueue = [];
     broadcast(rt, { type: "queue_cleared" });
@@ -1790,7 +1797,7 @@ const TURN_MESSAGES = {
 /** The error text for a turn that was stopped, by why it was stopped. */
 function stopMessage(reason) {
   if (reason === "client_stop") return "Stopped. The answer is incomplete.";
-  if (reason === "orphan") return `Stopped after ${Math.round(ORPHAN_CHILD_GRACE_MS / 60000)} minutes without a connected app (safety limit). The answer is incomplete.`;
+  if (reason === "orphan") return `Stopped after ${Math.round(ORPHAN_CHILD_GRACE_MS / 60000)} minutes in which no app was connected to the bridge (CONDUIT_ORPHAN_GRACE_MS). The answer is incomplete.`;
   return "Interrupted. The answer is incomplete.";
 }
 function stopKind(reason) {
@@ -2930,35 +2937,75 @@ function handleSocket(ws) {
   ws.on("close", () => {
     clearInterval(clientWatch);
     rt.subscribers.delete(ws);
-    const hasChild = !!(rt.inflight?.proc);
+    const hasChild = turnRunning(rt);
     log("info", "ws_close", {
       sid,
       hasChild,
       subscribers: rt.subscribers.size,
     });
-    // If no subscribers left AND there's still a running child, arm the
-    // long-grace orphan kill as a safety net. A reconnect (any WS open) will
-    // cancel it.
-    if (rt.subscribers.size === 0 && hasChild) {
-      if (rt.orphanKillTimer) clearTimeout(rt.orphanKillTimer);
-      // Capture the child this timer is about. Without it the timer killed
-      // whatever was running 30 minutes later — including a healthy turn that
-      // the queue had started in the meantime, on a grace period measured from
-      // someone else's disconnect.
-      const guarded = rt.inflight?.proc;
-      rt.orphanKillTimer = setTimeout(() => {
-        rt.orphanKillTimer = null;
-        if (guarded && rt.inflight?.proc === guarded && !rt.inflight.done) {
-          log("warn", "killing_orphan_child_no_reconnect", { sid, graceMs: ORPHAN_CHILD_GRACE_MS });
-          // Marked like every other stop. Unmarked, the SIGTERM exit fell into
-          // the `done` branch and a cut-off answer was stored as finished.
-          rt.inflight.abortedByStop = "orphan";
-          guarded.stop("orphan");
-        }
-      }, ORPHAN_CHILD_GRACE_MS);
-      rt.orphanKillTimer.unref?.();
+    if (!ownerConnected(email)) ownerLastSeenAt.set(email, Date.now());
+    // Optional safety limit (off by default, see ORPHAN_CHILD_GRACE_MS): when
+    // the last subscriber of this chat leaves while work is running or queued,
+    // arm a timer. It ends that work only once the owner has had no app
+    // connection at all for the whole grace period; until then it re-arms.
+    // Before 3.2.2 it fired 30 min after this one chat closed, even while the
+    // app was open on another chat, and cut healthy long runs short.
+    if (ORPHAN_CHILD_GRACE_MS > 0 && rt.subscribers.size === 0 && (hasChild || rt.promptQueue?.length)) {
+      armOrphanTimer(rt, email, ORPHAN_CHILD_GRACE_MS);
+      log("info", "orphan_timer_armed", { sid, graceMs: ORPHAN_CHILD_GRACE_MS });
     }
   });
+}
+
+/** A turn of this chat is running (one-shot child or warm process). */
+function turnRunning(rt) {
+  const inf = rt.inflight;
+  return !!inf && !inf.done && (!!inf.proc || !!inf.warm);
+}
+
+/**
+ * The timer follows the chat, not one process: a queued prompt that starts
+ * after the app left is covered by the same limit, measured from when the
+ * owner was last connected (the grace is never restarted by a queue flush).
+ */
+function armOrphanTimer(rt, owner, delayMs) {
+  if (rt.orphanKillTimer) clearTimeout(rt.orphanKillTimer);
+  rt.orphanKillTimer = setTimeout(() => {
+    rt.orphanKillTimer = null;
+    const d = orphanDecision({
+      graceMs: ORPHAN_CHILD_GRACE_MS,
+      now: Date.now(),
+      turnAlive: turnRunning(rt) || (rt.promptQueue?.length || 0) > 0,
+      ownerConnected: ownerConnected(owner),
+      ownerLastSeenAt: ownerLastSeenAt.get(owner) ?? null,
+    });
+    if (d.action === "rearm") {
+      log("info", "orphan_timer_rearmed", { sid: rt.sid, delayMs: d.delayMs });
+      armOrphanTimer(rt, owner, d.delayMs);
+      return;
+    }
+    if (d.action !== "kill") return;
+    log("warn", "killing_orphan_child_no_reconnect", { sid: rt.sid, graceMs: ORPHAN_CHILD_GRACE_MS });
+    // killInflight marks the turn ("orphan", never stored as finished), covers
+    // the warm path too, and records queued prompts as not started.
+    killInflight(rt, "orphan");
+  }, delayMs);
+  rt.orphanKillTimer.unref?.();
+}
+
+/** When each owner's last app connection closed (for the orphan limit). */
+const ownerLastSeenAt = new Map();
+
+/** Does this owner have at least one open app connection (any chat, or none)? */
+function ownerConnected(email) {
+  if (!email) return false;
+  if (e2e.hasSession(email)) return true;
+  for (const rt of runtime.values()) {
+    for (const sub of rt.subscribers || []) {
+      if (sub.auth?.email === email) return true;
+    }
+  }
+  return false;
 }
 
 

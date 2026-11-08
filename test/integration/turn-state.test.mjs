@@ -46,7 +46,7 @@ function killFakes() {
   for (const r of fakeRuns()) { try { process.kill(r.pid, "SIGKILL"); } catch { /* gone */ } }
 }
 
-async function startBridge({ warm }) {
+async function startBridge({ warm, env = {} }) {
   const logs = { text: "" };
   const proc = spawn(process.execPath, [fileURLToPath(new URL("../../src/server.mjs", import.meta.url))], {
     env: {
@@ -54,7 +54,7 @@ async function startBridge({ warm }) {
       PAIR_PUBLIC_HOST: HOST, PAIR_OWNER_EMAIL: EMAIL, DB_DIR: join(dir, "db"), LOG_DIR: join(dir, "logs"),
       PASTE_DIR: join(dir, "paste"), CLAUDE_CWD: join(dir, "home"), CLAUDE_BIN: join(dir, "fake-claude.mjs"),
       CONDUIT_SELFUPDATE: "0", CONDUIT_WARM: warm ? "1" : "0", BRIDGE_ALLOWED_HOSTS: `127.0.0.1,localhost,${HOST}`,
-      CONDUIT_JOURNAL_DIR: journalDir,
+      CONDUIT_JOURNAL_DIR: journalDir, ...env,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -87,7 +87,7 @@ function openWs() {
 }
 
 /** A connected device: RPC calls plus one chat channel with a frame log. */
-async function client({ pair = null } = {}) {
+async function client({ pair = null, sid = SID } = {}) {
   const o = openWs(); await o.ready;
   const { session } = await connect({ transport: o.transport, host: HOST, device, bridgeKey, hello: { v: 1, label: "t" }, ...(pair ? { pair } : {}) });
   const call = async (method, path, body) => {
@@ -98,10 +98,11 @@ async function client({ pair = null } = {}) {
     const all = Buffer.concat(parts); const n = all.readUInt32BE(0);
     return { head: JSON.parse(all.subarray(4, 4 + n)), body: JSON.parse(all.subarray(4 + n)) };
   };
-  const chat = await session.open(KIND.CHAT, { sid: SID });
+  // sid: null = an app that is connected but has no chat open.
+  const chat = sid ? await session.open(KIND.CHAT, { sid }) : null;
   const frames = [];
   const reader = new MessageReader({ maxBytes: 1e6, onMessage: (m) => frames.push(JSON.parse(Buffer.from(m))) });
-  chat.on("data", (x) => reader.push(x));
+  chat?.on("data", (x) => reader.push(x));
   const send = (obj) => chat.write(encodeMessage(new TextEncoder().encode(JSON.stringify(obj))));
   const waitFor = async (pred, what, ms = 10_000) => {
     const t0 = Date.now();
@@ -596,4 +597,84 @@ test("the journal is owner-only, separate, complete and leaks nothing", { skip: 
     assert.equal(r.journal, expected, JSON.stringify(r));
     assert.ok(r.sys && r.sys.includes(expected), `agent context missing for ${r.tag}`);
   }
+});
+
+// The orphan limit (07./08.11.2026: six healthy Codex runs cut off "without a
+// connected app" while the app was open on another chat, or the phone slept).
+const OTHER_SID = "abcdabcd-9999-4222-8333-444455556666";
+const fakeAlive = (tag) => runsOf(tag).some((r) => { try { process.kill(r.pid, 0); return true; } catch { return false; } });
+
+test("by default a running turn is never stopped because the app went away", { skip: !POSIX }, async () => {
+  bridge = await startBridge({ warm: false });
+  let c = await client();
+  await c.prompt("O1", "hang");
+  await c.waitFor((f) => f.type === "chunk" && f.assistantMessageId === "a-O1", "O1 running");
+  await c.close();
+  await sleep(1500);
+  assert.ok(fakeAlive("O1"), "run ended after the app disconnected");
+  assert.doesNotMatch(bridge.logs.text, /orphan_timer_armed/, "orphan limit armed although it is off by default");
+  // Back in the app: the run is still going and can be stopped by the user.
+  c = await client();
+  await c.send({ type: "attach" });
+  await c.send({ type: "stop" });
+  assert.equal((await c.waitFor(isTerminal("a-O1"), "O1 terminal")).type, "error");
+  await c.close();
+  await stopBridge("SIGTERM");
+  killFakes();
+});
+
+test("with CONDUIT_ORPHAN_GRACE_MS the limit counts only time without ANY app connection", { skip: !POSIX, timeout: 240_000 }, async () => {
+  const GRACE = 60_000;
+  bridge = await startBridge({ warm: false, env: { CONDUIT_ORPHAN_GRACE_MS: String(GRACE) } });
+  const c = await client();
+  const other = await client({ sid: OTHER_SID }); // the app stays open on another chat
+  const bare = await client({ sid: null });       // and a second app is connected without any chat
+  await c.prompt("O2", "hang");
+  await c.waitFor((f) => f.type === "chunk" && f.assistantMessageId === "a-O2", "O2 running");
+  await c.close();
+  await sleep(GRACE / 2);
+  await other.close(); // only the chat-less connection is left
+  await sleep(GRACE / 2 + 5_000);
+  assert.ok(fakeAlive("O2"), "run was stopped while an app was connected to the bridge");
+  assert.match(bridge.logs.text, /orphan_timer_rearmed/);
+  assert.doesNotMatch(bridge.logs.text, /killing_orphan_child_no_reconnect/);
+  // Now the app is gone entirely: the limit applies, measured from that moment.
+  const goneAt = Date.now();
+  await bare.close();
+  const t0 = Date.now();
+  while (fakeAlive("O2") && Date.now() - t0 < GRACE + 30_000) await sleep(500);
+  assert.ok(!fakeAlive("O2"), "run survived the configured limit with no app connected");
+  assert.ok(Date.now() - goneAt >= GRACE - 1_000, "stopped before the full grace without any app connection");
+  assert.match(bridge.logs.text, /killing_orphan_child_no_reconnect/);
+  const c2 = await client();
+  const hist = await c2.call("GET", `/api/sessions/${SID}/messages`);
+  const row = assistantRow(hist.body.messages, "a-O2");
+  assert.notEqual(row.turnStatus, "done", "a cut-off answer was stored as finished");
+  assert.match(row.turnError || "", /no app was connected/);
+  await c2.close();
+  await stopBridge("SIGTERM");
+  killFakes();
+});
+
+test("with CONDUIT_ORPHAN_GRACE_MS a queued prompt is not started after the limit ended the run", { skip: !POSIX, timeout: 240_000 }, async () => {
+  const GRACE = 60_000;
+  bridge = await startBridge({ warm: false, env: { CONDUIT_ORPHAN_GRACE_MS: String(GRACE) } });
+  const c = await client();
+  await c.prompt("O3", "hang");
+  await c.waitFor((f) => f.type === "chunk" && f.assistantMessageId === "a-O3", "O3 running");
+  await c.prompt("O4", "hang");
+  await c.waitFor((f) => f.assistantMessageId === "a-O4", "O4 queued");
+  await c.close();
+  const t0 = Date.now();
+  while (fakeAlive("O3") && Date.now() - t0 < GRACE + 30_000) await sleep(500);
+  assert.ok(!fakeAlive("O3"), "run survived the configured limit with no app connected");
+  await sleep(3_000);
+  assert.equal(runsOf("O4").length, 0, "the queued prompt was started after the orphan stop");
+  const c2 = await client();
+  const hist = await c2.call("GET", `/api/sessions/${SID}/messages`);
+  assert.equal(assistantRow(hist.body.messages, "a-O4").turnStatus, "not_started");
+  assert.match(assistantRow(hist.body.messages, "a-O3").turnError || "", /no app was connected/);
+  await c2.close();
+  await stopBridge("SIGTERM");
+  killFakes();
 });

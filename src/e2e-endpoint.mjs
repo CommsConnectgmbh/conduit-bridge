@@ -48,6 +48,9 @@ export function createE2eEndpoint(deps) {
     handleProtocols: (protocols) => (protocols.has(SUBPROTOCOL) ? SUBPROTOCOL : false),
   });
   const sessionsByDevice = new Map();
+  // Open sessions per account: "is the owner's app connected at all?" for the
+  // optional orphan limit, independent of which chat (if any) is open.
+  const sessionsByEmail = new Map();
   const handshakesByPeer = new Map();
   let pending = 0;
 
@@ -111,9 +114,17 @@ export function createE2eEndpoint(deps) {
     }
     const auth = { email: device.email, deviceId: device.device_id, jti: null, sid: null, e2e: true };
     deps.log("info", "e2e_session_open", { device: device.device_id });
+    const mine = sessionsByEmail.get(device.email) || new Set();
+    sessionsByEmail.set(device.email, mine);
+    mine.add(session);
     session.on("close", (info) => {
       set.delete(session);
       if (!set.size) sessionsByDevice.delete(key);
+      mine.delete(session);
+      if (!mine.size) {
+        if (sessionsByEmail.get(device.email) === mine) sessionsByEmail.delete(device.email);
+        try { deps.onAccountAway?.(device.email); } catch { /* observer only */ }
+      }
       deps.log("info", "e2e_session_close", { device: device.device_id, code: info.code });
     });
     session.on("channel", (ch) => {
@@ -216,7 +227,12 @@ export function createE2eEndpoint(deps) {
     }
   }
 
-  return { handleUpgrade, kickDevice, close: () => wss.close() };
+  /** Does this account have at least one open session (any chat or none)? */
+  function hasSession(email) {
+    return !!email && (sessionsByEmail.get(email)?.size || 0) > 0;
+  }
+
+  return { handleUpgrade, kickDevice, hasSession, close: () => wss.close() };
 }
 
 /** `ws` WebSocket as a session transport. Text frames end the connection. */
