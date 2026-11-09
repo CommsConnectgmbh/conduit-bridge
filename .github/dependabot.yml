@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # npm: keine Versions-PRs (Limit 0), nur Sicherheits-Updates, und die gesammelt
+  # in einem PR statt einem PR je Paket. Jeder PR startet einen CI-Lauf.
+  - package-ecosystem: npm
+    directories:
+      - /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Berlin
+    open-pull-requests-limit: 0
+    groups:
+      sicherheit:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  # Actions sind auf Commit-SHAs gepinnt; Dependabot hebt die Pins einmal im Monat
+  # gesammelt an.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
