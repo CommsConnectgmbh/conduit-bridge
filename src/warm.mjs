@@ -14,6 +14,7 @@
 // via handlers.onError so the caller can fall back to a one-shot spawn.
 
 import { getEngine, isQueuedTurnResult } from "./engines.mjs";
+import { noteClaudeModel } from "./models.mjs";
 const resolveClaudeModel = (m) => getEngine("claude").resolveModel(m);
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
@@ -150,6 +151,7 @@ export function createWarmPool({
     const t = p.turn;
 
     if (ev.type === "system" && ev.subtype === "init" && ev.session_id) {
+      noteClaudeModel(ev.model);
       p.claudeSessionId = ev.session_id;
       t?.handlers.onSessionId?.(ev.session_id);
       return;

@@ -195,11 +195,11 @@ Paths set in `.env.local` (`DB_DIR`, `LOG_DIR`, `PASTE_DIR`, `CONDUIT_MODELS_DIR
 | `PAIR_APP_BASE`, `CONDUIT_APP_BASE` | App origin, allowed for CORS, and base of the update URL | `https://app.tryconduit.de` |
 | `BRIDGE_ALLOWED_HOSTS` | Accepted `Host` headers, comma-separated | empty: not checked |
 | `BRIDGE_ALLOWED_ORIGINS` | Additional CORS origins | empty |
-| `CLAUDE_BIN`, `CLAUDE_MODEL`, `CLAUDE_ALEXA_MODEL` | Claude Code binary and models | `~/.local/bin/claude`, `claude-opus-5`, `haiku` |
+| `CLAUDE_BIN`, `CLAUDE_MODEL`, `CLAUDE_ALEXA_MODEL` | Claude Code binary and models | `~/.local/bin/claude`, `opus` (family alias: opus, sonnet, haiku, fable), `haiku` |
 | `CLAUDE_CWD` | Default working directory of chats | home directory |
 | `FILE_SEARCH_ROOTS` | Colon-separated roots for @-mentions and the working directory picker. Not a sandbox: it limits what the app offers, not what an agent can reach. | `CLAUDE_CWD` |
 | `CODEX_BIN`, `CODEX_MODEL`, `CODEX_HOME` | Codex binary, model, configuration directory | searched, from `config.toml`, `~/.codex` |
-| `AGY_BIN`, `AGY_MODEL` | Antigravity binary and model | `~/.local/bin/agy`, `gemini-3.1-pro-high` |
+| `AGY_BIN`, `AGY_MODEL` | Antigravity binary and model | `~/.local/bin/agy`, first model listed by `agy models` |
 | `OLLAMA_HOST`, `OLLAMA_MODEL` | Ollama service and default model | `http://127.0.0.1:11434`, first installed |
 | `CONDUIT_WARM`, `CONDUIT_WARM_MAX`, `CONDUIT_WARM_IDLE_MS` | Long-lived Claude processes per chat | on, 4, 480000 |
 | `CONDUIT_MAX_CONCURRENT_TURNS` | Turns running at once | max(4, 2 x `CONDUIT_WARM_MAX`) |

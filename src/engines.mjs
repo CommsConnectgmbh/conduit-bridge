@@ -19,6 +19,7 @@
 import { homedir } from "node:os";
 import { accessSync, readFileSync, statSync, constants as FS } from "node:fs";
 import { listMessages, setClaudeSessionId, setAgyConversationId, setCodexThreadId } from "./db.mjs";
+import { claudeAlias, claudeModels, noteClaudeModel, agyModels, refreshAgyModels } from "./models.mjs";
 import {
   readAgentPolicy, claudePermissionArgs, codexPermissionArgs, agyPermissionArgs, deniedNotice,
 } from "./agent-policy.mjs";
@@ -57,7 +58,7 @@ export function isQueuedTurnResult(ev) {
 const CLAUDE = {
   id: "claude",
   // Der Name, den der Client in der Engine-Auswahl zeigt.
-  name: "Claude Opus 5",
+  name: "Claude Code",
   badge: "⚡ Flagship",
   // Kurzform für Log-Meta und interne Zwecke.
   label: "Claude",
@@ -69,11 +70,10 @@ const CLAUDE = {
   // aus (Dateien, Befehle, MCP), und der Client zeigt das an.
   capabilities: { tools: true },
   bin: process.env.CLAUDE_BIN || `${homedir()}/.local/bin/claude`,
-  defaultModel: process.env.CLAUDE_MODEL || "claude-opus-5",
-  models: [
-    { id: "claude-opus-5", name: "Opus 5 (1M Context)", default: true },
-    { id: "claude-sonnet-5", name: "Sonnet (Fast)" },
-  ],
+  // Versionsfrei (siehe models.mjs): die CLI-Aliase meinen immer das neueste
+  // Modell der Familie, die Liste veraltet deshalb nicht mehr mit jedem Release.
+  get defaultModel() { return `claude-${claudeAlias(process.env.CLAUDE_MODEL)}`; },
+  get models() { return claudeModels(claudeAlias(process.env.CLAUDE_MODEL)); },
   // Nur Claude läuft über den Warm-Pool: der hält einen langlebigen
   // `claude --print --input-format stream-json` pro Session, spart den
   // CLI-Boot und den 32k-Cache-Neuaufbau und streamt Token für Token. Eine
@@ -93,16 +93,14 @@ const CLAUDE = {
   },
 
   /**
-   * Die CLI kennt nur die Kurznamen. Alles, was nicht als sonnet oder haiku
-   * erkennbar ist, landet absichtlich auf opus — das ist das teurere, aber
-   * verlässliche Ende, und ein Tippfehler im Modellnamen soll keinen Turn
-   * scheitern lassen.
+   * An die CLI geht nur der Familien-Alias (opus, sonnet, haiku, fable): der
+   * meint immer das neueste Modell. Auch alte Kennungen aus Session-Zeilen
+   * ("claude-opus-5", "claude-sonnet-4") landen so in ihrer Familie. Alles
+   * Unbekannte landet absichtlich auf opus, damit ein Tippfehler keinen Turn
+   * scheitern lässt.
    */
   resolveModel(requested) {
-    const req = String(requested || this.defaultModel).toLowerCase();
-    if (req.includes("sonnet")) return "sonnet";
-    if (req.includes("haiku")) return "haiku";
-    return "opus";
+    return claudeAlias(requested || this.defaultModel);
   },
 
   preparePrompt({ prompt }) { return prompt; },
@@ -139,6 +137,8 @@ const CLAUDE = {
    */
   readEvent(ev, sink) {
     if (ev.type === "system" && ev.subtype === "init" && ev.session_id) {
+      // Welche Version hinter dem Alias steckt, sagt nur dieser Event.
+      noteClaudeModel(ev.model);
       sink.onConversationId(ev.session_id);
     } else if (ev.type === "assistant" && ev.message?.content) {
       for (const block of ev.message.content) {
@@ -201,17 +201,16 @@ const CLAUDE = {
 const ANTIGRAVITY = {
   id: "gemini",
   aliases: ["agy", "antigravity"],
-  name: "Gemini 3.1 Pro (Antigravity)",
-  badge: "🔷 Full-Repo 1M",
+  name: "Gemini (Antigravity)",
+  badge: "🔷 Antigravity",
   label: "Antigravity",
   transport: "spawn",
   capabilities: { tools: true },
   bin: process.env.AGY_BIN || `${homedir()}/.local/bin/agy`,
-  defaultModel: process.env.AGY_MODEL || "gemini-3.1-pro-high",
-  models: [
-    { id: "gemini-3.1-pro-high", name: "Gemini 3.1 Pro (High)", default: true },
-    { id: "gemini-3.7-flash-high", name: "Gemini 3.7 Flash (High)" },
-  ],
+  // Die Liste kommt von `agy models` (siehe models.mjs). Solange sie fehlt,
+  // heißt die Vorgabe "default": agy nimmt dann sein eigenes Modell.
+  get defaultModel() { return agyModels(process.env.AGY_MODEL).find((m) => m.default)?.id || "default"; },
+  get models() { refreshAgyModels(this.bin); return agyModels(process.env.AGY_MODEL); },
   usesWarmPool: false,
 
   conversation: {
@@ -225,8 +224,16 @@ const ANTIGRAVITY = {
 
   // Die CLI nimmt den Modellnamen unverändert entgegen; "default" heißt
   // „nimm, was die CLI selbst eingestellt hat" und wird deshalb gar nicht
-  // erst als Argument gesetzt.
-  resolveModel(requested) { return requested || this.defaultModel; },
+  // erst als Argument gesetzt. Ein Name, den agy nicht (mehr) anbietet — die
+  // Session-Zeile nennt etwa noch "gemini-3.1-pro-high" —, geht auf die
+  // Vorgabe zurück, statt jeden Turn dieser Session scheitern zu lassen.
+  resolveModel(requested) {
+    const req = String(requested || "").trim();
+    const known = agyModels(process.env.AGY_MODEL);
+    if (req && known.some((m) => m.id === req)) return req;
+    if (req && known.length === 0 && req === process.env.AGY_MODEL) return req;
+    return this.defaultModel;
+  },
 
   /**
    * Ohne Conversation-Id fängt die CLI bei null an und weiß nichts vom
@@ -340,6 +347,10 @@ const ANTIGRAVITY = {
     emptyTurn: "Antigravity finished without response text. Check the current result and work log before continuing.",
   },
 };
+
+// Einmal beim Start anstoßen, wie bei Ollama: sonst stünde Gemini nach einem
+// Neustart bis zur ersten Auffrischung ohne Modelle in der Auswahl.
+if (binExecutable(ANTIGRAVITY.bin)) refreshAgyModels(ANTIGRAVITY.bin);
 
 // --- Codex (OpenAI) ---------------------------------------------------------
 // `codex exec --json` fährt einen Turn und schreibt JSONL auf stdout. Die
