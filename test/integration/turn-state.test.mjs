@@ -153,7 +153,8 @@ function run(raw) {
   const tag = (/TAG:([A-Za-z0-9]+)/.exec(raw) || [])[1] || null;
   const sc = (/SCENARIO:([a-z-]+)/.exec(raw) || [])[1] || "ok";
   const si = process.argv.indexOf("--append-system-prompt");
-  appendFileSync(LOG, JSON.stringify({ pid: process.pid, warm, tag, sc, journal: process.env.CONDUIT_JOURNAL_FILE || null,
+  const mi = process.argv.indexOf("--model");
+  appendFileSync(LOG, JSON.stringify({ pid: process.pid, warm, tag, sc, model: mi >= 0 ? process.argv[mi + 1] : null, journal: process.env.CONDUIT_JOURNAL_FILE || null,
     checkpoint: process.env.CONDUIT_CHECKPOINT_FILE || null, sys: si >= 0 ? process.argv[si + 1] : null }) + "\\n");
   if (sc === "ok") { text("answer " + tag); result(); }
   else if (sc === "empty-warm") {
@@ -387,6 +388,22 @@ test("a queued task-notification result does not end the warm turn or start a se
   const row = assistantRow(hist.body.messages, "a-P8b");
   assert.equal(row.turnStatus, "ok");
   assert.equal(row.content, "answer P8b");
+  await c.close();
+});
+
+test("a model switch reaches the warm process on the first turn, as a family alias", { skip: !POSIX }, async () => {
+  const c = await client();
+  const ask = (n, model) => c.send({ type: "prompt", content: `TAG:${n} SCENARIO:ok`, userMessageId: `u-${n}`, assistantMessageId: `a-${n}`, model });
+  // Fable used to fall back to opus, and the switch reached the warm process
+  // only one turn later (it read the model from the stale session row).
+  await ask("M1", "claude-fable");
+  assert.equal((await c.waitFor(isTerminal("a-M1"), "M1 terminal")).type, "done");
+  // An id stored by an older client still lands in its family.
+  await ask("M2", "claude-sonnet-4");
+  assert.equal((await c.waitFor(isTerminal("a-M2"), "M2 terminal")).type, "done");
+  const [m1] = runsOf("M1"); const [m2] = runsOf("M2");
+  assert.equal(m1.warm, true); assert.equal(m1.model, "fable");
+  assert.equal(m2.warm, true); assert.equal(m2.model, "sonnet");
   await c.close();
 });
 

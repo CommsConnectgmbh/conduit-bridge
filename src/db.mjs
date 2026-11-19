@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { ensurePrivateDir, tightenFile } from "./private-fs.mjs";
 
-const DB_DIR = process.env.DB_DIR || join(homedir(), "Library/conduit-bridge");
+export const DB_DIR = process.env.DB_DIR || join(homedir(), "Library/conduit-bridge");
 // Chat history is the most private thing the bridge stores: owner-only, and
 // installs from older versions are corrected here on every start.
 ensurePrivateDir(DB_DIR);
