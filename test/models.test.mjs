@@ -11,9 +11,20 @@ process.env.AGY_BIN = join(dir, "no-agy");
 delete process.env.CLAUDE_MODEL;
 delete process.env.AGY_MODEL;
 
+// Not after(): with the top-level awaits below the runner can run after()
+// before every test is registered. The history database stays open in this
+// process, and Windows keeps it locked until it is closed (see
+// agent-policy.test.mjs).
+let closeDb = () => {};
+process.on("exit", () => {
+  try { closeDb(); } catch {}
+  try { rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); } catch {}
+});
+
 const m = await import("../src/models.mjs");
 const { getEngine } = await import("../src/engines.mjs");
-test.after(() => rmSync(dir, { recursive: true, force: true }));
+const { db } = await import("../src/db.mjs");
+closeDb = () => db.close();
 
 test("claudeAlias maps old, new and concrete ids to the CLI family alias", () => {
   assert.equal(m.claudeAlias("claude-opus-5"), "opus");
