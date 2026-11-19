@@ -139,3 +139,17 @@ test("the last good agy list is stored and read back after a restart", { skip: p
   const fresh = await import(`../src/models.mjs?restart=${Date.now()}`);
   assert.deepEqual(fresh.agyModels().map((x) => x.id), ["gemini-9-x-high"]);
 });
+
+test("Windows: agy as a .cmd shim in a folder with spaces is run and its list read", { skip: process.platform !== "win32" }, async () => {
+  const { writeFileSync: w, mkdirSync } = await import("node:fs");
+  const folder = join(dir, "Program Files", "agy shim");
+  mkdirSync(folder, { recursive: true });
+  const shim = join(folder, "agy.cmd");
+  // What npm and installers put on Windows: a batch file that prints the list.
+  w(shim, "@echo off\r\nif not \"%~1\"==\"models\" exit /b 2\r\necho gemini-9-shim-high\tGemini 9 Shim (High)\r\necho gpt-oss-120b-medium\tGPT-OSS\r\n");
+  m._setAgyModels([]);
+  m._expireAgyCache();
+  assert.doesNotThrow(() => m.refreshAgyModels(shim));
+  for (let i = 0; i < 100 && !m.agyModels().length; i++) await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(m.agyModels().map((x) => [x.id, x.name]), [["gemini-9-shim-high", "Gemini 9 Shim (High)"]]);
+});
