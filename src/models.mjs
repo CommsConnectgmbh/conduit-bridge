@@ -120,7 +120,7 @@ export function parseAgyModels(stdout) {
   for (const line of String(stdout || "").split(/\r?\n/)) {
     const [id, ...rest] = line.split("\t");
     const slug = (id || "").trim();
-    if (!/^gemini-[a-z0-9.-]+$/i.test(slug) || slug.includes("orchestrator") || seen.has(slug)) continue;
+    if (!looksLikeGeminiModel(slug) || seen.has(slug)) continue;
     seen.add(slug);
     out.push({ id: slug, name: rest.join("\t").trim() || slug });
   }
@@ -133,7 +133,7 @@ export function refreshAgyModels(bin) {
   if (agyCache.refreshing) return;
   if (agyCache.failedAt ? now - agyCache.failedAt < AGY_RETRY_MS : now - agyCache.checkedAt < AGY_CACHE_TTL_MS) return;
   agyCache.refreshing = true;
-  execFile(bin, ["models"], { timeout: AGY_LIST_TIMEOUT_MS, maxBuffer: 1 << 20, env: { ...process.env, NO_COLOR: "1" } }, (err, stdout) => {
+  const done = (err, stdout) => {
     const list = err ? [] : parseAgyModels(stdout);
     if (list.length) {
       agyCache.models = list;
@@ -144,7 +144,25 @@ export function refreshAgyModels(bin) {
       agyCache.failedAt = Date.now();
     }
     agyCache.refreshing = false;
-  });
+  };
+  // Windows starts a .cmd/.bat shim only through the shell (Node refuses it
+  // otherwise with EINVAL). Safe here: the only argument is the fixed word
+  // "models", and the path is quoted.
+  const viaShell = process.platform === "win32" && /\.(cmd|bat)$/i.test(bin);
+  try {
+    execFile(viaShell ? `"${bin}"` : bin, ["models"], {
+      timeout: AGY_LIST_TIMEOUT_MS, maxBuffer: 1 << 20, env: { ...process.env, NO_COLOR: "1" },
+      ...(viaShell ? { shell: true } : {}), windowsHide: true,
+    }, done);
+  } catch (e) {
+    // A synchronous spawn error must never take the bridge down at import.
+    done(e, "");
+  }
+}
+
+/** Whether a name can be an agy Gemini model at all (used before the list is in). */
+export function looksLikeGeminiModel(id) {
+  return /^gemini-[a-z0-9.-]+$/i.test(String(id || "")) && !String(id).includes("orchestrator");
 }
 
 /** Known Gemini models with the default marked. `preferred` (AGY_MODEL) wins

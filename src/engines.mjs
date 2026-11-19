@@ -19,7 +19,7 @@
 import { homedir } from "node:os";
 import { accessSync, readFileSync, statSync, constants as FS } from "node:fs";
 import { listMessages, setClaudeSessionId, setAgyConversationId, setCodexThreadId } from "./db.mjs";
-import { claudeAlias, claudeModels, noteClaudeModel, agyModels, refreshAgyModels } from "./models.mjs";
+import { claudeAlias, claudeModels, noteClaudeModel, agyModels, refreshAgyModels, looksLikeGeminiModel } from "./models.mjs";
 import {
   readAgentPolicy, claudePermissionArgs, codexPermissionArgs, agyPermissionArgs, deniedNotice,
 } from "./agent-policy.mjs";
@@ -231,7 +231,10 @@ const ANTIGRAVITY = {
     const req = String(requested || "").trim();
     const known = agyModels(process.env.AGY_MODEL);
     if (req && known.some((m) => m.id === req)) return req;
-    if (req && known.length === 0 && req === process.env.AGY_MODEL) return req;
+    // Liste noch nicht da (erste Sekunden nach dem Start, agy gerade nicht
+    // erreichbar): ein Gemini-Name gilt, sonst verlöre eine gültige Auswahl
+    // still ihr Modell. Ein Name einer anderen Engine rutscht nie durch.
+    if (req && known.length === 0 && looksLikeGeminiModel(req)) return req;
     return this.defaultModel;
   },
 

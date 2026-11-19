@@ -94,10 +94,21 @@ test("Gemini engine offers agy's list and drops models agy no longer has", () =>
   delete process.env.AGY_MODEL;
 });
 
-test("without a list Gemini falls back to agy's own default", () => {
+test("without a list Gemini keeps a Gemini choice and otherwise uses agy's default", () => {
   const agy = getEngine("gemini");
   m._setAgyModels([]);
   assert.equal(agy.defaultModel, "default");
-  assert.equal(agy.resolveModel("gemini-3.1-pro-high"), "default");
+  // A valid stored choice must not silently lose its model on a cold start.
+  assert.equal(agy.resolveModel("gemini-3.8-flash-high"), "gemini-3.8-flash-high");
+  assert.equal(agy.resolveModel("claude-opus"), "default");
+  assert.equal(agy.resolveModel("gemini-pro-orchestrator-neon"), "default");
+  assert.equal(agy.resolveModel(""), "default");
   assert.ok(!agy.buildArgs({ prompt: "hi", model: "default" }).some((a) => a.startsWith("--model")));
+});
+
+test("a binary that cannot be started never throws out of the refresh", async () => {
+  m._setAgyModels([]);
+  assert.doesNotThrow(() => m.refreshAgyModels(join(dir, "missing", "agy")));
+  await new Promise((r) => setTimeout(r, 200));
+  assert.deepEqual(m.agyModels(), []);
 });

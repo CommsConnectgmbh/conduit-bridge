@@ -2004,7 +2004,7 @@ function spawnInflight(rt, sess, prompt, assistantId, userMessageId = null, engi
   // "interrupted" (tools may have run), not as "never started".
   recordTurnAccepted(rt, { state: "running", assistantId, userMessageId, engine: engineDef.id, model: model || rt.model || sess.model });
   if (engineDef.usesWarmPool && warmPool) {
-    return spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId);
+    return spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId, model || rt.model || sess.model);
   }
   return runInflightTurn(engineDef, rt, sess, prompt, assistantId, userMessageId, model || rt.model || sess.model);
 }
@@ -2012,12 +2012,12 @@ function spawnInflight(rt, sess, prompt, assistantId, userMessageId = null, engi
 // V3.0: stream the turn through the warm process pool (token-by-token, no boot).
 // On an early failure it transparently falls back to a one-shot spawn so the
 // user always gets an answer even if the warm path misbehaves.
-function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null) {
+function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null, model = null) {
   const spawnCwd = sessionSpawnCwd(sess);
 
   const inflight = {
     assistantId, userMessageId, content: "", done: false, errorMsg: null,
-    engine: CLAUDE_ENGINE.id, model: rt.model || sess?.model || null,
+    engine: CLAUDE_ENGINE.id, model: model || rt.model || sess?.model || null,
     proc: null,             // warm: the pool owns the long-lived process
     warm: true, stopRequested: false, fellBack: false,
     lastOutputAt: Date.now(),
@@ -2150,7 +2150,10 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null) 
   log("info", "spawn_claude", { sid: rt.sid, hasResume: !!rt.claudeSessionId, len: prompt.length, warm: true });
 
   warmPool.runTurn({
-    sid: rt.sid, sess, cwd: spawnCwd, prompt,
+    // The model goes along explicitly: `sess` is the row as read before this
+    // prompt stored its choice, so a switch (Opus → Fable) used to reach the
+    // warm process only on the turn after.
+    sid: rt.sid, sess, cwd: spawnCwd, prompt, model,
     handlers: {
       onSessionId: (id) => rememberConversation(CLAUDE_ENGINE, rt, id),
       onChunk: (text) => {
