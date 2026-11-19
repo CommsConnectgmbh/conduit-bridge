@@ -123,3 +123,19 @@ test("a binary that cannot be started never throws out of the refresh", async ()
   await new Promise((r) => setTimeout(r, 200));
   assert.deepEqual(m.agyModels(), []);
 });
+
+test("the last good agy list is stored and read back after a restart", { skip: process.platform === "win32" }, async () => {
+  const { writeFileSync: w, chmodSync } = await import("node:fs");
+  const fake = join(dir, "fake-agy");
+  w(fake, `#!${process.execPath}\nprocess.stdout.write("gemini-9-x-high\\tGemini 9 X (High)\\nclaude-opus-5-5-high\\tClaude\\n");\n`);
+  chmodSync(fake, 0o755);
+  m._setAgyModels([]);
+  m._expireAgyCache();
+  m.refreshAgyModels(fake);
+  for (let i = 0; i < 50 && !m.agyModels().length; i++) await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(m.agyModels().map((x) => x.id), ["gemini-9-x-high"]);
+  assert.deepEqual(JSON.parse(readFileSync(join(dir, "agy-models.json"), "utf8")), [{ id: "gemini-9-x-high", name: "Gemini 9 X (High)" }]);
+  // A fresh process reads it before agy has answered.
+  const fresh = await import(`../src/models.mjs?restart=${Date.now()}`);
+  assert.deepEqual(fresh.agyModels().map((x) => x.id), ["gemini-9-x-high"]);
+});

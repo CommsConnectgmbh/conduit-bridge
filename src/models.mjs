@@ -107,7 +107,29 @@ const AGY_CACHE_TTL_MS = 10 * 60_000;
 const AGY_RETRY_MS = 60_000;
 const AGY_LIST_TIMEOUT_MS = 20_000;
 
-const agyCache = { models: [], checkedAt: 0, failedAt: 0, refreshing: false };
+// The last good list is kept on disk: right after a restart the bridge then
+// already knows which models agy has, and a stored id agy dropped is mapped to
+// the default instead of being passed through and failing the first turn.
+const AGY_SEEN_FILE = join(DB_DIR, "agy-models.json");
+const agyCache = { models: loadAgySeen(), checkedAt: 0, failedAt: 0, refreshing: false };
+
+function loadAgySeen() {
+  try {
+    const raw = JSON.parse(readFileSync(AGY_SEEN_FILE, "utf8"));
+    return (Array.isArray(raw) ? raw : [])
+      .filter((m) => m && looksLikeGeminiModel(m.id) && typeof m.name === "string")
+      .map((m) => ({ id: m.id, name: m.name }));
+  } catch { return []; }
+}
+
+function saveAgySeen(list) {
+  try {
+    const tmp = `${AGY_SEEN_FILE}.tmp`;
+    writeFileSync(tmp, JSON.stringify(list), { mode: 0o600 });
+    renameSync(tmp, AGY_SEEN_FILE);
+    tightenFile(AGY_SEEN_FILE);
+  } catch { /* the in-memory list still applies */ }
+}
 
 /**
  * Parse `agy models`: one model per line, "<id>\t<display name>". agy also
@@ -136,6 +158,7 @@ export function refreshAgyModels(bin) {
   const done = (err, stdout) => {
     const list = err ? [] : parseAgyModels(stdout);
     if (list.length) {
+      if (JSON.stringify(list) !== JSON.stringify(agyCache.models)) saveAgySeen(list);
       agyCache.models = list;
       agyCache.checkedAt = Date.now();
       agyCache.failedAt = 0;
@@ -180,3 +203,6 @@ export function _setAgyModels(models) {
   agyCache.checkedAt = models.length ? Date.now() : 0;
   agyCache.failedAt = 0;
 }
+
+/** Test hook: let the next refresh run now. */
+export function _expireAgyCache() { agyCache.checkedAt = 0; agyCache.failedAt = 0; }
