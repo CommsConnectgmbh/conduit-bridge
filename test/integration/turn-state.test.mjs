@@ -32,6 +32,7 @@ const SID = "abcdabcd-1111-4222-8333-444455556666";
 const SECRET = "sk-ant-api03-SYNTHETICSECRET0123456789";
 const PRIVATE_PATH = "/Users/test-user/private/project";
 const EMAIL = "owner@example.com";
+const FOREIGN_SID = "abcdabcd-7777-4222-8333-444455556666";
 
 let dir, fakeLog, journalDir, bridge = null, bridgeKey, device, pairPort, port;
 const freePort = () => new Promise((res) => { const s = net.createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => res(p)); }); });
@@ -560,6 +561,64 @@ test("agent checkpoints are filtered into the journal and handed back to the age
   killFakes();
 });
 
+test("the task overview lists every task across chats with its end and the last work state", { skip: !POSIX }, async () => {
+  // A chat of another account on the same bridge: never in this account's list.
+  {
+    const db = new DatabaseSync(join(dir, "db", "db.sqlite"));
+    const t = Date.now();
+    db.prepare("INSERT INTO sessions (id, user_email, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)").run(FOREIGN_SID, "someone@example.org", "FOREIGN-TITLE", t, t);
+    db.prepare("INSERT INTO messages (id, session_id, role, content, ts) VALUES (?, ?, 'user', ?, ?)").run("u-F1", FOREIGN_SID, "FOREIGN-REQUEST", t);
+    db.prepare("INSERT INTO messages (id, session_id, role, content, ts, reply_to, turn_status) VALUES (?, ?, 'assistant', ?, ?, ?, 'ok')").run("a-F1", FOREIGN_SID, "FOREIGN-ANSWER", t + 1, "u-F1");
+    db.close();
+  }
+  bridge = await startBridge({ warm: false });
+  const c = await client();
+  const r = await c.call("GET", "/api/tasks");
+  assert.equal(r.head.status, 200);
+  assert.equal(r.body.ok, true);
+  const tasks = r.body.tasks;
+  const byId = Object.fromEntries(tasks.map((t) => [t.id, t]));
+  assert.equal(byId["a-P1"].status, "ok");
+  assert.equal(byId["a-P2"].status, "interrupted");
+  assert.ok(byId["a-P2"].steps.total >= 1 && byId["a-P2"].steps.interrupted >= 1, JSON.stringify(byId["a-P2"].steps));
+  assert.equal(byId["a-P3"].status, "not_started");
+  assert.equal(byId["a-P13"].status, "interrupted");
+  assert.ok(byId["a-P13"].error, "a failed task carries the bridge's text");
+  assert.equal(byId["a-P1"].error, null);
+  assert.equal(byId["a-P14"].status, "ok");
+  // The start of the request, one line, for the list row.
+  assert.ok(byId["a-P1"].request.startsWith("TAG:P1 SCENARIO:"), byId["a-P1"].request);
+  assert.ok(!byId["a-P1"].request.includes("\n"));
+  assert.equal(byId["a-P1"].sessionId, SID);
+  assert.equal(typeof byId["a-P1"].sessionTitle, "string");
+  for (let i = 1; i < tasks.length; i++) assert.ok(tasks[i - 1].startedAt >= tasks[i].startedAt, "not newest first");
+  // Only this account.
+  assert.ok(!tasks.some((t) => t.sessionId === FOREIGN_SID), "another account's task listed");
+  assert.ok(!JSON.stringify(r.body).includes("FOREIGN"), "another account's data leaked");
+  // The chat's last saved work state, as the agent wrote it (filtered).
+  const cp = r.body.checkpoints[SID];
+  assert.equal(cp.taskId, "a-P13");
+  assert.equal(cp.next, "Run step 3 (backfill) after checking row counts");
+  for (const leak of [SECRET, "SYNTHETICSECRET", "hunter2", EMAIL]) assert.ok(!JSON.stringify(cp).includes(leak), `checkpoint leaks ${leak}`);
+  // Limits.
+  const two = await c.call("GET", "/api/tasks?limit=2");
+  assert.equal(two.body.tasks.length, 2);
+  const huge = await c.call("GET", "/api/tasks?limit=999999");
+  assert.ok(huge.body.tasks.length <= 500);
+  // A running task is reported as running, with the tool it is in.
+  await c.prompt("P16", "hang");
+  await c.waitFor((f) => f.type === "chunk" && f.assistantMessageId === "a-P16", "P16 running");
+  const live = await c.call("GET", "/api/tasks?limit=5");
+  const p16 = live.body.tasks.find((t) => t.id === "a-P16");
+  assert.equal(p16.status, "running");
+  assert.ok(Array.isArray(p16.activeTools));
+  await c.send({ type: "stop" });
+  await c.waitFor(isTerminal("a-P16"), "P16 stopped");
+  await c.close();
+  await stopBridge("SIGTERM");
+  killFakes();
+});
+
 test("an answer stored by an older bridge is not claimed as a success", { skip: !POSIX }, async () => {
   {
     const db = new DatabaseSync(join(dir, "db", "db.sqlite"));
@@ -598,9 +657,22 @@ test("the journal is owner-only, separate, complete and leaks nothing", { skip: 
   assert.equal(mode(journalDir), 0o700);
   assert.equal(mode(join(dir, "PC-Transfer")), 0o755, "shared parent folder was changed");
   assert.equal(readFileSync(join(dir, "PC-Transfer", "Conduit-Arbeitsstand.md"), "utf8"), "owned by someone else\n");
-  const files = readdirSync(journalDir);
-  assert.deepEqual(files, [`Conduit-Journal-${SID}.md`]);
-  assert.equal(mode(join(journalDir, files[0])), 0o600);
+  const files = readdirSync(journalDir).sort();
+  assert.deepEqual(files, ["00-Conduit-Uebersicht.md", `Conduit-Journal-${SID}.md`]);
+  for (const f of files) assert.equal(mode(join(journalDir, f)), 0o600, f);
+
+  // The overview: every chat once, grouped, with the journal to open and the
+  // last work state, and nothing else.
+  const ov = readFileSync(join(journalDir, "00-Conduit-Uebersicht.md"), "utf8");
+  assert.match(ov, /^# Conduit · Übersicht aller Aufgaben/);
+  assert.match(ov, /## Läuft gerade \(0\)/);
+  assert.match(ov, /## Braucht Aufmerksamkeit \(\d+\)[\s\S]*Sitzung `abcdabcd-1111-4222-8333-444455556666`/);
+  assert.ok(ov.includes(`Journal: \`Conduit-Journal-${SID}.md\``));
+  assert.match(ov, /> Nächster Schritt: Run step 3 \(backfill\) after checking row counts/);
+  assert.equal((ov.match(new RegExp(`Sitzung \`${SID}\``, "g")) || []).length, 1, "a chat listed twice");
+  for (const leak of [SECRET, "SYNTHETICSECRET", PRIVATE_PATH, dir, EMAIL, "SCENARIO", "TAG:", "FOREIGN-TITLE", "FOREIGN-REQUEST", "FOREIGN-ANSWER", "hunter2", "/Users/test-user", "old text"]) {
+    assert.ok(!ov.includes(leak), `overview leaks ${JSON.stringify(leak)}`);
+  }
 
   const md = readJournal();
   // Content it must have.

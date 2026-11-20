@@ -219,6 +219,34 @@ const Q = {
     WHERE s.user_email = ? AND a.ts >= ?
     ORDER BY a.ts DESC LIMIT ?
   `),
+  // Task overview across all chats of one account: every answer (a task) with
+  // its chat, the start of the request it answers and how it ended.
+  listTasks: db.prepare(`
+    SELECT m.id, m.session_id, s.title AS session_title, s.engine, m.reply_to, m.ts, m.model,
+           m.turn_status, m.turn_error, length(m.content) AS chars,
+           substr(u.content, 1, 400) AS request
+    FROM messages m
+    JOIN sessions s ON s.id = m.session_id
+    LEFT JOIN messages u ON u.id = m.reply_to AND u.session_id = m.session_id
+    WHERE s.user_email = ?1 AND m.role = 'assistant' AND m.ts >= ?2
+    ORDER BY m.ts DESC LIMIT ?3
+  `),
+  // Tool steps per task, by state, with the time of the latest one.
+  listTaskSteps: db.prepare(`
+    SELECT a.assistant_id, a.status, COUNT(*) AS n, MAX(a.ts) AS last_ts
+    FROM audit_log a JOIN sessions s ON s.id = a.session_id
+    WHERE s.user_email = ?1 AND a.ts >= ?2 AND a.assistant_id IS NOT NULL
+    GROUP BY a.assistant_id, a.status
+  `),
+  // The latest task of every chat on this bridge (all accounts), for the
+  // overview file in the journal folder. Metadata only.
+  listLatestTasks: db.prepare(`
+    SELECT m.session_id, m.id, m.ts, m.model, m.turn_status, s.engine, s.updated_at
+    FROM messages m JOIN sessions s ON s.id = m.session_id
+    WHERE m.role = 'assistant'
+      AND m.id = (SELECT m2.id FROM messages m2 WHERE m2.session_id = m.session_id AND m2.role = 'assistant' ORDER BY m2.ts DESC LIMIT 1)
+    ORDER BY s.updated_at DESC LIMIT ?
+  `),
   addUsage: db.prepare(`
     UPDATE sessions SET
       tokens_in    = tokens_in    + ?,
@@ -708,6 +736,55 @@ export function listAudit(email, { sinceTs = 0, limit = 500 } = {}) {
 export function sweepStaleRunningAudit() {
   try { return Q.sweepRunningAudit.run().changes || 0; }
   catch { return 0; }
+}
+
+/** The start of a request as one short line, for a list row. */
+export function requestSnippet(text, maxLen = 160) {
+  const s = String(text || "").replace(/\s+/g, " ").trim();
+  if (!s) return "";
+  return s.length > maxLen ? s.slice(0, maxLen - 1).trimEnd() + "…" : s;
+}
+
+/**
+ * Tasks (answers) of one account across all chats, newest first, with the
+ * tool steps each one ran. A turn stored without a recorded end (older
+ * bridge) is "unknown", never counted as a success.
+ */
+export function listTasks(email, { sinceTs = 0, limit = 100 } = {}) {
+  const lim = Math.max(1, Math.min(500, Number(limit) || 100));
+  const since = Math.max(0, Number(sinceTs) || 0);
+  let rows = [];
+  try { rows = Q.listTasks.all(email, since, lim); } catch { return []; }
+  const steps = new Map();
+  try {
+    for (const r of Q.listTaskSteps.all(email, since)) {
+      const s = steps.get(r.assistant_id) || { total: 0, done: 0, failed: 0, running: 0, interrupted: 0, lastAt: null };
+      const k = ["done", "failed", "running", "interrupted"].includes(r.status) ? r.status : "interrupted";
+      s[k] += r.n;
+      s.total += r.n;
+      if (r.last_ts && (!s.lastAt || r.last_ts > s.lastAt)) s.lastAt = r.last_ts;
+      steps.set(r.assistant_id, s);
+    }
+  } catch { /* steps are an extra; the task list stands without them */ }
+  return rows.map((r) => ({
+    id: r.id,
+    sessionId: r.session_id,
+    sessionTitle: r.session_title || "Chat",
+    engine: r.engine || "claude",
+    model: r.model || null,
+    userMessageId: r.reply_to || null,
+    request: requestSnippet(r.request),
+    startedAt: r.ts,
+    status: r.turn_status || "unknown",
+    error: r.turn_status && r.turn_status !== "ok" ? (r.turn_error || null) : null,
+    chars: r.chars || 0,
+    steps: steps.get(r.id) || { total: 0, done: 0, failed: 0, running: 0, interrupted: 0, lastAt: null },
+  }));
+}
+
+/** The latest task of every chat on this bridge, for the overview file. */
+export function listLatestTasks(limit = 200) {
+  try { return Q.listLatestTasks.all(Math.max(1, Math.min(1000, Number(limit) || 200))); } catch { return []; }
 }
 
 export function addUsage(sid, usage) {
