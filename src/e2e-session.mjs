@@ -366,8 +366,30 @@ export class Channel {
     if (this.#closed) throw new Error("channel closed");
   }
 
-  /** Send bytes, split into frames and paced by the peer's credit. */
-  async write(bytes, { end = false } = {}) {
+  /**
+   * Send bytes, split into frames and paced by the peer's credit.
+   *
+   * Writes on one channel run one after another. A write awaits between its
+   * frames (credit, the session's send chain), and callers fire writes without
+   * waiting (ChannelSocket.send, ChatSocket.send). Without this queue the
+   * frames of the next message slipped in between, the reader on the other
+   * side decoded a length out of the middle of a message and closed the
+   * channel. A failed write does not block the ones after it; on a closed
+   * channel they fail on their own.
+   */
+  write(bytes, opts) {
+    return this.#enqueue(() => this.#writeNow(bytes, opts));
+  }
+
+  #writeChain = Promise.resolve();
+
+  #enqueue(job) {
+    const run = this.#writeChain.then(job);
+    this.#writeChain = run.catch(() => {});
+    return run;
+  }
+
+  async #writeNow(bytes, { end = false } = {}) {
     if (this.#closed) throw new Error("channel closed");
     let off = 0;
     do {
@@ -383,7 +405,9 @@ export class Channel {
   /** JSON convenience used by rpc and chat channels. */
   writeJson(obj, opts) { return this.write(utf8(JSON.stringify(obj)), opts); }
 
-  end() { return this.#s._sendData(this.id, new Uint8Array(0), true); }
+  // Behind any write still running: an end before its last frame would close
+  // the stream in the middle of the data.
+  end() { return this.#enqueue(() => this.#s._sendData(this.id, new Uint8Array(0), true)); }
 
   /** Close the channel locally and tell the peer. */
   async close(code = CLOSE.NORMAL, reason = "") {

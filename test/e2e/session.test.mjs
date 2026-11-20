@@ -3,6 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { generateKeyPair, utf8 } from "../../src/e2e-noise.mjs";
 import { connect, accept, KIND, MODE_PAIR, GOAWAY, CODE_ID_LEN } from "../../src/e2e.mjs";
+import { encodeMessage, MessageReader } from "../../src/e2e-messages.mjs";
 
 function memoryPair({ tamper } = {}) {
   const mk = () => ({ msg: [], cls: [], open: true, buffered: 0 });
@@ -111,6 +112,65 @@ test("flow control: a large upload is paced by credits and arrives intact", asyn
   await ch.write(big, { end: true });
   const out = await received;
   assert.equal(out.length, size); assert.ok(Buffer.from(big).equals(out));
+  await ds.goaway();
+});
+
+// What the bridge and the app do on a chat channel: send() fires a write and
+// does not wait for it. A message larger than one frame (or one that runs out
+// of credit) used to be split across awaits, so the next send() slipped its
+// frames in between and the reader on the other side decoded garbage.
+async function concurrentChatWrites({ window, rounds, bigSize }) {
+  const { b, d } = await setup({ options: window ? { window } : {} });
+  const bs = b.value.session, ds = d.value.session;
+  const got = [];
+  let readerError = null;
+  bs.on("channel", (ch) => {
+    const reader = new MessageReader({ maxBytes: 8e6, onMessage: (m) => got.push(td.decode(m)) });
+    ch.on("data", (p) => { try { reader.push(p); } catch (e) { readerError = e; } });
+  });
+  const ch = await ds.open(KIND.CHAT, { sid: "s" });
+  const sent = [];
+  const writes = [];
+  for (let i = 0; i < rounds; i++) {
+    const big = JSON.stringify({ i, kind: "big", pad: "x".repeat(bigSize) });
+    const small = JSON.stringify({ i, kind: "chunk" });
+    sent.push(big, small);
+    // Not awaited on purpose, like ChannelSocket.send / ChatSocket.send.
+    writes.push(ch.write(encodeMessage(utf8(big))), ch.write(encodeMessage(utf8(small))));
+  }
+  await Promise.all(writes);
+  const t0 = Date.now();
+  while (got.length < sent.length && !readerError && Date.now() - t0 < 10_000) await new Promise((r) => setTimeout(r, 10));
+  await ds.goaway();
+  return { got, sent, readerError };
+}
+
+test("concurrent writes of messages larger than a frame never interleave", async () => {
+  const { got, sent, readerError } = await concurrentChatWrites({ rounds: 5, bigSize: 150_000 });
+  assert.equal(readerError, null, String(readerError));
+  assert.deepEqual(got, sent);
+});
+
+test("concurrent small writes stay whole when the window runs out mid-message", async () => {
+  const { got, sent, readerError } = await concurrentChatWrites({ window: 4096, rounds: 200, bigSize: 700 });
+  assert.equal(readerError, null, String(readerError));
+  assert.deepEqual(got, sent);
+});
+
+test("end() waits for a write that is still running", async () => {
+  const { b, d } = await setup({ options: { window: 4096 } });
+  const bs = b.value.session, ds = d.value.session;
+  const received = new Promise((res) => bs.on("channel", (ch) => {
+    const parts = []; ch.on("data", (p) => parts.push(Uint8Array.from(p)));
+    ch.on("end", () => res(Buffer.concat(parts)));
+  }));
+  const ch = await ds.open(KIND.UPLOAD, { name: "x.bin" });
+  const body = new Uint8Array(100_000).fill(7);
+  const w = ch.write(body);
+  const e = ch.end();
+  await Promise.all([w, e]);
+  const out = await received;
+  assert.equal(out.length, body.length);
   await ds.goaway();
 });
 

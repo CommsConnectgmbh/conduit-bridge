@@ -157,6 +157,11 @@ function run(raw) {
   appendFileSync(LOG, JSON.stringify({ pid: process.pid, warm, tag, sc, model: mi >= 0 ? process.argv[mi + 1] : null, journal: process.env.CONDUIT_JOURNAL_FILE || null,
     checkpoint: process.env.CONDUIT_CHECKPOINT_FILE || null, sys: si >= 0 ? process.argv[si + 1] : null }) + "\\n");
   if (sc === "ok") { text("answer " + tag); result(); }
+  else if (sc === "big") {
+    // One block larger than an encrypted frame, then more text right behind
+    // it: the bridge sends both without waiting in between.
+    text("B".repeat(200000)); text("tail " + tag); result();
+  }
   else if (sc === "empty-warm") {
     // A warm process that really ends the prompt without text, stays up and
     // ignores SIGTERM (as claude does while it winds down MCP servers and
@@ -404,6 +409,20 @@ test("a model switch reaches the warm process on the first turn, as a family ali
   const [m1] = runsOf("M1"); const [m2] = runsOf("M2");
   assert.equal(m1.warm, true); assert.equal(m1.model, "fable");
   assert.equal(m2.warm, true); assert.equal(m2.model, "sonnet");
+  await c.close();
+});
+
+test("an answer larger than an encrypted frame arrives whole, with the text behind it", { skip: !POSIX }, async () => {
+  const c = await client();
+  await c.prompt("BIG1", "big");
+  const t = await c.waitFor(isTerminal("a-BIG1"), "BIG1 terminal", 20_000);
+  assert.equal(t.type, "done", JSON.stringify(t).slice(0, 500));
+  const text = c.frames.filter((f) => f.type === "chunk" && f.assistantMessageId === "a-BIG1").map((f) => f.text).join("");
+  assert.equal(text, "B".repeat(200000) + "\n\ntail BIG1");
+  // The channel is still usable: before the fix the reader decoded garbage
+  // and closed it.
+  await c.prompt("BIG2", "ok");
+  assert.equal((await c.waitFor(isTerminal("a-BIG2"), "BIG2 terminal")).type, "done");
   await c.close();
 });
 
