@@ -632,6 +632,8 @@ test("the task overview lists every task across chats with its end and the last 
   for (const leak of [SECRET, "SYNTHETICSECRET", "hunter2", EMAIL]) assert.ok(!JSON.stringify(cp).includes(leak), `checkpoint leaks ${leak}`);
   assert.equal(byId["a-OLD"].status, "interrupted");
   assert.equal(byId["a-P1"].engine, "claude", "engine of the task, not the chat's current choice");
+  assert.equal(byId["a-P1"].chatEngine, "codex", "the chat's current choice comes along");
+  assert.equal(byId["a-OLD"].chatEngine, "claude");
   assert.equal(byId["a-OLD"].engine, null, "an engine never recorded is not guessed");
   // Back to the engine the fake agent stands in for, before the next prompt.
   {
