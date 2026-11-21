@@ -227,6 +227,7 @@ const Q = {
   // its chat, the start of the request it answers and how it ended.
   listTasks: db.prepare(`
     SELECT m.id, m.session_id, s.title AS session_title, m.engine, m.reply_to, m.ts, m.model,
+           s.engine AS chat_engine, s.model AS chat_model,
            m.turn_status, m.turn_error, length(m.content) AS chars,
            substr(u.content, 1, 400) AS request
     FROM messages m
@@ -241,6 +242,7 @@ const Q = {
   // most one per chat plus what runs or waits right now).
   listOpenTasks: db.prepare(`
     SELECT m.id, m.session_id, s.title AS session_title, m.engine, m.reply_to, m.ts, m.model,
+           s.engine AS chat_engine, s.model AS chat_model,
            m.turn_status, m.turn_error, length(m.content) AS chars,
            substr(u.content, 1, 400) AS request
     FROM messages m
@@ -265,6 +267,7 @@ const Q = {
   // when the chat's saved work state says it is blocked (see listTasks).
   listLatestOkTasks: db.prepare(`
     SELECT m.id, m.session_id, s.title AS session_title, m.engine, m.reply_to, m.ts, m.model,
+           s.engine AS chat_engine, s.model AS chat_model,
            m.turn_status, m.turn_error, length(m.content) AS chars,
            substr(u.content, 1, 400) AS request
     FROM messages m
@@ -821,6 +824,10 @@ export function listTasks(email, { sinceTs = 0, limit = 100, isBlocked = null } 
     // null: a task from before 3.3, whose engine was never recorded.
     engine: r.engine || null,
     model: r.model || null,
+    // The chat's current choice, which the next message runs on (a task
+    // carries what it ran on; a client opening the chat needs this one).
+    chatEngine: r.chat_engine || null,
+    chatModel: r.chat_model || null,
     userMessageId: r.reply_to || null,
     request: requestSnippet(r.request),
     startedAt: r.ts,
