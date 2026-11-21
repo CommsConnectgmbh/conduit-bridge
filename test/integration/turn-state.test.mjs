@@ -35,6 +35,10 @@ const EMAIL = "owner@example.com";
 const FOREIGN_SID = "abcdabcd-7777-4222-8333-444455556666";
 // A chat of the owner whose only task was cut off long ago.
 const OLD_SID = "abcdabcd-5555-4222-8333-444455556666";
+// Old chats whose last answer ended "ok", one with a saved work state that says
+// it is blocked (open again), one whose work state says nothing blocks it.
+const BLOCKED_SID = "abcdabcd-8888-4222-8333-444455556666";
+const CLEAR_SID = "abcdabcd-9999-4222-8333-444455556666";
 
 let dir, fakeLog, journalDir, bridge = null, bridgeKey, device, pairPort, port;
 const freePort = () => new Promise((res) => { const s = net.createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => res(p)); }); });
@@ -586,6 +590,13 @@ test("the task overview lists every task across chats with its end and the last 
     db.prepare("INSERT INTO messages (id, session_id, role, content, ts, reply_to, turn_status, turn_error) VALUES (?, ?, 'assistant', '', ?, ?, 'interrupted', 'cut off')").run("a-OLD", OLD_SID, 1001, "u-OLD");
     // A step it ran long ago: kept with the task whatever the history cut.
     db.prepare("INSERT INTO audit_log (id, session_id, assistant_id, ts, tool, summary, status) VALUES (?, ?, ?, ?, 'Bash', 'x', 'interrupted')").run("st-OLD", OLD_SID, "a-OLD", 1002);
+    for (const [sid, blocked] of [[BLOCKED_SID, "Waiting for the database password"], [CLEAR_SID, "none"]]) {
+      const tag = sid.slice(9, 13);
+      db.prepare("INSERT INTO sessions (id, user_email, title, created_at, updated_at) VALUES (?, ?, 'Old ok chat', 900, 900)").run(sid, EMAIL);
+      db.prepare("INSERT INTO messages (id, session_id, role, content, ts, turn_status) VALUES (?, ?, 'assistant', 'done', 901, 'ok')").run(`a-${tag}`, sid);
+      mkdirSync(join(dir, "db", "checkpoints"), { recursive: true, mode: 0o700 });
+      writeFileSync(join(dir, "db", "checkpoints", `${sid}.saved.json`), JSON.stringify({ ts: 902, assistantId: `a-${tag}`, cp: { summary: "Deploy prepared", next: "Deploy", blocked, done: [], verified: [], artifacts: [] } }), { mode: 0o600 });
+    }
     // The chat now runs on another engine: earlier answers keep the one they ran on.
     db.prepare("UPDATE sessions SET engine = 'codex' WHERE id = ?").run(SID);
     db.close();
@@ -631,15 +642,17 @@ test("the task overview lists every task across chats with its end and the last 
   // Limits cut the history, never an open task: the old interrupted one is
   // still there behind the two newest, and the answer says it was cut.
   const two = await c.call("GET", "/api/tasks?limit=2");
-  assert.deepEqual(two.body.tasks.map((t) => t.id).slice(-1), ["a-OLD"]);
-  assert.equal(two.body.tasks.length, 3);
+  // The old chat whose work state is blocked is open too; the clear one is history.
+  assert.deepEqual(two.body.tasks.map((t) => t.id).slice(-2), ["a-OLD", "a-8888"]);
+  assert.equal(two.body.tasks.length, 4);
+  assert.equal(two.body.checkpoints[BLOCKED_SID].blocked, "Waiting for the database password");
   assert.equal(two.body.limited, true);
   assert.equal(r.body.limited, false);
   const huge = await c.call("GET", "/api/tasks?limit=999999");
   assert.ok(huge.body.tasks.length <= 500);
   // A history cut by time keeps an old open task with all its steps.
   const later = await c.call("GET", `/api/tasks?since=${Date.now() + 86_400_000}`);
-  assert.deepEqual(later.body.tasks.map((t) => t.id), ["a-OLD"]);
+  assert.deepEqual(later.body.tasks.map((t) => t.id), ["a-OLD", "a-8888"]);
   assert.equal(later.body.tasks[0].steps.total, 1);
   assert.equal(later.body.tasks[0].steps.interrupted, 1);
   // More open tasks than any history limit: none is dropped.
@@ -724,6 +737,8 @@ test("the journal is owner-only, separate, complete and leaks nothing", { skip: 
   assert.match(ov, /> Nächster Schritt: Run step 3 \(backfill\) after checking row counts/);
   assert.equal((ov.match(new RegExp(`Sitzung \`${SID}\``, "g")) || []).length, 1, "a chat listed twice");
   assert.match(ov, new RegExp(`## Braucht Aufmerksamkeit[\\s\\S]*Sitzung \`${OLD_SID}\`[\\s\\S]*## Abgeschlossen`), "old open chat missing from the attention group");
+  assert.match(ov, new RegExp(`## Braucht Aufmerksamkeit[\\s\\S]*Sitzung \`${BLOCKED_SID}\`[\\s\\S]*Blockiert: Waiting for the database password[\\s\\S]*## Abgeschlossen`), "blocked chat missing from the attention group");
+  assert.match(ov, new RegExp(`## Abgeschlossen[\\s\\S]*Sitzung \`${CLEAR_SID}\``), "a chat nothing blocks is finished");
   for (const leak of [SECRET, "SYNTHETICSECRET", PRIVATE_PATH, dir, EMAIL, "SCENARIO", "TAG:", "FOREIGN-TITLE", "FOREIGN-REQUEST", "FOREIGN-ANSWER", "hunter2", "/Users/test-user", "old text"]) {
     assert.ok(!ov.includes(leak), `overview leaks ${JSON.stringify(leak)}`);
   }

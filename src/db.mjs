@@ -261,6 +261,18 @@ const Q = {
     WHERE s.user_email = ?1 AND a.assistant_id IN (SELECT value FROM json_each(?2))
     GROUP BY a.assistant_id, a.status
   `),
+  // The newest task of each chat of one account that ended "ok": open again
+  // when the chat's saved work state says it is blocked (see listTasks).
+  listLatestOkTasks: db.prepare(`
+    SELECT m.id, m.session_id, s.title AS session_title, m.engine, m.reply_to, m.ts, m.model,
+           m.turn_status, m.turn_error, length(m.content) AS chars,
+           substr(u.content, 1, 400) AS request
+    FROM messages m
+    JOIN sessions s ON s.id = m.session_id
+    LEFT JOIN messages u ON u.id = m.reply_to AND u.session_id = m.session_id
+    WHERE s.user_email = ?1 AND m.role = 'assistant' AND m.turn_status = 'ok'
+      AND m.id = (SELECT m2.id FROM messages m2 WHERE m2.session_id = m.session_id AND m2.role = 'assistant' ORDER BY m2.ts DESC LIMIT 1)
+  `),
   // The latest task of every chat on this bridge (all accounts), for the
   // overview file in the journal folder. Metadata only.
   listLatestTasks: db.prepare(`
@@ -775,7 +787,7 @@ export function requestSnippet(text, maxLen = 160) {
  * open tasks (running, queued, or a chat's newest one that did not end "ok")
  * are always included, whatever their age. `limited` says the history was cut.
  */
-export function listTasks(email, { sinceTs = 0, limit = 100 } = {}) {
+export function listTasks(email, { sinceTs = 0, limit = 100, isBlocked = null } = {}) {
   const lim = Math.max(1, Math.min(500, Number(limit) || 100));
   const since = Math.max(0, Number(sinceTs) || 0);
   let rows = [];
@@ -786,6 +798,9 @@ export function listTasks(email, { sinceTs = 0, limit = 100 } = {}) {
     const seen = new Set(recent.map((r) => r.id));
     rows = recent;
     for (const r of Q.listOpenTasks.all(email)) if (!seen.has(r.id)) { seen.add(r.id); rows.push(r); }
+    // A chat whose saved work state says it is blocked is open too, even
+    // when its last answer ended "ok".
+    if (isBlocked) for (const r of Q.listLatestOkTasks.all(email)) if (!seen.has(r.id) && isBlocked(r.session_id)) { seen.add(r.id); rows.push(r); }
     rows.sort((a, b) => b.ts - a.ts);
   } catch { return { tasks: [], limited: false }; }
   const steps = new Map();
@@ -818,16 +833,12 @@ export function listTasks(email, { sinceTs = 0, limit = 100 } = {}) {
 }
 
 /**
- * The latest task of every chat on this bridge, for the overview file. Every
- * chat whose latest task is not "ok" is kept; only finished chats are cut to
- * `finishedLimit`, most recently active first.
+ * The latest task of every chat on this bridge, most recently active first,
+ * for the overview file. All of them: which are open is decided there, with
+ * the saved work state, and only finished ones are cut.
  */
-export function listLatestTasks(finishedLimit = 200) {
-  const lim = Math.max(1, Math.min(1000, Number(finishedLimit) || 200));
-  let rows;
-  try { rows = Q.listLatestTasks.all(); } catch { return []; }
-  let finished = 0;
-  return rows.filter((r) => r.turn_status !== "ok" || ++finished <= lim);
+export function listLatestTasks() {
+  try { return Q.listLatestTasks.all(); } catch { return []; }
 }
 
 export function addUsage(sid, usage) {

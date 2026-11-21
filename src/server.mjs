@@ -22,7 +22,7 @@ import {
   searchHistory, closeStaleTurns, auditForAssistant, closeRunningAuditFor,
   listTasks, listLatestTasks,
 } from "./db.mjs";
-import { createJournal, journalDirFromEnv } from "./journal.mjs";
+import { createJournal, journalDirFromEnv, blockedOf } from "./journal.mjs";
 import { normaliseOrphanGrace, orphanDecision, ORPHAN_GRACE_MAX_MS } from "./orphan-guard.mjs";
 import {
   addE2eDevice, getE2eDevice, getE2eDeviceById, listE2eDevices, revokeE2eDevice, touchE2eDevice,
@@ -429,7 +429,7 @@ const journal = createJournal({
 let overviewTimer = null;
 function writeOverviewNow() {
   try {
-    journal.writeOverview(listLatestTasks(200).map((r) => ({
+    journal.writeOverview(listLatestTasks().map((r) => ({
       sid: r.session_id, taskId: r.id, state: r.turn_status, ts: r.ts, engine: r.engine, model: r.model,
     })));
   } catch (e) { log("warn", "overview_failed", { err: String(e?.message || e).slice(0, 120) }); }
@@ -1241,7 +1241,8 @@ async function handleApi(req, res, u, auth) {
   if (path === "/api/tasks" && req.method === "GET") {
     const sinceTs = Number(u.searchParams.get("since")) || 0;
     const limit = Math.min(500, Math.max(1, Number(u.searchParams.get("limit")) || 150));
-    const { tasks, limited } = listTasks(email, { sinceTs, limit });
+    const isBlocked = journal.enabled ? (sid) => { try { return !!blockedOf(journal.lastCheckpoint(sid)); } catch { return false; } } : null;
+    const { tasks, limited } = listTasks(email, { sinceTs, limit, isBlocked });
     const live = new Map();
     for (const t of tasks) {
       if (live.has(t.sessionId)) continue;
@@ -1264,7 +1265,7 @@ async function handleApi(req, res, u, auth) {
         if (!cp?.cp) continue;
         checkpoints[sid] = {
           at: cp.ts, taskId: cp.assistantId || null,
-          summary: cp.cp.summary || null, next: cp.cp.next || null, blocked: cp.cp.blocked || null,
+          summary: cp.cp.summary || null, next: cp.cp.next || null, blocked: blockedOf(cp),
           done: cp.cp.done || [], verified: (cp.cp.verified || []).length, artifacts: cp.cp.artifacts || [],
         };
       }

@@ -659,13 +659,15 @@ export function createJournal({ dir, checkpointDir = null, log = () => {}, now =
    *   { sid, taskId, state, ts, engine, model }
    */
   function writeOverview(tasks) {
+    // Every chat's latest task comes in; only what is really finished is cut
+    // (DONE_SHOWN below), after a blocked work state has been seen.
     if (!enabled) return false;
     if (!ensureDir()) return false;
     const groups = { running: [], attention: [], done: [] };
     for (const t of tasks || []) {
       const state = t.state == null ? "unknown" : pick(STATES, t.state);
       const cp = cpEnabled ? lastCheckpoint(t.sid) : null;
-      const blocked = cp?.cp?.blocked && !/^(nein|no|none|keine?|-)$/i.test(cp.cp.blocked) ? cp.cp.blocked : null;
+      const blocked = blockedOf(cp);
       const row = { ...t, state, cp, blocked };
       if (state === "running" || state === "queued") groups.running.push(row);
       else if (state === "ok" && !blocked) groups.done.push(row);
@@ -760,6 +762,13 @@ export function createJournal({ dir, checkpointDir = null, log = () => {}, now =
     turnAccepted, turnFinished, sessionEvent, ingestCheckpoint, lastCheckpoint, forgetCheckpoints,
     agentContext, agentEnv, writeOverview, status,
   };
+}
+
+/** What a saved work state says blocks the work, or null. "none", "nein",
+ *  "-" and the like are the agent saying nothing blocks it. */
+export function blockedOf(entry) {
+  const b = entry?.cp?.blocked;
+  return b && !/^(nein|no|none|keine?|-)$/i.test(String(b).trim()) ? b : null;
 }
 
 /**
