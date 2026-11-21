@@ -584,6 +584,10 @@ test("the task overview lists every task across chats with its end and the last 
     db.prepare("INSERT INTO sessions (id, user_email, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)").run(OLD_SID, EMAIL, "Old chat", 1000, 1000);
     db.prepare("INSERT INTO messages (id, session_id, role, content, ts) VALUES (?, ?, 'user', ?, ?)").run("u-OLD", OLD_SID, "old request", 1000);
     db.prepare("INSERT INTO messages (id, session_id, role, content, ts, reply_to, turn_status, turn_error) VALUES (?, ?, 'assistant', '', ?, ?, 'interrupted', 'cut off')").run("a-OLD", OLD_SID, 1001, "u-OLD");
+    // A step it ran long ago: kept with the task whatever the history cut.
+    db.prepare("INSERT INTO audit_log (id, session_id, assistant_id, ts, tool, summary, status) VALUES (?, ?, ?, ?, 'Bash', 'x', 'interrupted')").run("st-OLD", OLD_SID, "a-OLD", 1002);
+    // The chat now runs on another engine: earlier answers keep the one they ran on.
+    db.prepare("UPDATE sessions SET engine = 'codex' WHERE id = ?").run(SID);
     db.close();
   }
   bridge = await startBridge({ warm: false });
@@ -616,6 +620,14 @@ test("the task overview lists every task across chats with its end and the last 
   assert.equal(cp.next, "Run step 3 (backfill) after checking row counts");
   for (const leak of [SECRET, "SYNTHETICSECRET", "hunter2", EMAIL]) assert.ok(!JSON.stringify(cp).includes(leak), `checkpoint leaks ${leak}`);
   assert.equal(byId["a-OLD"].status, "interrupted");
+  assert.equal(byId["a-P1"].engine, "claude", "engine of the task, not the chat's current choice");
+  assert.equal(byId["a-OLD"].engine, null, "an engine never recorded is not guessed");
+  // Back to the engine the fake agent stands in for, before the next prompt.
+  {
+    const db = new DatabaseSync(join(dir, "db", "db.sqlite"));
+    db.prepare("UPDATE sessions SET engine = 'claude' WHERE id = ?").run(SID);
+    db.close();
+  }
   // Limits cut the history, never an open task: the old interrupted one is
   // still there behind the two newest, and the answer says it was cut.
   const two = await c.call("GET", "/api/tasks?limit=2");
@@ -625,6 +637,27 @@ test("the task overview lists every task across chats with its end and the last 
   assert.equal(r.body.limited, false);
   const huge = await c.call("GET", "/api/tasks?limit=999999");
   assert.ok(huge.body.tasks.length <= 500);
+  // A history cut by time keeps an old open task with all its steps.
+  const later = await c.call("GET", `/api/tasks?since=${Date.now() + 86_400_000}`);
+  assert.deepEqual(later.body.tasks.map((t) => t.id), ["a-OLD"]);
+  assert.equal(later.body.tasks[0].steps.total, 1);
+  assert.equal(later.body.tasks[0].steps.interrupted, 1);
+  // More open tasks than any history limit: none is dropped.
+  {
+    const db = new DatabaseSync(join(dir, "db", "db.sqlite"));
+    db.exec("BEGIN");
+    for (let i = 0; i < 520; i++) {
+      const sid = `bulk-${String(i).padStart(4, "0")}`;
+      db.prepare("INSERT INTO sessions (id, user_email, title, created_at, updated_at) VALUES (?, ?, 'Bulk', 2000, 2000)").run(sid, EMAIL);
+      db.prepare("INSERT INTO messages (id, session_id, role, content, ts, turn_status) VALUES (?, ?, 'assistant', '', ?, 'interrupted')").run(`a-${sid}`, sid, 2000 + i);
+    }
+    db.exec("COMMIT");
+    const many = await c.call("GET", "/api/tasks?limit=1");
+    assert.equal(many.body.tasks.filter((t) => t.id.startsWith("a-bulk-")).length, 520);
+    assert.ok(many.body.tasks.some((t) => t.id === "a-OLD"));
+    db.exec("DELETE FROM messages WHERE session_id LIKE 'bulk-%'; DELETE FROM sessions WHERE id LIKE 'bulk-%'");
+    db.close();
+  }
   // A running task is reported as running, with the tool it is in.
   await c.prompt("P16", "hang");
   await c.waitFor((f) => f.type === "chunk" && f.assistantMessageId === "a-P16", "P16 running");

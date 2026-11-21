@@ -2918,7 +2918,7 @@ function handleSocket(ws) {
             try { updateSessionEngine(sid, email, targetEngine, targetModel); } catch {}
             const qUser = msg.userMessageId || cryptoRandom();
             try { insertUserMessage(sid, qUser, msg.content); } catch { /* dup id ignored */ }
-            const qAsst = newAssistantId(sid, msg.assistantMessageId, qUser, targetModel);
+            const qAsst = newAssistantId(sid, msg.assistantMessageId, qUser, targetModel, targetEngine);
             rt.promptQueue.push({ content: msg.content, userMessageId: qUser, assistantId: qAsst, sess: sess2, engine: targetEngine, model: targetModel });
             recordTurnAccepted(rt, { state: "queued", assistantId: qAsst, userMessageId: qUser, engine: targetEngine, model: targetModel, queuePosition: rt.promptQueue.length });
             broadcast(rt, { type: "queued", userMessageId: qUser, assistantMessageId: qAsst, queuePosition: rt.promptQueue.length, turnStatus: "queued" });
@@ -2949,7 +2949,7 @@ function handleSocket(ws) {
           try { updateSessionEngine(sid, email, targetEngine, targetModel); } catch {}
           const qUserMsgId = msg.userMessageId || cryptoRandom();
           try { insertUserMessage(sid, qUserMsgId, msg.content); } catch { /* dup id ignored */ }
-          const qAssistantId = newAssistantId(sid, msg.assistantMessageId, qUserMsgId, targetModel);
+          const qAssistantId = newAssistantId(sid, msg.assistantMessageId, qUserMsgId, targetModel, targetEngine);
           rt.promptQueue.push({
             content: msg.content,
             userMessageId: qUserMsgId,
@@ -2991,7 +2991,7 @@ function handleSocket(ws) {
       const userMsgId = msg.userMessageId || cryptoRandom();
       try { insertUserMessage(sid, userMsgId, msg.content); } catch { /* dup id ignored */ }
 
-      const assistantId = newAssistantId(sid, msg.assistantMessageId, userMsgId, targetModel);
+      const assistantId = newAssistantId(sid, msg.assistantMessageId, userMsgId, targetModel, targetEngine);
 
       broadcast(rt, { type: "started", userMessageId: userMsgId, assistantMessageId: assistantId, engine: targetEngine, turnStatus: "running" });
 
@@ -3147,15 +3147,15 @@ function retryOutcome(rt, sid, userMessageId) {
   return { kind: "unknown" };
 }
 
-function newAssistantId(sid, wanted, replyTo = null, model = null) {
+function newAssistantId(sid, wanted, replyTo = null, model = null, engine = null) {
   const id = wanted || cryptoRandom();
   try {
-    insertAssistantPlaceholder(sid, id, replyTo, model);
+    insertAssistantPlaceholder(sid, id, replyTo, model, "queued", engine);
     return id;
   } catch {
     const gen = cryptoRandom();
     try {
-      insertAssistantPlaceholder(sid, gen, replyTo, model);
+      insertAssistantPlaceholder(sid, gen, replyTo, model, "queued", engine);
       log("info", "assistant_id_regenerated", { sid });
     } catch (e2) {
       // Not a collision — the DB is unhappy (locked, full). Say so instead of
