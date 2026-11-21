@@ -20,8 +20,9 @@ import {
   latestSessionEmail,
   userMessageExists, assistantAfter, setMessageStatus, listSessionAudit, getAuditStep,
   searchHistory, closeStaleTurns, auditForAssistant, closeRunningAuditFor,
+  listTasks, listLatestTasks,
 } from "./db.mjs";
-import { createJournal, journalDirFromEnv } from "./journal.mjs";
+import { createJournal, journalDirFromEnv, blockedOf } from "./journal.mjs";
 import { normaliseOrphanGrace, orphanDecision, ORPHAN_GRACE_MAX_MS } from "./orphan-guard.mjs";
 import {
   addE2eDevice, getE2eDevice, getE2eDeviceById, listE2eDevices, revokeE2eDevice, touchE2eDevice,
@@ -422,6 +423,29 @@ const journal = createJournal({
   checkpointDir: join(process.env.DB_DIR || join(homedir(), "Library/conduit-bridge"), "checkpoints"),
   log,
 });
+
+// The overview file (all chats in one place) is rebuilt from the database a
+// moment after anything changed, so a burst of turn events writes it once.
+let overviewTimer = null;
+function writeOverviewNow() {
+  try {
+    journal.writeOverview(listLatestTasks().map((r) => ({
+      sid: r.session_id, taskId: r.id, state: r.turn_status, ts: r.ts, engine: r.engine, model: r.model,
+    })));
+  } catch (e) { log("warn", "overview_failed", { err: String(e?.message || e).slice(0, 120) }); }
+}
+function scheduleOverview(delayMs = 1500) {
+  if (!journal.enabled || overviewTimer) return;
+  overviewTimer = setTimeout(() => { overviewTimer = null; writeOverviewNow(); }, delayMs);
+  overviewTimer.unref?.();
+}
+/** A pending rewrite happens now (shutdown: the timer would be lost). */
+function flushOverview() {
+  if (!overviewTimer) return;
+  clearTimeout(overviewTimer);
+  overviewTimer = null;
+  writeOverviewNow();
+}
 
 // Local speech (speech-service.mjs). Holds nothing until a model is used.
 const speech = createSpeechService({ log });
@@ -1211,6 +1235,51 @@ async function handleApi(req, res, u, auth) {
     });
   }
 
+  // Task overview across all chats: what runs, what waits, what needs a look,
+  // what finished. One row per answer, newest first, plus each chat's last
+  // saved work state (written by the agent, filtered, marked as unverified).
+  if (path === "/api/tasks" && req.method === "GET") {
+    const sinceTs = Number(u.searchParams.get("since")) || 0;
+    const limit = Math.min(500, Math.max(1, Number(u.searchParams.get("limit")) || 150));
+    const isBlocked = journal.enabled ? (sid) => { try { return !!blockedOf(journal.lastCheckpoint(sid)); } catch { return false; } } : null;
+    const { tasks, limited } = listTasks(email, { sinceTs, limit, isBlocked });
+    const live = new Map();
+    for (const t of tasks) {
+      if (live.has(t.sessionId)) continue;
+      const rt = runtime.get(t.sessionId);
+      if (!rt) continue;
+      const inf = rt.inflight && !rt.inflight.done ? rt.inflight : null;
+      live.set(t.sessionId, {
+        runningTask: inf ? inf.assistantId : null,
+        // Tool names only; what a tool was given stays in the chat view.
+        activeTools: inf?.activeTools ? [...inf.activeTools.values()].map((x) => String(x.name || "tool").slice(0, 64)) : [],
+        lastOutputAt: inf ? (inf.lastOutputAt || inf.startedAt || null) : null,
+        queued: (rt.promptQueue || []).map((q) => q.assistantId).filter(Boolean),
+      });
+    }
+    const checkpoints = {};
+    if (journal.enabled) {
+      for (const sid of new Set(tasks.map((t) => t.sessionId))) {
+        let cp = null;
+        try { cp = journal.lastCheckpoint(sid); } catch { cp = null; }
+        if (!cp?.cp) continue;
+        checkpoints[sid] = {
+          at: cp.ts, taskId: cp.assistantId || null,
+          summary: cp.cp.summary || null, next: cp.cp.next || null, blocked: blockedOf(cp),
+          done: cp.cp.done || [], verified: (cp.cp.verified || []).length, artifacts: cp.cp.artifacts || [],
+        };
+      }
+    }
+    for (const t of tasks) {
+      const l = live.get(t.sessionId);
+      if (!l) continue;
+      if (l.runningTask === t.id) { t.status = "running"; t.activeTools = l.activeTools; t.lastOutputAt = l.lastOutputAt; }
+      const qi = l.queued.indexOf(t.id);
+      if (qi >= 0) { t.status = "queued"; t.queuePosition = qi + 1; }
+    }
+    return json(res, 200, { ok: true, tasks, limited, checkpoints, journal: { enabled: journal.enabled, ok: journal.status().ok } });
+  }
+
   if (path === "/api/audit" && req.method === "GET") {
     const sinceTs = Number(u.searchParams.get("since")) || 0;
     // Clamp: `?limit=99999999` would otherwise pull the whole audit table into
@@ -1309,6 +1378,7 @@ async function handleApi(req, res, u, auth) {
         // The agent's raw checkpoint file goes with the chat; the filtered
         // journal stays (it is the record that the chat existed and ended).
         journal.forgetCheckpoints(sid);
+        scheduleOverview();
       }
       const rt = runtime.get(sid);
       if (rt?.inflight && !rt.inflight.done) {
@@ -1708,7 +1778,8 @@ function emitActivityEnd(rt, inflight, block) {
   // A finished tool step is where an agent saves a checkpoint (it writes the
   // file with a tool). Picked up right away, so a crash a minute later still
   // leaves it in the journal.
-  if (journal.enabled) { try { journal.ingestCheckpoint(rt.sid, { assistantId: inflight.assistantId }); } catch {} }
+  // A new checkpoint changes the overview's "next step" for this chat.
+  if (journal.enabled) { try { if (journal.ingestCheckpoint(rt.sid, { assistantId: inflight.assistantId })) scheduleOverview(); } catch {} }
 }
 
 // Delta/snapshot guard: Claude CLI can emit either real deltas or cumulative
@@ -1820,6 +1891,7 @@ function recordTurnAccepted(rt, t) {
     try { setMessageStatus(rt.sid, t.assistantId, "running"); } catch {}
   }
   if (journal.enabled) journal.turnAccepted(rt.sid, { ...t, ts: Date.now() });
+  scheduleOverview();
 }
 
 /**
@@ -1836,6 +1908,7 @@ function recordTurnEnd(rt, inflight, state, { error = null, kind = null } = {}) 
   // delivered every tool result already.
   if (state !== "ok") closeRunningAuditFor(rt.sid, inflight.assistantId);
   if (!journal.enabled) return;
+  scheduleOverview();
   // A checkpoint saved in the last step, before the end is journaled.
   try { journal.ingestCheckpoint(rt.sid, { assistantId: inflight.assistantId }); } catch {}
   journal.turnFinished(rt.sid, {
@@ -2846,7 +2919,7 @@ function handleSocket(ws) {
             try { updateSessionEngine(sid, email, targetEngine, targetModel); } catch {}
             const qUser = msg.userMessageId || cryptoRandom();
             try { insertUserMessage(sid, qUser, msg.content); } catch { /* dup id ignored */ }
-            const qAsst = newAssistantId(sid, msg.assistantMessageId, qUser, targetModel);
+            const qAsst = newAssistantId(sid, msg.assistantMessageId, qUser, targetModel, targetEngine);
             rt.promptQueue.push({ content: msg.content, userMessageId: qUser, assistantId: qAsst, sess: sess2, engine: targetEngine, model: targetModel });
             recordTurnAccepted(rt, { state: "queued", assistantId: qAsst, userMessageId: qUser, engine: targetEngine, model: targetModel, queuePosition: rt.promptQueue.length });
             broadcast(rt, { type: "queued", userMessageId: qUser, assistantMessageId: qAsst, queuePosition: rt.promptQueue.length, turnStatus: "queued" });
@@ -2877,7 +2950,7 @@ function handleSocket(ws) {
           try { updateSessionEngine(sid, email, targetEngine, targetModel); } catch {}
           const qUserMsgId = msg.userMessageId || cryptoRandom();
           try { insertUserMessage(sid, qUserMsgId, msg.content); } catch { /* dup id ignored */ }
-          const qAssistantId = newAssistantId(sid, msg.assistantMessageId, qUserMsgId, targetModel);
+          const qAssistantId = newAssistantId(sid, msg.assistantMessageId, qUserMsgId, targetModel, targetEngine);
           rt.promptQueue.push({
             content: msg.content,
             userMessageId: qUserMsgId,
@@ -2919,7 +2992,7 @@ function handleSocket(ws) {
       const userMsgId = msg.userMessageId || cryptoRandom();
       try { insertUserMessage(sid, userMsgId, msg.content); } catch { /* dup id ignored */ }
 
-      const assistantId = newAssistantId(sid, msg.assistantMessageId, userMsgId, targetModel);
+      const assistantId = newAssistantId(sid, msg.assistantMessageId, userMsgId, targetModel, targetEngine);
 
       broadcast(rt, { type: "started", userMessageId: userMsgId, assistantMessageId: assistantId, engine: targetEngine, turnStatus: "running" });
 
@@ -3075,15 +3148,15 @@ function retryOutcome(rt, sid, userMessageId) {
   return { kind: "unknown" };
 }
 
-function newAssistantId(sid, wanted, replyTo = null, model = null) {
+function newAssistantId(sid, wanted, replyTo = null, model = null, engine = null) {
   const id = wanted || cryptoRandom();
   try {
-    insertAssistantPlaceholder(sid, id, replyTo, model);
+    insertAssistantPlaceholder(sid, id, replyTo, model, "queued", engine);
     return id;
   } catch {
     const gen = cryptoRandom();
     try {
-      insertAssistantPlaceholder(sid, gen, replyTo, model);
+      insertAssistantPlaceholder(sid, gen, replyTo, model, "queued", engine);
       log("info", "assistant_id_regenerated", { sid });
     } catch (e2) {
       // Not a collision — the DB is unhappy (locked, full). Say so instead of
@@ -3187,6 +3260,7 @@ function closeRuntimeTurns(kind) {
 
 function shutdown(sig) {
   try { closeRuntimeTurns("bridge_shutdown"); } catch {}
+  try { flushOverview(); } catch {}
   try { alexaSpeaker?.close(); } catch {}
   try { speech.close(); } catch {}
   try { warmPool?.killAll(); } catch {}
@@ -3242,6 +3316,8 @@ function closeTurnsLeftByPreviousProcess() {
 server.listen(PORT, HOST, () => {
   log("info", "bridge_listening", { host: HOST, port: PORT, version: BRIDGE_VERSION, claude: CLAUDE_BIN, cwd: CWD, warm: USE_WARM, db: process.env.DB_DIR || "~/Library/conduit-bridge" });
   try { closeTurnsLeftByPreviousProcess(); } catch (e) { log("error", "turn_sweep_failed", { err: String(e?.message || e).slice(0, 120) }); }
+  // The overview reflects the state after the sweep.
+  scheduleOverview(5_000);
   // A row left 'running' at boot was orphaned by the previous process dying
   // mid-tool (crash/kill/self-update). Close them so the audit trail has no
   // permanently ambiguous entries.

@@ -32,6 +32,13 @@ const SID = "abcdabcd-1111-4222-8333-444455556666";
 const SECRET = "sk-ant-api03-SYNTHETICSECRET0123456789";
 const PRIVATE_PATH = "/Users/test-user/private/project";
 const EMAIL = "owner@example.com";
+const FOREIGN_SID = "abcdabcd-7777-4222-8333-444455556666";
+// A chat of the owner whose only task was cut off long ago.
+const OLD_SID = "abcdabcd-5555-4222-8333-444455556666";
+// Old chats whose last answer ended "ok", one with a saved work state that says
+// it is blocked (open again), one whose work state says nothing blocks it.
+const BLOCKED_SID = "abcdabcd-8888-4222-8333-444455556666";
+const CLEAR_SID = "abcdabcd-9999-4222-8333-444455556666";
 
 let dir, fakeLog, journalDir, bridge = null, bridgeKey, device, pairPort, port;
 const freePort = () => new Promise((res) => { const s = net.createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => res(p)); }); });
@@ -207,6 +214,10 @@ function run(raw) {
     setInterval(() => {}, 1000);
     return "hang";
   } else if (sc === "checkpoint") {
+    // Saved well after the bridge started and the turn began, so neither the
+    // startup write of the overview (5 s) nor the one after acceptance can
+    // have picked it up: only the refresh on a new checkpoint can.
+    setTimeout(() => {
     toolUse("t-cp-" + tag, { command: "save checkpoint" });
     writeFileSync(process.env.CONDUIT_CHECKPOINT_FILE, JSON.stringify({
       summary: "Migration step 2 of 3 applied in staging",
@@ -219,6 +230,7 @@ function run(raw) {
     }));
     toolResult("t-cp-" + tag, "saved");
     text("partial");
+    }, 6500);
     setInterval(() => {}, 1000);
     return "hang";
   } else if (sc === "tools-then-die") {
@@ -522,6 +534,11 @@ test("agent checkpoints are filtered into the journal and handed back to the age
   let c = await client();
   await c.prompt("P13", "checkpoint");
   await c.waitFor((f) => f.type === "chunk" && f.assistantMessageId === "a-P13", "P13 text after checkpoint");
+  // The overview file picks up the new next step while the task still runs.
+  const ovFile = join(journalDir, "00-Conduit-Uebersicht.md");
+  let ovNow = "";
+  for (let i = 0; i < 80 && !/Run step 3/.test(ovNow); i++) { await sleep(100); try { ovNow = readFileSync(ovFile, "utf8"); } catch { /* not yet */ } }
+  assert.match(ovNow, /## Läuft gerade \(1\)[\s\S]*Nächster Schritt: Run step 3[\s\S]*## Braucht Aufmerksamkeit/, "overview missed the checkpoint saved mid-run");
   const [run] = runsOf("P13");
   // The agent was told, in its context, where the journal and the checkpoint are.
   assert.ok(run.sys, "no --append-system-prompt");
@@ -555,6 +572,114 @@ test("agent checkpoints are filtered into the journal and handed back to the age
   for (const leak of [SECRET, "SYNTHETICSECRET", "hunter2", "owner@example.com", "DE89 3704", "TOKEN="]) {
     assert.ok(!next.sys.includes(leak), `agent context leaks ${leak}`);
   }
+  await c.close();
+  await stopBridge("SIGTERM");
+  killFakes();
+});
+
+test("the task overview lists every task across chats with its end and the last work state", { skip: !POSIX }, async () => {
+  // A chat of another account on the same bridge: never in this account's list.
+  {
+    const db = new DatabaseSync(join(dir, "db", "db.sqlite"));
+    const t = Date.now();
+    db.prepare("INSERT INTO sessions (id, user_email, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)").run(FOREIGN_SID, "someone@example.org", "FOREIGN-TITLE", t, t);
+    db.prepare("INSERT INTO messages (id, session_id, role, content, ts) VALUES (?, ?, 'user', ?, ?)").run("u-F1", FOREIGN_SID, "FOREIGN-REQUEST", t);
+    db.prepare("INSERT INTO messages (id, session_id, role, content, ts, reply_to, turn_status) VALUES (?, ?, 'assistant', ?, ?, ?, 'ok')").run("a-F1", FOREIGN_SID, "FOREIGN-ANSWER", t + 1, "u-F1");
+    db.prepare("INSERT INTO sessions (id, user_email, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)").run(OLD_SID, EMAIL, "Old chat", 1000, 1000);
+    db.prepare("INSERT INTO messages (id, session_id, role, content, ts) VALUES (?, ?, 'user', ?, ?)").run("u-OLD", OLD_SID, "old request", 1000);
+    db.prepare("INSERT INTO messages (id, session_id, role, content, ts, reply_to, turn_status, turn_error) VALUES (?, ?, 'assistant', '', ?, ?, 'interrupted', 'cut off')").run("a-OLD", OLD_SID, 1001, "u-OLD");
+    // A step it ran long ago: kept with the task whatever the history cut.
+    db.prepare("INSERT INTO audit_log (id, session_id, assistant_id, ts, tool, summary, status) VALUES (?, ?, ?, ?, 'Bash', 'x', 'interrupted')").run("st-OLD", OLD_SID, "a-OLD", 1002);
+    for (const [sid, blocked] of [[BLOCKED_SID, "Waiting for the database password"], [CLEAR_SID, "none"]]) {
+      const tag = sid.slice(9, 13);
+      db.prepare("INSERT INTO sessions (id, user_email, title, created_at, updated_at) VALUES (?, ?, 'Old ok chat', 900, 900)").run(sid, EMAIL);
+      db.prepare("INSERT INTO messages (id, session_id, role, content, ts, turn_status) VALUES (?, ?, 'assistant', 'done', 901, 'ok')").run(`a-${tag}`, sid);
+      mkdirSync(join(dir, "db", "checkpoints"), { recursive: true, mode: 0o700 });
+      writeFileSync(join(dir, "db", "checkpoints", `${sid}.saved.json`), JSON.stringify({ ts: 902, assistantId: `a-${tag}`, cp: { summary: "Deploy prepared", next: "Deploy", blocked, done: [], verified: [], artifacts: [] } }), { mode: 0o600 });
+    }
+    // The chat now runs on another engine: earlier answers keep the one they ran on.
+    db.prepare("UPDATE sessions SET engine = 'codex' WHERE id = ?").run(SID);
+    db.close();
+  }
+  bridge = await startBridge({ warm: false });
+  const c = await client();
+  const r = await c.call("GET", "/api/tasks");
+  assert.equal(r.head.status, 200);
+  assert.equal(r.body.ok, true);
+  const tasks = r.body.tasks;
+  const byId = Object.fromEntries(tasks.map((t) => [t.id, t]));
+  assert.equal(byId["a-P1"].status, "ok");
+  assert.equal(byId["a-P2"].status, "interrupted");
+  assert.ok(byId["a-P2"].steps.total >= 1 && byId["a-P2"].steps.interrupted >= 1, JSON.stringify(byId["a-P2"].steps));
+  assert.equal(byId["a-P3"].status, "not_started");
+  assert.equal(byId["a-P13"].status, "interrupted");
+  assert.ok(byId["a-P13"].error, "a failed task carries the bridge's text");
+  assert.equal(byId["a-P1"].error, null);
+  assert.equal(byId["a-P14"].status, "ok");
+  // The start of the request, one line, for the list row.
+  assert.ok(byId["a-P1"].request.startsWith("TAG:P1 SCENARIO:"), byId["a-P1"].request);
+  assert.ok(!byId["a-P1"].request.includes("\n"));
+  assert.equal(byId["a-P1"].sessionId, SID);
+  assert.equal(typeof byId["a-P1"].sessionTitle, "string");
+  for (let i = 1; i < tasks.length; i++) assert.ok(tasks[i - 1].startedAt >= tasks[i].startedAt, "not newest first");
+  // Only this account.
+  assert.ok(!tasks.some((t) => t.sessionId === FOREIGN_SID), "another account's task listed");
+  assert.ok(!JSON.stringify(r.body).includes("FOREIGN"), "another account's data leaked");
+  // The chat's last saved work state, as the agent wrote it (filtered).
+  const cp = r.body.checkpoints[SID];
+  assert.equal(cp.taskId, "a-P13");
+  assert.equal(cp.next, "Run step 3 (backfill) after checking row counts");
+  for (const leak of [SECRET, "SYNTHETICSECRET", "hunter2", EMAIL]) assert.ok(!JSON.stringify(cp).includes(leak), `checkpoint leaks ${leak}`);
+  assert.equal(byId["a-OLD"].status, "interrupted");
+  assert.equal(byId["a-P1"].engine, "claude", "engine of the task, not the chat's current choice");
+  assert.equal(byId["a-OLD"].engine, null, "an engine never recorded is not guessed");
+  // Back to the engine the fake agent stands in for, before the next prompt.
+  {
+    const db = new DatabaseSync(join(dir, "db", "db.sqlite"));
+    db.prepare("UPDATE sessions SET engine = 'claude' WHERE id = ?").run(SID);
+    db.close();
+  }
+  // Limits cut the history, never an open task: the old interrupted one is
+  // still there behind the two newest, and the answer says it was cut.
+  const two = await c.call("GET", "/api/tasks?limit=2");
+  // The old chat whose work state is blocked is open too; the clear one is history.
+  assert.deepEqual(two.body.tasks.map((t) => t.id).slice(-2), ["a-OLD", "a-8888"]);
+  assert.equal(two.body.tasks.length, 4);
+  assert.equal(two.body.checkpoints[BLOCKED_SID].blocked, "Waiting for the database password");
+  assert.equal(two.body.limited, true);
+  assert.equal(r.body.limited, false);
+  const huge = await c.call("GET", "/api/tasks?limit=999999");
+  assert.ok(huge.body.tasks.length <= 500);
+  // A history cut by time keeps an old open task with all its steps.
+  const later = await c.call("GET", `/api/tasks?since=${Date.now() + 86_400_000}`);
+  assert.deepEqual(later.body.tasks.map((t) => t.id), ["a-OLD", "a-8888"]);
+  assert.equal(later.body.tasks[0].steps.total, 1);
+  assert.equal(later.body.tasks[0].steps.interrupted, 1);
+  // More open tasks than any history limit: none is dropped.
+  {
+    const db = new DatabaseSync(join(dir, "db", "db.sqlite"));
+    db.exec("BEGIN");
+    for (let i = 0; i < 520; i++) {
+      const sid = `bulk-${String(i).padStart(4, "0")}`;
+      db.prepare("INSERT INTO sessions (id, user_email, title, created_at, updated_at) VALUES (?, ?, 'Bulk', 2000, 2000)").run(sid, EMAIL);
+      db.prepare("INSERT INTO messages (id, session_id, role, content, ts, turn_status) VALUES (?, ?, 'assistant', '', ?, 'interrupted')").run(`a-${sid}`, sid, 2000 + i);
+    }
+    db.exec("COMMIT");
+    const many = await c.call("GET", "/api/tasks?limit=1");
+    assert.equal(many.body.tasks.filter((t) => t.id.startsWith("a-bulk-")).length, 520);
+    assert.ok(many.body.tasks.some((t) => t.id === "a-OLD"));
+    db.exec("DELETE FROM messages WHERE session_id LIKE 'bulk-%'; DELETE FROM sessions WHERE id LIKE 'bulk-%'");
+    db.close();
+  }
+  // A running task is reported as running, with the tool it is in.
+  await c.prompt("P16", "hang");
+  await c.waitFor((f) => f.type === "chunk" && f.assistantMessageId === "a-P16", "P16 running");
+  const live = await c.call("GET", "/api/tasks?limit=5");
+  const p16 = live.body.tasks.find((t) => t.id === "a-P16");
+  assert.equal(p16.status, "running");
+  assert.ok(Array.isArray(p16.activeTools));
+  await c.send({ type: "stop" });
+  await c.waitFor(isTerminal("a-P16"), "P16 stopped");
   await c.close();
   await stopBridge("SIGTERM");
   killFakes();
@@ -598,9 +723,25 @@ test("the journal is owner-only, separate, complete and leaks nothing", { skip: 
   assert.equal(mode(journalDir), 0o700);
   assert.equal(mode(join(dir, "PC-Transfer")), 0o755, "shared parent folder was changed");
   assert.equal(readFileSync(join(dir, "PC-Transfer", "Conduit-Arbeitsstand.md"), "utf8"), "owned by someone else\n");
-  const files = readdirSync(journalDir);
-  assert.deepEqual(files, [`Conduit-Journal-${SID}.md`]);
-  assert.equal(mode(join(journalDir, files[0])), 0o600);
+  const files = readdirSync(journalDir).sort();
+  assert.deepEqual(files, ["00-Conduit-Uebersicht.md", `Conduit-Journal-${SID}.md`]);
+  for (const f of files) assert.equal(mode(join(journalDir, f)), 0o600, f);
+
+  // The overview: every chat once, grouped, with the journal to open and the
+  // last work state, and nothing else.
+  const ov = readFileSync(join(journalDir, "00-Conduit-Uebersicht.md"), "utf8");
+  assert.match(ov, /^# Conduit · Übersicht aller Aufgaben/);
+  assert.match(ov, /## Läuft gerade \(0\)/);
+  assert.match(ov, /## Braucht Aufmerksamkeit \(\d+\)[\s\S]*Sitzung `abcdabcd-1111-4222-8333-444455556666`/);
+  assert.ok(ov.includes(`Journal: \`Conduit-Journal-${SID}.md\``));
+  assert.match(ov, /> Nächster Schritt: Run step 3 \(backfill\) after checking row counts/);
+  assert.equal((ov.match(new RegExp(`Sitzung \`${SID}\``, "g")) || []).length, 1, "a chat listed twice");
+  assert.match(ov, new RegExp(`## Braucht Aufmerksamkeit[\\s\\S]*Sitzung \`${OLD_SID}\`[\\s\\S]*## Abgeschlossen`), "old open chat missing from the attention group");
+  assert.match(ov, new RegExp(`## Braucht Aufmerksamkeit[\\s\\S]*Sitzung \`${BLOCKED_SID}\`[\\s\\S]*Blockiert: Waiting for the database password[\\s\\S]*## Abgeschlossen`), "blocked chat missing from the attention group");
+  assert.match(ov, new RegExp(`## Abgeschlossen[\\s\\S]*Sitzung \`${CLEAR_SID}\``), "a chat nothing blocks is finished");
+  for (const leak of [SECRET, "SYNTHETICSECRET", PRIVATE_PATH, dir, EMAIL, "SCENARIO", "TAG:", "FOREIGN-TITLE", "FOREIGN-REQUEST", "FOREIGN-ANSWER", "hunter2", "/Users/test-user", "old text"]) {
+    assert.ok(!ov.includes(leak), `overview leaks ${JSON.stringify(leak)}`);
+  }
 
   const md = readJournal();
   // Content it must have.

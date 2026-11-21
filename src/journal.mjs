@@ -47,6 +47,8 @@ import { ensurePrivateDir, tightenFile, PRIVATE_FILE_MODE } from "./private-fs.m
 
 export const JOURNAL_PREFIX = "Conduit-Journal-";
 export const DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024;
+// One file for all chats, sorted first in a folder listing.
+export const OVERVIEW_FILE = "00-Conduit-Uebersicht.md";
 const MAX_CHECKPOINT_BYTES = 64 * 1024;
 // Open errors kept per operation and target; beyond this the oldest go.
 const MAX_OPEN_ERRORS = 100;
@@ -646,6 +648,93 @@ export function createJournal({ dir, checkpointDir = null, log = () => {}, now =
     if (ok) succeeded("checkpoint_delete", sid);
   }
 
+  /**
+   * One overview file for all chats: what is running, what needs a look, what
+   * finished, each with the journal file to open and the agent's last saved
+   * work state. Rewritten as a whole (temporary file, then rename), so a
+   * reader never sees half of it. Same rules as the journal: metadata and
+   * filtered agent checkpoints only, no titles, prompts or answers.
+   *
+   * `tasks`: the latest task of each chat, newest first:
+   *   { sid, taskId, state, ts, engine, model }
+   */
+  function writeOverview(tasks) {
+    // Every chat's latest task comes in; only what is really finished is cut
+    // (DONE_SHOWN below), after a blocked work state has been seen.
+    if (!enabled) return false;
+    if (!ensureDir()) return false;
+    const groups = { running: [], attention: [], done: [] };
+    for (const t of tasks || []) {
+      const state = t.state == null ? "unknown" : pick(STATES, t.state);
+      const cp = cpEnabled ? lastCheckpoint(t.sid) : null;
+      const blocked = blockedOf(cp);
+      const row = { ...t, state, cp, blocked };
+      if (state === "running" || state === "queued") groups.running.push(row);
+      else if (state === "ok" && !blocked) groups.done.push(row);
+      else groups.attention.push(row);
+    }
+    const DONE_SHOWN = 50;
+    const fmt = (r) => {
+      const lines = [
+        `- ${iso(r.ts)} · ${STATE_LABEL[r.state]} · Sitzung \`${safeId(r.sid)}\` · Aufgabe \`${safeId(r.taskId)}\``
+          + (r.engine ? ` · ${safeName(r.engine)}` : "") + (r.model ? `/${safeName(r.model)}` : ""),
+        `  - Journal: \`${JOURNAL_PREFIX}${safeId(r.sid)}.md\``,
+      ];
+      if (r.cp?.cp) {
+        const c = r.cp.cp;
+        lines.push(`  - Arbeitsstand (${iso(r.cp.ts)}, vom Agenten gemeldet, nicht geprüft):`);
+        if (c.summary) lines.push(`    > Stand: ${c.summary}`);
+        lines.push(`    > Nächster Schritt: ${c.next || "nicht angegeben"}`);
+        if (r.blocked) lines.push(`    > Blockiert: ${r.blocked}`);
+      } else if (r.state !== "ok") {
+        lines.push("  - Arbeitsstand: keiner gespeichert");
+      }
+      return lines.join("\n");
+    };
+    const section = (title, rows, empty) => [
+      `## ${title} (${rows.length})`, "",
+      ...(rows.length ? rows.map(fmt) : [empty]), "",
+    ];
+    const text = [
+      "# Conduit · Übersicht aller Aufgaben",
+      "",
+      "Automatisch von der Conduit-Bridge geschrieben und bei jeder Änderung komplett ersetzt (nicht von Hand pflegen).",
+      "Je Chat steht hier die letzte Aufgabe. Einzelheiten stehen im genannten Journal; Titel, Prompts und Antworten stehen bewusst nicht hier, sie sind in der Conduit-App.",
+      "Zitierte Arbeitsstände schreibt der Agent selbst; die Bridge filtert sie, prüft ihren Inhalt aber nicht.",
+      "",
+      `Stand: ${iso(now())} · ${groups.running.length} laufen · ${groups.attention.length} brauchen Aufmerksamkeit · ${groups.done.length} abgeschlossen`,
+      "",
+      ...section("Läuft gerade", groups.running, "Nichts läuft."),
+      ...section("Braucht Aufmerksamkeit", groups.attention, "Nichts offen."),
+      ...section(`Abgeschlossen${groups.done.length > DONE_SHOWN ? `, neueste ${DONE_SHOWN}` : ""}`, groups.done.slice(0, DONE_SHOWN), "Noch nichts abgeschlossen."),
+    ].join("\n");
+    const target = join(dir, OVERVIEW_FILE);
+    const tmp = join(dir, `.${OVERVIEW_FILE}.${process.pid}.${createHash("sha256").update(String(Math.random())).digest("hex").slice(0, 8)}.tmp`);
+    let fd = null;
+    try {
+      fd = openSync(tmp, "wx", PRIVATE_FILE_MODE);
+      const bytes = Buffer.from(text, "utf8");
+      for (let off = 0; off < bytes.length;) {
+        const n = writeSync(fd, bytes, off, bytes.length - off);
+        if (!(n > 0)) throw Object.assign(new Error("short write"), { code: "ESHORTWRITE" });
+        off += n;
+      }
+      fsyncSync(fd);
+      closeSync(fd);
+      fd = null;
+      tightenFile(tmp);
+      renameSync(tmp, target);
+      st.overviewAt = now();
+      succeeded("overview");
+      return true;
+    } catch (e) {
+      if (fd != null) { try { closeSync(fd); } catch { /* already failing */ } }
+      try { rmSync(tmp, { force: true }); } catch { /* best effort */ }
+      fail("overview", e);
+      return false;
+    }
+  }
+
   /** Current health, for /api/status. Never contains paths. */
   function status() {
     const open = [...errors.values()];
@@ -664,14 +753,22 @@ export function createJournal({ dir, checkpointDir = null, log = () => {}, now =
       failures: st.failures,
       rotations: st.rotations,
       savedCheckpoints: st.checkpoints,
+      overviewAt: st.overviewAt || null,
     };
   }
 
   return {
     enabled, dir: enabled ? dir : null, fileFor, checkpointFileFor,
     turnAccepted, turnFinished, sessionEvent, ingestCheckpoint, lastCheckpoint, forgetCheckpoints,
-    agentContext, agentEnv, status,
+    agentContext, agentEnv, writeOverview, status,
   };
+}
+
+/** What a saved work state says blocks the work, or null. "none", "nein",
+ *  "-" and the like are the agent saying nothing blocks it. */
+export function blockedOf(entry) {
+  const b = entry?.cp?.blocked;
+  return b && !/^(nein|no|none|keine?|-)$/i.test(String(b).trim()) ? b : null;
 }
 
 /**

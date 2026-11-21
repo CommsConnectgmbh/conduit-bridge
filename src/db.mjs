@@ -135,6 +135,10 @@ for (const ddl of [
   // history load after a restart) can say what went wrong instead of a generic
   // "ended with an error". Bridge-generated text only, never tool output.
   "ALTER TABLE messages ADD COLUMN turn_error TEXT",
+  // The engine a task ran on, written when it is accepted. sessions.engine is
+  // the chat's current choice and changes with the next switch, so it cannot
+  // say what an earlier answer ran on. NULL: written before 3.3, not known.
+  "ALTER TABLE messages ADD COLUMN engine TEXT",
 ]) {
   try { db.exec(ddl); } catch { /* column already present */ }
 }
@@ -166,7 +170,7 @@ const Q = {
   `),
   deleteSession: db.prepare(`DELETE FROM sessions WHERE id = ? AND user_email = ?`),
   insertMessage: db.prepare(`INSERT INTO messages (id, session_id, role, content, ts) VALUES (?, ?, ?, ?, ?)`),
-  insertAssistant: db.prepare(`INSERT INTO messages (id, session_id, role, content, ts, reply_to, model, turn_status) VALUES (?, ?, 'assistant', '', ?, ?, ?, ?)`),
+  insertAssistant: db.prepare(`INSERT INTO messages (id, session_id, role, content, ts, reply_to, model, turn_status, engine) VALUES (?, ?, 'assistant', '', ?, ?, ?, ?, ?)`),
   // A clean 'ok' may only replace a non-terminal state. Late writers exist (a
   // superseded turn's process exiting after the fact, the close handler running
   // after a stream error was already recorded), and none of them may turn a
@@ -218,6 +222,65 @@ const Q = {
     FROM audit_log a JOIN sessions s ON s.id = a.session_id
     WHERE s.user_email = ? AND a.ts >= ?
     ORDER BY a.ts DESC LIMIT ?
+  `),
+  // Task overview across all chats of one account: every answer (a task) with
+  // its chat, the start of the request it answers and how it ended.
+  listTasks: db.prepare(`
+    SELECT m.id, m.session_id, s.title AS session_title, m.engine, m.reply_to, m.ts, m.model,
+           m.turn_status, m.turn_error, length(m.content) AS chars,
+           substr(u.content, 1, 400) AS request
+    FROM messages m
+    JOIN sessions s ON s.id = m.session_id
+    LEFT JOIN messages u ON u.id = m.reply_to AND u.session_id = m.session_id
+    WHERE s.user_email = ?1 AND m.role = 'assistant' AND m.ts >= ?2
+    ORDER BY m.ts DESC LIMIT ?3
+  `),
+  // Tasks that are still open, however old: running or queued, or the newest
+  // task of a chat that did not end with "ok". The newest-first list above is
+  // cut at a limit; these must never fall off it, so this one has none (at
+  // most one per chat plus what runs or waits right now).
+  listOpenTasks: db.prepare(`
+    SELECT m.id, m.session_id, s.title AS session_title, m.engine, m.reply_to, m.ts, m.model,
+           m.turn_status, m.turn_error, length(m.content) AS chars,
+           substr(u.content, 1, 400) AS request
+    FROM messages m
+    JOIN sessions s ON s.id = m.session_id
+    LEFT JOIN messages u ON u.id = m.reply_to AND u.session_id = m.session_id
+    WHERE s.user_email = ?1 AND m.role = 'assistant'
+      AND (m.turn_status IN ('queued', 'running')
+        OR ((m.turn_status IS NULL OR m.turn_status <> 'ok')
+          AND m.id = (SELECT m2.id FROM messages m2 WHERE m2.session_id = m.session_id AND m2.role = 'assistant' ORDER BY m2.ts DESC LIMIT 1)))
+    ORDER BY m.ts DESC
+  `),
+  // Tool steps of the listed tasks (a JSON array of their ids), by state, with
+  // the time of the latest one. By task, not by time: an old open task keeps
+  // all its steps whatever the history cut.
+  listTaskSteps: db.prepare(`
+    SELECT a.assistant_id, a.status, COUNT(*) AS n, MAX(a.ts) AS last_ts
+    FROM audit_log a JOIN sessions s ON s.id = a.session_id
+    WHERE s.user_email = ?1 AND a.assistant_id IN (SELECT value FROM json_each(?2))
+    GROUP BY a.assistant_id, a.status
+  `),
+  // The newest task of each chat of one account that ended "ok": open again
+  // when the chat's saved work state says it is blocked (see listTasks).
+  listLatestOkTasks: db.prepare(`
+    SELECT m.id, m.session_id, s.title AS session_title, m.engine, m.reply_to, m.ts, m.model,
+           m.turn_status, m.turn_error, length(m.content) AS chars,
+           substr(u.content, 1, 400) AS request
+    FROM messages m
+    JOIN sessions s ON s.id = m.session_id
+    LEFT JOIN messages u ON u.id = m.reply_to AND u.session_id = m.session_id
+    WHERE s.user_email = ?1 AND m.role = 'assistant' AND m.turn_status = 'ok'
+      AND m.id = (SELECT m2.id FROM messages m2 WHERE m2.session_id = m.session_id AND m2.role = 'assistant' ORDER BY m2.ts DESC LIMIT 1)
+  `),
+  // The latest task of every chat on this bridge (all accounts), for the
+  // overview file in the journal folder. Metadata only.
+  listLatestTasks: db.prepare(`
+    SELECT m.session_id, m.id, m.ts, m.model, m.turn_status, m.engine, s.updated_at
+    FROM messages m JOIN sessions s ON s.id = m.session_id
+    WHERE m.role = 'assistant'
+      AND m.id = (SELECT m2.id FROM messages m2 WHERE m2.session_id = m.session_id AND m2.role = 'assistant' ORDER BY m2.ts DESC LIMIT 1)
+    ORDER BY s.updated_at DESC
   `),
   addUsage: db.prepare(`
     UPDATE sessions SET
@@ -579,9 +642,9 @@ export function insertUserMessage(sid, msgId, content) {
 export const TURN_STATES = Object.freeze(["queued", "running", "ok", "error", "interrupted", "not_started"]);
 export const OPEN_TURN_STATES = Object.freeze(["queued", "running"]);
 
-export function insertAssistantPlaceholder(sid, msgId, replyTo = null, model = null, status = "queued") {
+export function insertAssistantPlaceholder(sid, msgId, replyTo = null, model = null, status = "queued", engine = null) {
   const now = Date.now();
-  Q.insertAssistant.run(msgId, sid, now, replyTo, model, status);
+  Q.insertAssistant.run(msgId, sid, now, replyTo, model, status, engine == null ? null : String(engine).slice(0, 40));
   try { Q.touchSession.run(now, sid); } catch {}
 }
 
@@ -708,6 +771,74 @@ export function listAudit(email, { sinceTs = 0, limit = 500 } = {}) {
 export function sweepStaleRunningAudit() {
   try { return Q.sweepRunningAudit.run().changes || 0; }
   catch { return 0; }
+}
+
+/** The start of a request as one short line, for a list row. */
+export function requestSnippet(text, maxLen = 160) {
+  const s = String(text || "").replace(/\s+/g, " ").trim();
+  if (!s) return "";
+  return s.length > maxLen ? s.slice(0, maxLen - 1).trimEnd() + "…" : s;
+}
+
+/**
+ * Tasks (answers) of one account across all chats, newest first, with the
+ * tool steps each one ran. A turn stored without a recorded end (older
+ * bridge) is "unknown", never counted as a success. `limit` cuts the history;
+ * open tasks (running, queued, or a chat's newest one that did not end "ok")
+ * are always included, whatever their age. `limited` says the history was cut.
+ */
+export function listTasks(email, { sinceTs = 0, limit = 100, isBlocked = null } = {}) {
+  const lim = Math.max(1, Math.min(500, Number(limit) || 100));
+  const since = Math.max(0, Number(sinceTs) || 0);
+  let rows = [];
+  let limited = false;
+  try {
+    const recent = Q.listTasks.all(email, since, lim);
+    limited = recent.length === lim;
+    const seen = new Set(recent.map((r) => r.id));
+    rows = recent;
+    for (const r of Q.listOpenTasks.all(email)) if (!seen.has(r.id)) { seen.add(r.id); rows.push(r); }
+    // A chat whose saved work state says it is blocked is open too, even
+    // when its last answer ended "ok".
+    if (isBlocked) for (const r of Q.listLatestOkTasks.all(email)) if (!seen.has(r.id) && isBlocked(r.session_id)) { seen.add(r.id); rows.push(r); }
+    rows.sort((a, b) => b.ts - a.ts);
+  } catch { return { tasks: [], limited: false }; }
+  const steps = new Map();
+  try {
+    for (const r of Q.listTaskSteps.all(email, JSON.stringify(rows.map((t) => t.id)))) {
+      const s = steps.get(r.assistant_id) || { total: 0, done: 0, failed: 0, running: 0, interrupted: 0, lastAt: null };
+      const k = ["done", "failed", "running", "interrupted"].includes(r.status) ? r.status : "interrupted";
+      s[k] += r.n;
+      s.total += r.n;
+      if (r.last_ts && (!s.lastAt || r.last_ts > s.lastAt)) s.lastAt = r.last_ts;
+      steps.set(r.assistant_id, s);
+    }
+  } catch { /* steps are an extra; the task list stands without them */ }
+  const tasks = rows.map((r) => ({
+    id: r.id,
+    sessionId: r.session_id,
+    sessionTitle: r.session_title || "Chat",
+    // null: a task from before 3.3, whose engine was never recorded.
+    engine: r.engine || null,
+    model: r.model || null,
+    userMessageId: r.reply_to || null,
+    request: requestSnippet(r.request),
+    startedAt: r.ts,
+    status: r.turn_status || "unknown",
+    error: r.turn_status && r.turn_status !== "ok" ? (r.turn_error || null) : null,
+    chars: r.chars || 0,
+    steps: steps.get(r.id) || { total: 0, done: 0, failed: 0, running: 0, interrupted: 0, lastAt: null },
+  }));
+  return { tasks, limited };
+}
+
+/**
+ * The latest task of every chat on this bridge, most recently active first,
+ * for the overview file. All of them: which are open is decided there, with
+ * the saved work state, and only finished ones are cut.
+ */
+export function listLatestTasks() {
+  try { return Q.listLatestTasks.all(); } catch { return []; }
 }
 
 export function addUsage(sid, usage) {
