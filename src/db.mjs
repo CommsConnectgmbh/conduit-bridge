@@ -231,6 +231,22 @@ const Q = {
     WHERE s.user_email = ?1 AND m.role = 'assistant' AND m.ts >= ?2
     ORDER BY m.ts DESC LIMIT ?3
   `),
+  // Tasks that are still open, however old: running or queued, or the newest
+  // task of a chat that did not end with "ok". The newest-first list above is
+  // cut at a limit; these must never fall off it.
+  listOpenTasks: db.prepare(`
+    SELECT m.id, m.session_id, s.title AS session_title, s.engine, m.reply_to, m.ts, m.model,
+           m.turn_status, m.turn_error, length(m.content) AS chars,
+           substr(u.content, 1, 400) AS request
+    FROM messages m
+    JOIN sessions s ON s.id = m.session_id
+    LEFT JOIN messages u ON u.id = m.reply_to AND u.session_id = m.session_id
+    WHERE s.user_email = ?1 AND m.role = 'assistant'
+      AND (m.turn_status IN ('queued', 'running')
+        OR ((m.turn_status IS NULL OR m.turn_status <> 'ok')
+          AND m.id = (SELECT m2.id FROM messages m2 WHERE m2.session_id = m.session_id AND m2.role = 'assistant' ORDER BY m2.ts DESC LIMIT 1)))
+    ORDER BY m.ts DESC LIMIT 500
+  `),
   // Tool steps per task, by state, with the time of the latest one.
   listTaskSteps: db.prepare(`
     SELECT a.assistant_id, a.status, COUNT(*) AS n, MAX(a.ts) AS last_ts
@@ -245,7 +261,7 @@ const Q = {
     FROM messages m JOIN sessions s ON s.id = m.session_id
     WHERE m.role = 'assistant'
       AND m.id = (SELECT m2.id FROM messages m2 WHERE m2.session_id = m.session_id AND m2.role = 'assistant' ORDER BY m2.ts DESC LIMIT 1)
-    ORDER BY s.updated_at DESC LIMIT ?
+    ORDER BY s.updated_at DESC
   `),
   addUsage: db.prepare(`
     UPDATE sessions SET
@@ -748,13 +764,23 @@ export function requestSnippet(text, maxLen = 160) {
 /**
  * Tasks (answers) of one account across all chats, newest first, with the
  * tool steps each one ran. A turn stored without a recorded end (older
- * bridge) is "unknown", never counted as a success.
+ * bridge) is "unknown", never counted as a success. `limit` cuts the history;
+ * open tasks (running, queued, or a chat's newest one that did not end "ok")
+ * are always included, whatever their age. `limited` says the history was cut.
  */
 export function listTasks(email, { sinceTs = 0, limit = 100 } = {}) {
   const lim = Math.max(1, Math.min(500, Number(limit) || 100));
   const since = Math.max(0, Number(sinceTs) || 0);
   let rows = [];
-  try { rows = Q.listTasks.all(email, since, lim); } catch { return []; }
+  let limited = false;
+  try {
+    const recent = Q.listTasks.all(email, since, lim);
+    limited = recent.length === lim;
+    const seen = new Set(recent.map((r) => r.id));
+    rows = recent;
+    for (const r of Q.listOpenTasks.all(email)) if (!seen.has(r.id)) { seen.add(r.id); rows.push(r); }
+    rows.sort((a, b) => b.ts - a.ts);
+  } catch { return { tasks: [], limited: false }; }
   const steps = new Map();
   try {
     for (const r of Q.listTaskSteps.all(email, since)) {
@@ -766,7 +792,7 @@ export function listTasks(email, { sinceTs = 0, limit = 100 } = {}) {
       steps.set(r.assistant_id, s);
     }
   } catch { /* steps are an extra; the task list stands without them */ }
-  return rows.map((r) => ({
+  const tasks = rows.map((r) => ({
     id: r.id,
     sessionId: r.session_id,
     sessionTitle: r.session_title || "Chat",
@@ -780,11 +806,20 @@ export function listTasks(email, { sinceTs = 0, limit = 100 } = {}) {
     chars: r.chars || 0,
     steps: steps.get(r.id) || { total: 0, done: 0, failed: 0, running: 0, interrupted: 0, lastAt: null },
   }));
+  return { tasks, limited };
 }
 
-/** The latest task of every chat on this bridge, for the overview file. */
-export function listLatestTasks(limit = 200) {
-  try { return Q.listLatestTasks.all(Math.max(1, Math.min(1000, Number(limit) || 200))); } catch { return []; }
+/**
+ * The latest task of every chat on this bridge, for the overview file. Every
+ * chat whose latest task is not "ok" is kept; only finished chats are cut to
+ * `finishedLimit`, most recently active first.
+ */
+export function listLatestTasks(finishedLimit = 200) {
+  const lim = Math.max(1, Math.min(1000, Number(finishedLimit) || 200));
+  let rows;
+  try { rows = Q.listLatestTasks.all(); } catch { return []; }
+  let finished = 0;
+  return rows.filter((r) => r.turn_status !== "ok" || ++finished <= lim);
 }
 
 export function addUsage(sid, usage) {

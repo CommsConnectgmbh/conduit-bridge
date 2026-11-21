@@ -33,6 +33,8 @@ const SECRET = "sk-ant-api03-SYNTHETICSECRET0123456789";
 const PRIVATE_PATH = "/Users/test-user/private/project";
 const EMAIL = "owner@example.com";
 const FOREIGN_SID = "abcdabcd-7777-4222-8333-444455556666";
+// A chat of the owner whose only task was cut off long ago.
+const OLD_SID = "abcdabcd-5555-4222-8333-444455556666";
 
 let dir, fakeLog, journalDir, bridge = null, bridgeKey, device, pairPort, port;
 const freePort = () => new Promise((res) => { const s = net.createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => res(p)); }); });
@@ -208,6 +210,10 @@ function run(raw) {
     setInterval(() => {}, 1000);
     return "hang";
   } else if (sc === "checkpoint") {
+    // Saved well after the bridge started and the turn began, so neither the
+    // startup write of the overview (5 s) nor the one after acceptance can
+    // have picked it up: only the refresh on a new checkpoint can.
+    setTimeout(() => {
     toolUse("t-cp-" + tag, { command: "save checkpoint" });
     writeFileSync(process.env.CONDUIT_CHECKPOINT_FILE, JSON.stringify({
       summary: "Migration step 2 of 3 applied in staging",
@@ -220,6 +226,7 @@ function run(raw) {
     }));
     toolResult("t-cp-" + tag, "saved");
     text("partial");
+    }, 6500);
     setInterval(() => {}, 1000);
     return "hang";
   } else if (sc === "tools-then-die") {
@@ -523,6 +530,11 @@ test("agent checkpoints are filtered into the journal and handed back to the age
   let c = await client();
   await c.prompt("P13", "checkpoint");
   await c.waitFor((f) => f.type === "chunk" && f.assistantMessageId === "a-P13", "P13 text after checkpoint");
+  // The overview file picks up the new next step while the task still runs.
+  const ovFile = join(journalDir, "00-Conduit-Uebersicht.md");
+  let ovNow = "";
+  for (let i = 0; i < 80 && !/Run step 3/.test(ovNow); i++) { await sleep(100); try { ovNow = readFileSync(ovFile, "utf8"); } catch { /* not yet */ } }
+  assert.match(ovNow, /## Läuft gerade \(1\)[\s\S]*Nächster Schritt: Run step 3[\s\S]*## Braucht Aufmerksamkeit/, "overview missed the checkpoint saved mid-run");
   const [run] = runsOf("P13");
   // The agent was told, in its context, where the journal and the checkpoint are.
   assert.ok(run.sys, "no --append-system-prompt");
@@ -569,6 +581,9 @@ test("the task overview lists every task across chats with its end and the last 
     db.prepare("INSERT INTO sessions (id, user_email, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)").run(FOREIGN_SID, "someone@example.org", "FOREIGN-TITLE", t, t);
     db.prepare("INSERT INTO messages (id, session_id, role, content, ts) VALUES (?, ?, 'user', ?, ?)").run("u-F1", FOREIGN_SID, "FOREIGN-REQUEST", t);
     db.prepare("INSERT INTO messages (id, session_id, role, content, ts, reply_to, turn_status) VALUES (?, ?, 'assistant', ?, ?, ?, 'ok')").run("a-F1", FOREIGN_SID, "FOREIGN-ANSWER", t + 1, "u-F1");
+    db.prepare("INSERT INTO sessions (id, user_email, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)").run(OLD_SID, EMAIL, "Old chat", 1000, 1000);
+    db.prepare("INSERT INTO messages (id, session_id, role, content, ts) VALUES (?, ?, 'user', ?, ?)").run("u-OLD", OLD_SID, "old request", 1000);
+    db.prepare("INSERT INTO messages (id, session_id, role, content, ts, reply_to, turn_status, turn_error) VALUES (?, ?, 'assistant', '', ?, ?, 'interrupted', 'cut off')").run("a-OLD", OLD_SID, 1001, "u-OLD");
     db.close();
   }
   bridge = await startBridge({ warm: false });
@@ -600,9 +615,14 @@ test("the task overview lists every task across chats with its end and the last 
   assert.equal(cp.taskId, "a-P13");
   assert.equal(cp.next, "Run step 3 (backfill) after checking row counts");
   for (const leak of [SECRET, "SYNTHETICSECRET", "hunter2", EMAIL]) assert.ok(!JSON.stringify(cp).includes(leak), `checkpoint leaks ${leak}`);
-  // Limits.
+  assert.equal(byId["a-OLD"].status, "interrupted");
+  // Limits cut the history, never an open task: the old interrupted one is
+  // still there behind the two newest, and the answer says it was cut.
   const two = await c.call("GET", "/api/tasks?limit=2");
-  assert.equal(two.body.tasks.length, 2);
+  assert.deepEqual(two.body.tasks.map((t) => t.id).slice(-1), ["a-OLD"]);
+  assert.equal(two.body.tasks.length, 3);
+  assert.equal(two.body.limited, true);
+  assert.equal(r.body.limited, false);
   const huge = await c.call("GET", "/api/tasks?limit=999999");
   assert.ok(huge.body.tasks.length <= 500);
   // A running task is reported as running, with the tool it is in.
@@ -670,6 +690,7 @@ test("the journal is owner-only, separate, complete and leaks nothing", { skip: 
   assert.ok(ov.includes(`Journal: \`Conduit-Journal-${SID}.md\``));
   assert.match(ov, /> Nächster Schritt: Run step 3 \(backfill\) after checking row counts/);
   assert.equal((ov.match(new RegExp(`Sitzung \`${SID}\``, "g")) || []).length, 1, "a chat listed twice");
+  assert.match(ov, new RegExp(`## Braucht Aufmerksamkeit[\\s\\S]*Sitzung \`${OLD_SID}\`[\\s\\S]*## Abgeschlossen`), "old open chat missing from the attention group");
   for (const leak of [SECRET, "SYNTHETICSECRET", PRIVATE_PATH, dir, EMAIL, "SCENARIO", "TAG:", "FOREIGN-TITLE", "FOREIGN-REQUEST", "FOREIGN-ANSWER", "hunter2", "/Users/test-user", "old text"]) {
     assert.ok(!ov.includes(leak), `overview leaks ${JSON.stringify(leak)}`);
   }

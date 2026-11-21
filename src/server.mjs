@@ -1241,7 +1241,7 @@ async function handleApi(req, res, u, auth) {
   if (path === "/api/tasks" && req.method === "GET") {
     const sinceTs = Number(u.searchParams.get("since")) || 0;
     const limit = Math.min(500, Math.max(1, Number(u.searchParams.get("limit")) || 150));
-    const tasks = listTasks(email, { sinceTs, limit });
+    const { tasks, limited } = listTasks(email, { sinceTs, limit });
     const live = new Map();
     for (const t of tasks) {
       if (live.has(t.sessionId)) continue;
@@ -1276,7 +1276,7 @@ async function handleApi(req, res, u, auth) {
       const qi = l.queued.indexOf(t.id);
       if (qi >= 0) { t.status = "queued"; t.queuePosition = qi + 1; }
     }
-    return json(res, 200, { ok: true, tasks, checkpoints, journal: { enabled: journal.enabled, ok: journal.status().ok } });
+    return json(res, 200, { ok: true, tasks, limited, checkpoints, journal: { enabled: journal.enabled, ok: journal.status().ok } });
   }
 
   if (path === "/api/audit" && req.method === "GET") {
@@ -1777,7 +1777,8 @@ function emitActivityEnd(rt, inflight, block) {
   // A finished tool step is where an agent saves a checkpoint (it writes the
   // file with a tool). Picked up right away, so a crash a minute later still
   // leaves it in the journal.
-  if (journal.enabled) { try { journal.ingestCheckpoint(rt.sid, { assistantId: inflight.assistantId }); } catch {} }
+  // A new checkpoint changes the overview's "next step" for this chat.
+  if (journal.enabled) { try { if (journal.ingestCheckpoint(rt.sid, { assistantId: inflight.assistantId })) scheduleOverview(); } catch {} }
 }
 
 // Delta/snapshot guard: Claude CLI can emit either real deltas or cumulative
