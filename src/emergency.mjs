@@ -27,16 +27,29 @@ export function createEmergencyStop({ stateDir, log = () => {}, now = Date.now }
   let state = load();
   // The file always exists from the first start on: a press on a full disk
   // can then fall back to emptying it (markPressedWithoutSpace), which needs
-  // no space. Without a file it could only try to create one.
-  if (!existsSync(file)) {
-    try { save({ active: false, since: null, by: null }); }
-    catch (e) { log("error", "emergency_state_write_failed", { err: String(e?.message || e).slice(0, 120) }); }
+  // no space. Without a file it could only try to create one; if even the
+  // first write fails, status says unsaved until a write succeeds.
+  if (state.missing) {
+    state = { active: false, since: null, by: null };
+    try { save(state); }
+    catch (e) {
+      log("error", "emergency_state_write_failed", { err: String(e?.message || e).slice(0, 120) });
+      state = { ...state, unsaved: true };
+    }
   }
 
   function load() {
-    if (!existsSync(file)) return { active: false, since: null, by: null };
+    let raw;
+    try { raw = readFileSync(file, "utf8"); }
+    catch (e) {
+      // Only a file that is really not there means "never pressed". Any other
+      // read error (no permission, I/O) counts as pressed.
+      if (e?.code === "ENOENT") return { active: false, since: null, by: null, missing: true };
+      log("error", "emergency_state_unreadable", { err: String(e?.code || e?.message || e).slice(0, 120) });
+      return { active: true, since: null, by: "unreadable-state" };
+    }
     try {
-      const j = JSON.parse(readFileSync(file, "utf8"));
+      const j = JSON.parse(raw);
       if (j && j.active === false) return { active: false, since: null, by: null };
       if (j && j.active === true) {
         return { active: true, since: Number.isFinite(j.since) ? j.since : null, by: typeof j.by === "string" ? j.by : null };

@@ -2326,11 +2326,11 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null, 
       onToolResult: (block) => { armStall(); emitActivityEnd(rt, inflight, block); },
       onPermissionDenied: (names) => emitDeniedNotice(rt, inflight, CLAUDE_ENGINE, names),
       onUsageEvent: (ev) => { armStall(); applyResultUsage(rt, ev); },
-      // A result that lands while the emergency stop ends this process still
-      // counts as stopped by it, so journal and replay say it was pressed
-      // (the text that arrived is kept).
-      onDone: () => (inflight.abortedByStop === "emergency"
-        ? finishTurn(stopMessage("emergency"), stopKind("emergency"))
+      // A result that lands while a stop (Stop, emergency stop, orphan limit
+      // …) ends this process still counts as stopped, so journal and replay
+      // say it was stopped (the text that arrived is kept).
+      onDone: () => (inflight.abortedByStop
+        ? finishTurn(stopMessage(inflight.abortedByStop), stopKind(inflight.abortedByStop))
         : finishTurn(null)),
       onError: (msg, info) => {
         if (inflight.stopRequested) {

@@ -107,3 +107,24 @@ test("the state file exists from the first start, so even a first press on a ful
     assert.equal(createEmergencyStop({ stateDir: dir }).active, true);
   } finally { chmodSync(dir, 0o700); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("a state file that exists but cannot be read counts as pressed, not as missing", { skip: process.platform === "win32" || process.getuid?.() === 0 }, () => {
+  const dir = fresh();
+  try {
+    createEmergencyStop({ stateDir: dir });      // writes {active:false}
+    chmodSync(join(dir, EMERGENCY_FILE), 0o000);
+    const logs = [];
+    assert.equal(createEmergencyStop({ stateDir: dir, log: (l, ev) => logs.push(ev) }).active, true);
+    assert.ok(logs.includes("emergency_state_unreadable"));
+  } finally { try { chmodSync(join(dir, EMERGENCY_FILE), 0o600); } catch {} rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("if the file cannot be created at the first start, status says unsaved from the start", { skip: process.platform === "win32" || process.getuid?.() === 0 }, () => {
+  const dir = fresh();
+  try {
+    chmodSync(dir, 0o500);
+    const e = createEmergencyStop({ stateDir: dir });
+    assert.equal(e.active, false);
+    assert.equal(e.status().unsaved, true);
+  } finally { chmodSync(dir, 0o700); rmSync(dir, { recursive: true, force: true }); }
+});

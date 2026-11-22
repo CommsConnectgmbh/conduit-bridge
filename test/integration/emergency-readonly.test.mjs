@@ -361,3 +361,20 @@ test("an answer that completes while the emergency stop ends it is recorded as s
   await stopBridge("SIGTERM");
   killFakes();
 });
+
+test("an answer that completes while the user's Stop ends it is recorded as stopped, not ok", { skip: !POSIX, timeout: 60_000 }, async () => {
+  bridge = await startBridge({ warm: true });
+  const c = await client({ sid: SID_B });
+  await c.prompt("R2", "result-on-term", { engine: "claude" });
+  await c.waitFor((f) => f.type === "chunk" && f.assistantMessageId === "a-R2", "R2 running");
+  await c.send({ type: "stop" });
+  const t = await c.waitFor(isTerminal("a-R2"), "R2 terminal");
+  assert.equal(t.type, "error", JSON.stringify(t));
+  const hist = await c.call("GET", `/api/sessions/${SID_B}/messages`);
+  const row = hist.body.messages.find((m) => m.id === "a-R2");
+  assert.notEqual(row.turnStatus, "ok");
+  assert.match(row.content, /almost done/);
+  await c.close();
+  await stopBridge("SIGTERM");
+  killFakes();
+});
