@@ -56,7 +56,7 @@ const MAX_OPEN_ERRORS = 100;
 // Fixed vocabulary. Anything else is written as "unknown".
 const STATES = new Set(["queued", "running", "ok", "error", "interrupted", "not_started"]);
 const KINDS = new Set([
-  "stopped", "stall", "deadline", "orphan", "exit", "signal", "agent_error", "empty",
+  "stopped", "stall", "startup", "deadline", "orphan", "exit", "signal", "agent_error", "empty",
   "empty_after_tools", "spawn", "policy", "capacity", "bridge_restart",
   "bridge_shutdown", "superseded", "deleted", "interrupted",
 ]);
@@ -108,6 +108,7 @@ const STATE_LABEL = {
 const KIND_LABEL = {
   stopped: "vom Nutzer gestoppt",
   stall: "keine Ausgabe mehr (Stall-Wächter)",
+  startup: "Agent startete nicht (keine Ausgabe nach dem Start)",
   deadline: "harte Zeitgrenze erreicht",
   orphan: "Sicherheitsgrenze: lange keine App verbunden",
   exit: "Agent-Prozess mit Fehlercode beendet",

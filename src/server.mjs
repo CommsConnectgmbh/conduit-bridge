@@ -203,6 +203,9 @@ const MAX_LOG_FILES = HOUSEKEEPING.logFiles;
 const WS_PONG_TIMEOUT_MS = intEnv("CONDUIT_CHAT_SILENT_MS", 75_000, 1000, 3600_000);
 const WS_WATCH_INTERVAL_MS = Math.min(15_000, Math.max(250, Math.floor(WS_PONG_TIMEOUT_MS / 3)));
 const CHILD_STALL_MS = intEnv("CONDUIT_TURN_STALL_MS", 900_000, 1000, 24 * 3600_000); // no stdout for this long → kill claude
+// A warm claude that has not printed one byte this long after launch never
+// started (see warm.mjs startupMs). 0 = off.
+const CHILD_STARTUP_MS = intEnv("CONDUIT_TURN_STARTUP_MS", 90_000, 0, 24 * 3600_000);
 const CHILD_HEARTBEAT_MS = 10_000;       // tick interval for the "still working" heartbeat
 const CHILD_HEARTBEAT_MIN_SILENCE_MS = 3_000; // only emit once silence exceeds this, so lively chunks aren't drowned in beats
 const MAX_PROMPT_QUEUE = 10;             // max prompts queued while a turn is running (further ones are rejected)
@@ -459,7 +462,7 @@ const warmPool = USE_WARM
   ? createWarmPool({
       claudeBin: CLAUDE_BIN, model: MODEL, defaultCwd: CWD,
       env: process.env, envFor: (sid) => agentEnvFor(sid), systemPromptFor: (sid) => agentContextFor(sid), log, isUuid,
-      maxWarm: WARM_MAX, idleMs: WARM_IDLE_MS, stallMs: CHILD_STALL_MS,
+      maxWarm: WARM_MAX, idleMs: WARM_IDLE_MS, stallMs: CHILD_STALL_MS, startupMs: CHILD_STARTUP_MS,
     })
   : null;
 
@@ -2254,7 +2257,11 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null, 
         // warm failure. Retrying it through the one-shot path re-ran a prompt
         // that had already been executing for 15 minutes — with
         // bypassPermissions, so any side effects happened a second time.
-        if (info?.stall || info?.terminal) { finishTurn(msg, info?.stall ? "stall" : "agent_error"); return; }
+        if (info?.stall || info?.terminal) {
+          if (info?.startup) log("warn", "child_killed", { sid: rt.sid, reason: "startup", warm: true });
+          finishTurn(msg, info?.startup ? "startup" : info?.stall ? "stall" : "agent_error");
+          return;
+        }
         // Warm turn died before producing any output → transparently retry once
         // via the one-shot path so the user still gets an answer.
         // The supersede guard belongs here too. Without it a late error from a
@@ -2513,7 +2520,10 @@ function runInflightTurn(engine, rt, sess, prompt, assistantId, userMessageId = 
   };
 
   const hooks = {
-    onActivity: () => armStall(),
+    onActivity: () => {
+      if (inflight.startupTimer) { clearTimeout(inflight.startupTimer); inflight.startupTimer = null; }
+      armStall();
+    },
     onLine: (line) => handleStreamLine(line, rt, inflight, engine),
     onStderr: (text) => {
       inflight.stderrBuf += text;
@@ -2521,6 +2531,7 @@ function runInflightTurn(engine, rt, sess, prompt, assistantId, userMessageId = 
     },
     onClose: (code, signal, tail) => {
       if (inflight.stallTimer) { clearTimeout(inflight.stallTimer); inflight.stallTimer = null; }
+      if (inflight.startupTimer) { clearTimeout(inflight.startupTimer); inflight.startupTimer = null; }
       if (inflight.heartbeatTimer) { clearInterval(inflight.heartbeatTimer); inflight.heartbeatTimer = null; }
       // Only flush if this turn is still the live one. Running it first meant a
       // superseded child's last partial line was broadcast into the middle of its
@@ -2568,6 +2579,10 @@ function runInflightTurn(engine, rt, sess, prompt, assistantId, userMessageId = 
       if (inflight.abortedByStop) {
         inflight.errorMsg = inflight.errorMsg || stopMessage(inflight.abortedByStop);
         kind = stopKind(inflight.abortedByStop);
+      } else if (inflight.abortedByStartup) {
+        // Never printed a byte: the CLI did not start (see CHILD_STARTUP_MS).
+        inflight.errorMsg = inflight.errorMsg || engine.messages.startup(Math.round(CHILD_STARTUP_MS / 1000));
+        kind = "startup";
       } else if (inflight.abortedByStall) {
         // Killed by the stall watchdog: the answer is truncated. SIGTERM would
         // otherwise fall into the `done` branch below and the client would show
@@ -2610,6 +2625,7 @@ function runInflightTurn(engine, rt, sess, prompt, assistantId, userMessageId = 
     onFailure: (msg) => {
       if (inflight.deadlineTimer) { clearTimeout(inflight.deadlineTimer); inflight.deadlineTimer = null; }
       if (inflight.stallTimer) { clearTimeout(inflight.stallTimer); inflight.stallTimer = null; }
+      if (inflight.startupTimer) { clearTimeout(inflight.startupTimer); inflight.startupTimer = null; }
       if (inflight.heartbeatTimer) { clearInterval(inflight.heartbeatTimer); inflight.heartbeatTimer = null; }
       if (inflight.wrappedUp) return;
       inflight.wrappedUp = true;
@@ -2687,6 +2703,20 @@ function runInflightTurn(engine, rt, sess, prompt, assistantId, userMessageId = 
   }, CHILD_HEARTBEAT_MS);
   inflight.heartbeatTimer.unref?.();
   armStall();
+  // Same startup check as the warm pool, for Claude only: other engines may
+  // legitimately stay silent at first (a local model loading its weights).
+  if (engine.id === "claude" && engine.transport !== "http" && CHILD_STARTUP_MS > 0) {
+    inflight.startupTimer = setTimeout(() => {
+      inflight.startupTimer = null;
+      if (rt.inflight !== inflight || !inflight.proc || inflight.done) return;
+      inflight.abortedByStartup = true;
+      inflight.errorMsg = engine.messages.startup(Math.round(CHILD_STARTUP_MS / 1000));
+      broadcast(rt, { type: "error", message: inflight.errorMsg, assistantMessageId: inflight.assistantId });
+      inflight.proc.stop("startup");
+      log("warn", "child_killed", { sid: rt.sid, reason: "startup", ...engine.killMeta });
+    }, CHILD_STARTUP_MS);
+    inflight.startupTimer.unref?.();
+  }
 }
 
 /**

@@ -205,6 +205,7 @@ Paths set in `.env.local` (`DB_DIR`, `LOG_DIR`, `PASTE_DIR`, `CONDUIT_MODELS_DIR
 | `CONDUIT_MAX_CONCURRENT_TURNS` | Turns running at once | max(4, 2 x `CONDUIT_WARM_MAX`) |
 | `CONDUIT_MAX_RUNTIME_SESSIONS` | Chats held in memory | 200 |
 | `CONDUIT_TURN_STALL_MS` | End a turn after this long without output | 900000 |
+| `CONDUIT_TURN_STARTUP_MS` | End a Claude turn whose process printed nothing this long after launch (0 = off) | 90000 |
 | `CONDUIT_MAX_TURN_MS` | Hard limit per turn | `0`: none |
 | `CONDUIT_ORPHAN_GRACE_MS` | Optional safety limit: stop a running turn once no app has been connected to the bridge (any chat) for this long; values below 60000 are raised to 60000 (recorded as an error, never as finished) | 0 (off) |
 | `CONDUIT_JOURNAL_DIR` | Folder for the automatic Markdown journal, one file per chat (created 0700 if missing; an existing folder keeps its mode; files 0600) | `<DB_DIR>/journal` |
