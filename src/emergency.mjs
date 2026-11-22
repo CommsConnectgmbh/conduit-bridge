@@ -10,7 +10,7 @@
 // Not-Aus als gedrückt (schlägt geschlossen fehl). Lösen geht dann wie immer
 // über die App und schreibt die Datei neu.
 
-import { readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, existsSync, truncateSync, openSync, closeSync } from "node:fs";
 import { join } from "node:path";
 import { PRIVATE_FILE_MODE } from "./private-fs.mjs";
 
@@ -41,6 +41,23 @@ export function createEmergencyStop({ stateDir, log = () => {}, now = Date.now }
     }
   }
 
+  /**
+   * Last resort when the state cannot be written (full disk): an EMPTY state
+   * file needs no data blocks — truncating an existing one frees space — and
+   * load() reads it as unreadable, i.e. pressed. So a restart cannot lift a
+   * stop that was pressed while the disk was full.
+   */
+  function markPressedWithoutSpace() {
+    try {
+      if (existsSync(file)) truncateSync(file, 0);
+      else closeSync(openSync(file, "w", PRIVATE_FILE_MODE));
+      return true;
+    } catch (e) {
+      log("error", "emergency_state_fallback_failed", { err: String(e?.message || e).slice(0, 120) });
+      return false;
+    }
+  }
+
   function save(next) {
     const tmp = `${file}.${process.pid}.tmp`;
     writeFileSync(tmp, JSON.stringify(next), { mode: PRIVATE_FILE_MODE });
@@ -51,7 +68,7 @@ export function createEmergencyStop({ stateDir, log = () => {}, now = Date.now }
     /** Gedrückt? */
     get active() { return state.active; },
     /** Für /api/status und die App. */
-    status() { return { ...state }; },
+    status() { return { active: state.active, since: state.since, by: state.by, unsaved: state.unsaved === true }; },
     /**
      * Drücken. Gilt sofort im Speicher, auch wenn das Schreiben scheitert;
      * dann sagt `persisted: false`, dass ein Neustart ihn aufheben würde.
@@ -60,10 +77,13 @@ export function createEmergencyStop({ stateDir, log = () => {}, now = Date.now }
       const already = state.active;
       if (!already) state = { active: true, since: now(), by: by || null };
       let persisted = true;
-      try { save(state); } catch (e) {
-        persisted = false;
+      try { save({ active: true, since: state.since, by: state.by }); } catch (e) {
         log("error", "emergency_state_write_failed", { err: String(e?.message || e).slice(0, 120) });
+        persisted = markPressedWithoutSpace();
       }
+      // Kept in the state, so /api/status keeps saying it until a later
+      // press or the release could save — not only the answer to this press.
+      state = { ...state, unsaved: !persisted };
       return { ...state, already, persisted };
     },
     /**

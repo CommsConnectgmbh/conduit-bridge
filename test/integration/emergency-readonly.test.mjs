@@ -292,3 +292,44 @@ test("an engine that cannot enforce read-only refuses the turn instead of runnin
   await stopBridge("SIGTERM");
   killFakes();
 });
+
+test("an emergency stop that cannot be saved stays visible on every status read, and a full disk cannot lift it on restart", { skip: !POSIX || process.getuid?.() === 0, timeout: 120_000 }, async () => {
+  const { chmodSync: chmod, rmSync: rm } = await import("node:fs");
+  const logDir = join(dir, "logs");
+  bridge = await startBridge({ warm: false });
+  let c = await client({ sid: SID_A });
+  // Nothing on disk and nothing can be created: held in memory, said on every read.
+  rm(join(logDir, ".emergency-stop.json"), { force: true });
+  chmod(logDir, 0o500);
+  try {
+    const on = await c.call("POST", "/api/emergency-stop");
+    assert.equal(on.body.persisted, false);
+    assert.equal(on.body.emergencyStop.unsaved, true);
+    for (let i = 0; i < 2; i++) {   // the app opening Tasks again, twice
+      const st = await c.call("GET", "/api/status");
+      assert.equal(st.body.emergencyStop.active, true);
+      assert.equal(st.body.emergencyStop.unsaved, true);
+    }
+  } finally { chmod(logDir, 0o700); }
+  // Writable again: release, then the full-disk case with an existing file.
+  assert.equal((await c.call("POST", "/api/emergency-release")).body.ok, true);
+  chmod(logDir, 0o500);
+  try {
+    const on = await c.call("POST", "/api/emergency-stop");
+    assert.equal(on.body.persisted, true);
+    assert.equal(on.body.emergencyStop.unsaved, false);
+  } finally { chmod(logDir, 0o700); }
+  await c.close();
+  await stopBridge("SIGTERM");
+  bridge = await startBridge({ warm: false });
+  c = await client({ sid: SID_A });
+  const st = await c.call("GET", "/api/status");
+  assert.equal(st.body.emergencyStop.active, true, "a restart lifted the stop");
+  await c.prompt("F1", "ok");
+  assert.equal((await c.waitFor(isTerminal("a-F1"), "F1 refused")).type, "error");
+  assert.equal(runsOf("F1").length, 0);
+  assert.equal((await c.call("POST", "/api/emergency-release")).body.emergencyStop.active, false);
+  await c.close();
+  await stopBridge("SIGTERM");
+  killFakes();
+});
