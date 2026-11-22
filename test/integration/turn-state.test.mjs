@@ -155,7 +155,12 @@ const text = (t) => out({ type: "assistant", message: { content: [{ type: "text"
 const toolUse = (id, input) => out({ type: "assistant", message: { content: [{ type: "tool_use", id, name: "Bash", input }] } });
 const toolResult = (id, content) => out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, content }] } });
 const result = () => out({ type: "result", subtype: "success", is_error: false, usage: { input_tokens: 1, output_tokens: 1 } });
-out({ type: "system", subtype: "init", session_id: "11111111-2222-3333-4444-555555555555" });
+if (process.env.FAKE_SILENT_START) {
+  // A CLI that never starts: no init, no answer, like claude blocked in openat()
+  // while macOS waits for a permission dialog. It only notes that it ran.
+  appendFileSync(LOG, JSON.stringify({ pid: process.pid, warm, silent: true }) + "\\n");
+  setInterval(() => {}, 1 << 30);
+} else out({ type: "system", subtype: "init", session_id: "11111111-2222-3333-4444-555555555555" });
 function run(raw) {
   const tag = (/TAG:([A-Za-z0-9]+)/.exec(raw) || [])[1] || null;
   const sc = (/SCENARIO:([a-z-]+)/.exec(raw) || [])[1] || "ok";
@@ -238,7 +243,8 @@ function run(raw) {
     process.exit(1);
   }
 }
-if (warm) createInterface({ input: process.stdin }).on("line", (l) => { if (l.trim()) run(l); });
+if (process.env.FAKE_SILENT_START) { /* never answers */ }
+else if (warm) createInterface({ input: process.stdin }).on("line", (l) => { if (l.trim()) run(l); });
 else { if (run(process.argv.slice(2).join(" ")) !== "hang") process.exitCode = 0; }
 `);
   chmodSync(fake, 0o755);
@@ -787,6 +793,31 @@ test("the journal is owner-only, separate, complete and leaks nothing", { skip: 
 // connected app" while the app was open on another chat, or the phone slept).
 const OTHER_SID = "abcdabcd-9999-4222-8333-444455556666";
 const fakeAlive = (tag) => runsOf(tag).some((r) => { try { process.kill(r.pid, 0); return true; } catch { return false; } });
+
+for (const warm of [true, false]) {
+  test(`a claude that never starts ends after CONDUIT_TURN_STARTUP_MS, once, as "startup" (${warm ? "warm" : "one-shot"})`, { skip: !POSIX }, async () => {
+    const before = fakeRuns().length;
+    bridge = await startBridge({ warm, env: { FAKE_SILENT_START: "1", CONDUIT_TURN_STARTUP_MS: "800" } });
+    const c = await client();
+    const tag = warm ? "PS1" : "PS2";
+    const t0 = Date.now();
+    await c.prompt(tag, "ok");
+    const t = await c.waitFor(isTerminal("a-" + tag), tag + " terminal");
+    assert.equal(t.type, "error");
+    assert.match(t.message, /did not start/);
+    assert.ok(Date.now() - t0 < 10_000, "startup check did not fire in time");
+    const hist = await c.call("GET", `/api/sessions/${SID}/messages`);
+    assert.equal(assistantRow(hist.body.messages, "a-" + tag).turnStatus, "error");
+    await sleep(500);
+    // No retry: neither the one-shot fallback nor a second process.
+    assert.equal(fakeRuns().slice(before).filter((r) => r.silent).length, 1);
+    const journal = readFileSync(join(journalDir, `Conduit-Journal-${SID}.md`), "utf8");
+    assert.match(journal, /Agent startete nicht/);
+    await c.close();
+    await stopBridge("SIGTERM");
+    killFakes();
+  });
+}
 
 test("by default a running turn is never stopped because the app went away", { skip: !POSIX }, async () => {
   bridge = await startBridge({ warm: false });

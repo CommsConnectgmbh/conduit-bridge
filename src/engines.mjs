@@ -187,6 +187,7 @@ const CLAUDE = {
     spawnFailed: (m) => `Claude could not be started: ${m}`,
     stall: "Claude has not responded for 10 minutes. Stopped.",
     stallIncomplete: "Claude stopped responding. The answer is incomplete.",
+    startup: (secs) => `Claude did not start: no output ${secs}s after launch. The Mac may be waiting for a permission dialog (for example access to a drive). Confirm it on the Mac, then send the message again.`,
     exit: (code, tail) => `claude exit ${code}: ${tail}`,
     procError: (m) => `claude error: ${m}`,
     emptyTurn: "Claude finished without response text. Check the current result and work log before continuing.",

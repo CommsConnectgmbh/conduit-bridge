@@ -40,6 +40,15 @@ export function createWarmPool({
   // timeout, so a legit long silent op (incl. a slow Agent/Task run) never trips
   // it — only a genuinely dead turn does. Overridable via CONDUIT_TURN_STALL_MS.
   stallMs = 900_000,
+  // A freshly spawned claude that has not written a single byte to stdout
+  // after this long never started. A healthy CLI prints its `system/init`
+  // event within a second; on 22.11.2026 three turns sat at zero bytes for the
+  // full 15-minute stall window, blocked in openat() while macOS waited for a
+  // permission dialog nobody can click from the phone. Only the very first
+  // output of a process counts, so a long, silent turn on a process that did
+  // start is still the stall watchdog's business. 0 disables the check.
+  // Overridable via CONDUIT_TURN_STARTUP_MS.
+  startupMs = 90_000,
 }) {
   /** sid -> proc */
   const procs = new Map();
@@ -106,7 +115,23 @@ export function createWarmPool({
   }, 30_000);
   idleTimer.unref?.();
 
+  function onStartupTimeout(p) {
+    p.startupTimer = null;
+    if (!p.alive || p.firstOutAt) return;
+    const t = p.turn;
+    const secs = Math.round(startupMs / 1000);
+    log("warn", "warm_startup_stall", { sid: p.sid, secs, stderr: p.stderrBuf.length > 0 });
+    if (t && !t.finished) {
+      t.finished = true;
+      // Terminal: a one-shot retry would start the same CLI against the same
+      // blocked resource and hang for another full stall window.
+      t.handlers.onError?.(getEngine("claude").messages.startup(secs), { stall: true, startup: true });
+    }
+    killProc(p, "startup_stall");
+  }
+
   function onExit(p, code, signal) {
+    if (p.startupTimer) { clearTimeout(p.startupTimer); p.startupTimer = null; }
     // Drain the decoder and any final line the process did not newline-terminate,
     // so a last complete record is not lost on exit.
     try {
@@ -236,6 +261,10 @@ export function createWarmPool({
 
   function onStdout(p, d) {
     p.lastOutAt = Date.now();
+    if (!p.firstOutAt) {
+      p.firstOutAt = p.lastOutAt;
+      if (p.startupTimer) { clearTimeout(p.startupTimer); p.startupTimer = null; }
+    }
     p.stdoutBuf += p.outDecoder.write(d);
     // A single event larger than the cap used to be sliced from the FRONT, so
     // the line became invalid JSON and routeEvent dropped it without a word. If
@@ -304,7 +333,12 @@ export function createWarmPool({
       // otherwise land in the transcript as U+FFFD.
       outDecoder: new StringDecoder("utf8"),
       exitedAt: 0, markExited: null, exited: null,
+      firstOutAt: 0, startupTimer: null,
     };
+    if (startupMs > 0) {
+      p.startupTimer = setTimeout(() => onStartupTimeout(p), startupMs);
+      p.startupTimer.unref?.();
+    }
     p.exited = new Promise((resolve) => { p.markExited = resolve; });
     procs.set(sid, p);
     child.stdout.on("data", (d) => onStdout(p, d));
