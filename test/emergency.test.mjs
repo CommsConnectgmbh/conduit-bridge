@@ -95,3 +95,15 @@ test("when nothing at all can be written the stop holds in memory and status kee
     assert.equal(createEmergencyStop({ stateDir: dir }).active, true);
   } finally { chmodSync(dir, 0o700); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("the state file exists from the first start, so even a first press on a full disk survives a restart", { skip: process.platform === "win32" || process.getuid?.() === 0 }, () => {
+  const dir = fresh();
+  try {
+    createEmergencyStop({ stateDir: dir });
+    assert.deepEqual(JSON.parse(readFileSync(join(dir, EMERGENCY_FILE), "utf8")), { active: false, since: null, by: null });
+    chmodSync(dir, 0o500);
+    const e = createEmergencyStop({ stateDir: dir });
+    assert.equal(e.engage("o").persisted, true);
+    assert.equal(createEmergencyStop({ stateDir: dir }).active, true);
+  } finally { chmodSync(dir, 0o700); rmSync(dir, { recursive: true, force: true }); }
+});

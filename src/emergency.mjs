@@ -25,6 +25,13 @@ export const EMERGENCY_FILE = ".emergency-stop.json";
 export function createEmergencyStop({ stateDir, log = () => {}, now = Date.now }) {
   const file = join(stateDir, EMERGENCY_FILE);
   let state = load();
+  // The file always exists from the first start on: a press on a full disk
+  // can then fall back to emptying it (markPressedWithoutSpace), which needs
+  // no space. Without a file it could only try to create one.
+  if (!existsSync(file)) {
+    try { save({ active: false, since: null, by: null }); }
+    catch (e) { log("error", "emergency_state_write_failed", { err: String(e?.message || e).slice(0, 120) }); }
+  }
 
   function load() {
     if (!existsSync(file)) return { active: false, since: null, by: null };

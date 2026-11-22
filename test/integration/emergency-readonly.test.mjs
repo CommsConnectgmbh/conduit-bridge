@@ -143,6 +143,15 @@ function run(raw) {
   if (sc === "ok") {
     out({ type: "assistant", message: { content: [{ type: "text", text: "answer " + tag }] } });
     out({ type: "result", subtype: "success", is_error: false, usage: { input_tokens: 1, output_tokens: 1 } });
+  } else if (sc === "result-on-term") {
+    // Finishes its answer while being stopped: the result lands on SIGTERM.
+    out({ type: "assistant", message: { content: [{ type: "text", text: "almost done" }] } });
+    process.on("SIGTERM", () => {
+      out({ type: "result", subtype: "success", is_error: false, usage: { input_tokens: 1, output_tokens: 1 } });
+      setTimeout(() => process.exit(0), 50);
+    });
+    setInterval(() => {}, 1000);
+    return "hang";
   } else if (sc === "hang") {
     out({ type: "assistant", message: { content: [{ type: "text", text: "partial" }] } });
     out({ type: "assistant", message: { content: [{ type: "tool_use", id: "t-" + tag, name: "Bash", input: { command: "sleep 999" } }] } });
@@ -329,6 +338,25 @@ test("an emergency stop that cannot be saved stays visible on every status read,
   assert.equal((await c.waitFor(isTerminal("a-F1"), "F1 refused")).type, "error");
   assert.equal(runsOf("F1").length, 0);
   assert.equal((await c.call("POST", "/api/emergency-release")).body.emergencyStop.active, false);
+  await c.close();
+  await stopBridge("SIGTERM");
+  killFakes();
+});
+
+test("an answer that completes while the emergency stop ends it is recorded as stopped by it", { skip: !POSIX, timeout: 60_000 }, async () => {
+  bridge = await startBridge({ warm: true });
+  const c = await client({ sid: SID_B });
+  await c.prompt("R1", "result-on-term", { engine: "claude" });  // the chat was on codex
+  await c.waitFor((f) => f.type === "chunk" && f.assistantMessageId === "a-R1", "R1 running");
+  await c.call("POST", "/api/emergency-stop");
+  const t = await c.waitFor(isTerminal("a-R1"), "R1 terminal");
+  assert.equal(t.type, "error", JSON.stringify(t));
+  assert.match(t.message, /emergency stop/);
+  const hist = await c.call("GET", `/api/sessions/${SID_B}/messages`);
+  const row = hist.body.messages.find((m) => m.id === "a-R1");
+  assert.notEqual(row.turnStatus, "ok");
+  assert.match(row.content, /almost done/);
+  await c.call("POST", "/api/emergency-release");
   await c.close();
   await stopBridge("SIGTERM");
   killFakes();

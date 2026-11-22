@@ -2326,7 +2326,12 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null, 
       onToolResult: (block) => { armStall(); emitActivityEnd(rt, inflight, block); },
       onPermissionDenied: (names) => emitDeniedNotice(rt, inflight, CLAUDE_ENGINE, names),
       onUsageEvent: (ev) => { armStall(); applyResultUsage(rt, ev); },
-      onDone: () => finishTurn(null),
+      // A result that lands while the emergency stop ends this process still
+      // counts as stopped by it, so journal and replay say it was pressed
+      // (the text that arrived is kept).
+      onDone: () => (inflight.abortedByStop === "emergency"
+        ? finishTurn(stopMessage("emergency"), stopKind("emergency"))
+        : finishTurn(null)),
       onError: (msg, info) => {
         if (inflight.stopRequested) {
           // Every stop is reported as one. Passing null for anything but a
