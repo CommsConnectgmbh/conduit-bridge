@@ -41,6 +41,7 @@ import { issuePairCode, pairPayload, revokeCodesIssuedBy, CODE_TTL_MS } from "./
 import { createAlexaVerifier } from "./alexa-verify.mjs";
 import { handleAlexaRequest } from "./alexa.mjs";
 import { createAlexaSession } from "./alexa-session.mjs";
+import { createEmergencyStop } from "./emergency.mjs";
 import { createSpeaker, findIds } from "./speaker.mjs";
 import { PLAYER_ID } from "./sonos.mjs";
 
@@ -836,7 +837,16 @@ const alexaSession = createAlexaSession({
   longTimeoutMs: ALEXA_TASK_TIMEOUT_MS,
   permissionArgs: CLAUDE_ENGINE.permissionArgs(),
 });
+// Not-Aus (emergency.mjs). Steht hier, weil Alexa ihn als Erste braucht.
+const emergency = createEmergencyStop({ stateDir: LOG_DIR, log });
+if (emergency.active) log("warn", "emergency_stop_active_at_boot", { since: emergency.status().since });
+const EMERGENCY_BLOCKED_MSG = "Emergency stop is on. Nothing runs until you release it in the app (Tasks).";
+
 const askAlexa = async (query, opts) => {
+  if (emergency.active) {
+    log("warn", "alexa_blocked_by_emergency_stop", {});
+    return { code: 503, body: { ok: false, error: "emergency-stop" } };
+  }
   // Claude switched off or misconfigured: Alexa runs nothing either.
   const blocked = enginePolicyBlock(CLAUDE_ENGINE);
   if (blocked) {
@@ -1065,8 +1075,29 @@ async function handleApi(req, res, u, auth) {
       journal: journal.status(),
       // Features a client can rely on: turnStatus on every turn frame, the
       // /messages and /inflight fields.
-      features: { turnStatus: 1 },
+      // emergencyStop: POST /api/emergency-stop|release; readOnly: prompt
+      // frames take `readOnly: true`.
+      features: { turnStatus: 1, emergencyStop: 1, readOnly: 1 },
+      emergencyStop: emergency.status(),
     });
+  }
+
+  // Not-Aus: stops every run of every chat and blocks new ones until released.
+  if (path === "/api/emergency" && req.method === "GET") {
+    return json(res, 200, { ok: true, emergencyStop: emergency.status() });
+  }
+  if (path === "/api/emergency-stop" && req.method === "POST") {
+    const r = engageEmergencyStop(email);
+    return json(res, 200, { ok: true, emergencyStop: emergency.status(), stopped: r.stopped, dropped: r.dropped, persisted: r.persisted });
+  }
+  if (path === "/api/emergency-release" && req.method === "POST") {
+    const r = emergency.release();
+    if (r.released === false && emergency.active) {
+      return json(res, 500, { ok: false, error: "Could not save the release on the computer. The emergency stop stays on." });
+    }
+    log("warn", "emergency_stop_released", { by: email });
+    for (const rt of runtime.values()) broadcast(rt, { type: "emergency", active: false });
+    return json(res, 200, { ok: true, emergencyStop: emergency.status() });
   }
 
   // Paired devices of this account: list, revoke, and a pairing code for a
@@ -1575,7 +1606,7 @@ function maybeFlushQueue(rt) {
     turnStatus: "running",
   });
   log("info", "queue_flush_start", { sid: rt.sid, remaining: rt.promptQueue.length });
-  spawnInflight(rt, next.sess, next.content, next.assistantId, next.userMessageId, next.engine, next.model);
+  spawnInflight(rt, next.sess, next.content, next.assistantId, next.userMessageId, next.engine, next.model, { readOnly: next.readOnly === true });
 }
 
 function broadcast(rt, obj) {
@@ -1644,13 +1675,15 @@ function killInflight(rt, reason) {
   // that stale kill happens to make room for a fresh turn, not to abandon work.
   // The optional orphan limit does the same: it exists to end unobserved work,
   // so starting the next queued prompt right after it would defeat it.
-  if ((reason === "client_stop" || reason === "orphan") && rt.promptQueue?.length) {
+  if ((reason === "client_stop" || reason === "orphan" || reason === "emergency") && rt.promptQueue?.length) {
     log("info", "queue_cleared_on_stop", { sid: rt.sid, count: rt.promptQueue.length, reason });
     // Their placeholders were written as 'queued'; left alone they would read
     // as still waiting forever.
     const why = reason === "orphan"
       ? { error: "Not started: no app was connected to the bridge for the configured limit (CONDUIT_ORPHAN_GRACE_MS). It was not run.", kind: "orphan" }
-      : { error: "Cancelled with Stop before it started. It was not run.", kind: "stopped" };
+      : reason === "emergency"
+        ? { error: "Not started: the emergency stop was pressed. It was not run.", kind: "emergency" }
+        : { error: "Cancelled with Stop before it started. It was not run.", kind: "stopped" };
     for (const q of rt.promptQueue) {
       recordTurnEnd(rt, { assistantId: q.assistantId, userMessageId: q.userMessageId, engine: q.engine, model: q.model, content: "" },
         "not_started", why);
@@ -1872,11 +1905,13 @@ const TURN_MESSAGES = {
 function stopMessage(reason) {
   if (reason === "client_stop") return "Stopped. The answer is incomplete.";
   if (reason === "orphan") return `Stopped after ${Math.round(ORPHAN_CHILD_GRACE_MS / 60000)} minutes in which no app was connected to the bridge (CONDUIT_ORPHAN_GRACE_MS). The answer is incomplete.`;
+  if (reason === "emergency") return "Stopped by the emergency stop. The answer is incomplete.";
   return "Interrupted. The answer is incomplete.";
 }
 function stopKind(reason) {
   if (reason === "client_stop") return "stopped";
   if (reason === "orphan") return "orphan";
+  if (reason === "emergency") return "emergency";
   if (reason === "dead_on_new_prompt") return "superseded";
   if (reason === "session_delete") return "deleted";
   return "interrupted";
@@ -2038,6 +2073,28 @@ function applyResultUsage(rt, ev, engine = null) {
 // subprocesses) with nothing to stop them.
 const MAX_CONCURRENT_TURNS = intEnv("CONDUIT_MAX_CONCURRENT_TURNS", Math.max(4, WARM_MAX * 2), 1, 1000);
 
+/**
+ * Not-Aus drücken: jeden laufenden Lauf aller Chats stoppen, alle
+ * Warteschlangen verwerfen, warme Prozesse und Alexa beenden. Neue Läufe
+ * lehnt spawnInflight ab, bis er gelöst ist. Zweimal drücken stoppt erneut.
+ */
+function engageEmergencyStop(by) {
+  const st = emergency.engage(by);
+  let stopped = 0, dropped = 0;
+  for (const rt of runtime.values()) {
+    dropped += rt.promptQueue?.length || 0;
+    if (rt.inflight && !rt.inflight.done) stopped++;
+    try { killInflight(rt, "emergency"); } catch (e) { log("error", "emergency_kill_failed", { sid: rt.sid, err: String(e?.message || e).slice(0, 200) }); }
+    broadcast(rt, { type: "emergency", active: true, since: st.since });
+  }
+  // Idle warm processes hold no turn, but "everything off" means off; the
+  // next turn after the release resumes the conversation.
+  try { warmPool?.killAll(); } catch {}
+  try { alexaSession.stop?.("emergency"); } catch {}
+  log("warn", "emergency_stop_engaged", { by, stopped, dropped, already: st.already, persisted: st.persisted });
+  return { stopped, dropped, persisted: st.persisted };
+}
+
 function activeTurnCount() {
   let n = 0;
   for (const r of runtime.values()) {
@@ -2046,7 +2103,16 @@ function activeTurnCount() {
   return n;
 }
 
-function spawnInflight(rt, sess, prompt, assistantId, userMessageId = null, engine = null, model = null) {
+function spawnInflight(rt, sess, prompt, assistantId, userMessageId = null, engine = null, model = null, opts = {}) {
+  const readOnly = opts.readOnly === true;
+  // Not-Aus first: nothing starts while it is on, not even a queued prompt.
+  if (emergency.active) {
+    log("warn", "turn_blocked_by_emergency_stop", { sid: rt.sid });
+    recordTurnEnd(rt, { assistantId, userMessageId, engine: engine || rt.engine, model, startedAt: Date.now(), content: "" }, "error", { error: EMERGENCY_BLOCKED_MSG, kind: "emergency" });
+    broadcast(rt, { type: "error", message: EMERGENCY_BLOCKED_MSG, assistantMessageId: assistantId, turnStatus: "error" });
+    maybeFlushQueue(rt);
+    return;
+  }
   // rt.inflight is set by the callers only *inside* the spawn functions, so at
   // this point this turn is not yet counted — hence >= against the ceiling.
   if (activeTurnCount() >= MAX_CONCURRENT_TURNS) {
@@ -2072,6 +2138,16 @@ function spawnInflight(rt, sess, prompt, assistantId, userMessageId = null, engi
     maybeFlushQueue(rt);
     return;
   }
+  // Read-only only where the engine can enforce it itself (Claude's tool
+  // options) or has no tools at all. Never run such a turn with full rights.
+  if (readOnly && !engineDef.supportsReadOnly && engineDef.capabilities?.tools !== false) {
+    const message = `${engineDef.name} cannot run read-only on this bridge. Switch the chat to Claude for read-only runs.`;
+    log("warn", "turn_blocked_read_only_unsupported", { sid: rt.sid, engine: engineDef.id });
+    recordTurnEnd(rt, { assistantId, userMessageId, engine: engineDef.id, model, startedAt: Date.now(), content: "" }, "error", { error: message, kind: "policy" });
+    broadcast(rt, { type: "error", message, assistantMessageId: assistantId, turnStatus: "error" });
+    maybeFlushQueue(rt);
+    return;
+  }
   // Der Warm-Pool ist eine Eigenschaft der Engine, keine Eigenschaft des
   // Turns: nur eine CLI, die einen langlebigen Prozess mit stream-json-Eingabe
   // beherrscht, kann darüber laufen. Ist er abgeschaltet (CONDUIT_WARM=0),
@@ -2080,15 +2156,15 @@ function spawnInflight(rt, sess, prompt, assistantId, userMessageId = null, engi
   // "interrupted" (tools may have run), not as "never started".
   recordTurnAccepted(rt, { state: "running", assistantId, userMessageId, engine: engineDef.id, model: model || rt.model || sess.model });
   if (engineDef.usesWarmPool && warmPool) {
-    return spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId, model || rt.model || sess.model);
+    return spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId, model || rt.model || sess.model, { readOnly });
   }
-  return runInflightTurn(engineDef, rt, sess, prompt, assistantId, userMessageId, model || rt.model || sess.model);
+  return runInflightTurn(engineDef, rt, sess, prompt, assistantId, userMessageId, model || rt.model || sess.model, { readOnly });
 }
 
 // V3.0: stream the turn through the warm process pool (token-by-token, no boot).
 // On an early failure it transparently falls back to a one-shot spawn so the
 // user always gets an answer even if the warm path misbehaves.
-function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null, model = null) {
+function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null, model = null, opts = {}) {
   const spawnCwd = sessionSpawnCwd(sess);
 
   const inflight = {
@@ -2096,6 +2172,7 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null, 
     engine: CLAUDE_ENGINE.id, model: model || rt.model || sess?.model || null,
     proc: null,             // warm: the pool owns the long-lived process
     warm: true, stopRequested: false, fellBack: false,
+    readOnly: opts.readOnly === true,
     lastOutputAt: Date.now(),
     startedAt: Date.now(),
     seq: 0,
@@ -2135,7 +2212,7 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null, 
       return;
     }
     rt.inflight = null;
-    runInflightTurn(CLAUDE_ENGINE, rt, sess, prompt, assistantId, userMessageId);
+    runInflightTurn(CLAUDE_ENGINE, rt, sess, prompt, assistantId, userMessageId, null, { readOnly: inflight.readOnly });
   };
   const finishTurn = (errorMsg, kind = null) => {
     if (inflight.done) return;
@@ -2223,13 +2300,13 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null, 
   inflight.heartbeatTimer.unref?.();
   armStall();
 
-  log("info", "spawn_claude", { sid: rt.sid, hasResume: !!rt.claudeSessionId, len: prompt.length, warm: true });
+  log("info", "spawn_claude", { sid: rt.sid, hasResume: !!rt.claudeSessionId, len: prompt.length, warm: true, readOnly: inflight.readOnly });
 
   warmPool.runTurn({
     // The model goes along explicitly: `sess` is the row as read before this
     // prompt stored its choice, so a switch (Opus → Fable) used to reach the
     // warm process only on the turn after.
-    sid: rt.sid, sess, cwd: spawnCwd, prompt, model,
+    sid: rt.sid, sess, cwd: spawnCwd, prompt, model, readOnly: inflight.readOnly,
     handlers: {
       onSessionId: (id) => rememberConversation(CLAUDE_ENGINE, rt, id),
       onChunk: (text) => {
@@ -2458,7 +2535,8 @@ function startHttpTransport(engine, { request, hooks }) {
  * Handle ist der Rest wieder für alle gleich — auch für eine Engine, die gar
  * keinen Prozess hat.
  */
-function runInflightTurn(engine, rt, sess, prompt, assistantId, userMessageId = null, model = null) {
+function runInflightTurn(engine, rt, sess, prompt, assistantId, userMessageId = null, model = null, opts = {}) {
+  const readOnly = opts.readOnly === true;
   const targetModel = engine.resolveModel(model || rt.model || sess.model);
   const resumeId = engine.conversation.read(rt, sess) || null;
   // Eine Fortsetzungs-Id, die bisher nur in der Session-Zeile stand, gehört ab
@@ -2672,6 +2750,7 @@ function runInflightTurn(engine, rt, sess, prompt, assistantId, userMessageId = 
         // im unsicheren Kontext ein "id-<ts>-<rand>", das die CLI zurückweist.
         sessionId: isUuid(rt.sid) ? rt.sid : null,
         systemAppend: engine.id === "claude" ? journalContext : null,
+        readOnly,
       });
       proc = startChildTransport(engine, { cwd: spawnCwd, args, hooks, sid: ENGINES_WITH_JOURNAL_CONTEXT.has(engine.id) ? rt.sid : null });
     }
@@ -2859,6 +2938,8 @@ function handleSocket(ws) {
       // resends it; without the id it cannot tell "you never got this" from
       // "you got it and refused it", so a refusal was retried until the attempt
       // budget ran out and the real reason was buried under a generic timeout.
+      // The client may restrict its own turn to reading (never widen it).
+      const readOnly = msg.readOnly === true;
       const promptBytes = Buffer.byteLength(msg.content, "utf8");
       if (promptBytes > MAX_PROMPT_BYTES) {
         send({ type: "error", assistantMessageId: msg.assistantMessageId, message: `Message too long (${promptBytes} bytes, max ${MAX_PROMPT_BYTES}). Please attach it as a file.` });
@@ -2950,7 +3031,7 @@ function handleSocket(ws) {
             const qUser = msg.userMessageId || cryptoRandom();
             try { insertUserMessage(sid, qUser, msg.content); } catch { /* dup id ignored */ }
             const qAsst = newAssistantId(sid, msg.assistantMessageId, qUser, targetModel, targetEngine);
-            rt.promptQueue.push({ content: msg.content, userMessageId: qUser, assistantId: qAsst, sess: sess2, engine: targetEngine, model: targetModel });
+            rt.promptQueue.push({ content: msg.content, userMessageId: qUser, assistantId: qAsst, sess: sess2, engine: targetEngine, model: targetModel, readOnly });
             recordTurnAccepted(rt, { state: "queued", assistantId: qAsst, userMessageId: qUser, engine: targetEngine, model: targetModel, queuePosition: rt.promptQueue.length });
             broadcast(rt, { type: "queued", userMessageId: qUser, assistantMessageId: qAsst, queuePosition: rt.promptQueue.length, turnStatus: "queued" });
             rt.inflight = null;
@@ -2988,6 +3069,7 @@ function handleSocket(ws) {
             sess,
             engine: targetEngine,
             model: targetModel,
+            readOnly,
           });
           recordTurnAccepted(rt, { state: "queued", assistantId: qAssistantId, userMessageId: qUserMsgId, engine: targetEngine, model: targetModel, queuePosition: rt.promptQueue.length });
           broadcast(rt, {
@@ -3032,7 +3114,7 @@ function handleSocket(ws) {
       rt.claudeSessionId = sess.claude_session_id || rt.claudeSessionId || null;
       rt.lastUsed = Date.now();
 
-      spawnInflight(rt, sess, msg.content, assistantId, userMsgId, targetEngine, targetModel);
+      spawnInflight(rt, sess, msg.content, assistantId, userMsgId, targetEngine, targetModel, { readOnly });
     }
    } catch (e) {
      log("error", "ws_message_failed", { sid, err: String(e?.stack || e).slice(0, 500) });

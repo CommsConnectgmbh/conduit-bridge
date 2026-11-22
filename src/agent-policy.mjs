@@ -115,6 +115,42 @@ export function claudePermissionArgs(p) {
   return args;
 }
 
+// Lesemodus (Conduit 2.0, Phase 2): für alles, was nicht der Besitzer live
+// auslöst, und für Chats, die er selbst auf „nur lesen" stellt. Die Rechte
+// kommen aus den Optionen der CLI, nicht aus einer Bitte im Prompt:
+//   --tools          nur diese eingebauten Werkzeuge existieren überhaupt
+//                    (kein Bash, Edit, Write, NotebookEdit, WebFetch, WebSearch,
+//                    Task, Skill …). Auch Websuche fehlt absichtlich: ein Text,
+//                    den der Agent gelesen hat, soll keinen Weg nach draußen
+//                    finden, und eine Suchanfrage wäre einer.
+//   --strict-mcp-config  ohne --mcp-config: kein einziger MCP-Server, also auch
+//                    keine Mail-, CRM- oder Kalender-Werkzeuge mit Schreibrecht.
+//   dontAsk + prompts none  alles, was nicht vorab erlaubt ist, wird abgelehnt
+//                    statt erfragt; bypassPermissions ist ausgeschlossen.
+// Geprüft gegen claude 2.1.322: das init-Event meldet tools [Glob, Grep, Read],
+// mcp_servers [], permissionMode dontAsk; Schreiben und Shell scheitern.
+export const CLAUDE_READ_ONLY_TOOLS = ["Read", "Grep", "Glob"];
+
+/**
+ * Argumente für einen Claude-Lauf im Lesemodus. Ersetzt claudePermissionArgs
+ * vollständig; was der Betreiber zusätzlich verboten hat (disallowedTools,
+ * settings), gilt weiter, denn der Lesemodus darf nie mehr erlauben als die
+ * Richtlinie.
+ */
+export function claudeReadOnlyArgs(p) {
+  const tools = CLAUDE_READ_ONLY_TOOLS.join(",");
+  const args = [
+    "--permission-mode", "dontAsk",
+    "--permission-prompts", "none",
+    "--tools", tools,
+    "--allowedTools", tools,
+    "--strict-mcp-config",
+  ];
+  if (p?.disallowedTools?.length) args.push("--disallowedTools", p.disallowedTools.join(","));
+  if (p?.settings) args.push("--settings", p.settings);
+  return args;
+}
+
 /**
  * Argumente für `codex exec` und `codex exec resume`.
  *

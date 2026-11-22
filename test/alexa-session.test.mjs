@@ -187,3 +187,23 @@ test("re-init after a miss fails: one attempt, 502, nothing persisted, next requ
     assert.equal(c.length, 4);
     assert.ok(c[3].sessionId && c[3].sessionId !== c[2].sessionId, "fresh id, no 'already in use'");
   }));
+
+test("stop() ends a running question at once and the session takes the next one", () =>
+  withBridge(async (bridge, dirs) => {
+    control(dirs, { delayMs: 20_000 });
+    const t0 = Date.now();
+    const pending = bridge.session.ask("lange frage", { long: true });
+    while (!calls(dirs).length && Date.now() - t0 < 5000) await new Promise((r) => setTimeout(r, 25));
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(bridge.session.busy, true);
+    assert.equal(bridge.session.stop(), true);
+    const r = await pending;
+    assert.equal(r.code, 503);
+    assert.equal(r.body.error, "stopped");
+    assert.ok(Date.now() - t0 < 10_000, "stop waited for the run to finish");
+    assert.equal(bridge.session.busy, false);
+    assert.equal(bridge.session.stop(), false, "stop with nothing running");
+    control(dirs, {});
+    const next = await ask(bridge, "noch eine frage");
+    assert.equal(next.status, 200, JSON.stringify(next.body));
+  }));

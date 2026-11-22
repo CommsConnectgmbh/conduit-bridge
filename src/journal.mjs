@@ -58,7 +58,7 @@ const STATES = new Set(["queued", "running", "ok", "error", "interrupted", "not_
 const KINDS = new Set([
   "stopped", "stall", "startup", "deadline", "orphan", "exit", "signal", "agent_error", "empty",
   "empty_after_tools", "spawn", "policy", "capacity", "bridge_restart",
-  "bridge_shutdown", "superseded", "deleted", "interrupted",
+  "bridge_shutdown", "superseded", "deleted", "interrupted", "emergency",
 ]);
 const STEP_STATES = new Set(["running", "done", "failed", "interrupted"]);
 
@@ -124,6 +124,7 @@ const KIND_LABEL = {
   superseded: "durch neuen Lauf ersetzt",
   deleted: "Chat gelöscht",
   interrupted: "abgebrochen",
+  emergency: "Not-Aus: gestoppt bzw. nicht gestartet",
   unknown: "unbekannt",
 };
 
