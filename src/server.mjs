@@ -2202,8 +2202,10 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null, 
     try { exited = await warmPool.retire(rt.sid); }
     catch (e) { log("error", "warm_retire_failed", { sid: rt.sid, err: String(e?.message || e).slice(0, 200) }); }
     if (rt.inflight !== inflight || inflight.done || rt.deleted) return;
-    if (inflight.stopRequested) {
-      finishTurn(stopMessage(inflight.abortedByStop), stopKind(inflight.abortedByStop));
+    // The emergency stop marks this turn stopped; checking it here as well
+    // means no retry can start while it is on, whatever ordering got us here.
+    if (inflight.stopRequested || emergency.active) {
+      finishTurn(stopMessage(inflight.abortedByStop || "emergency"), stopKind(inflight.abortedByStop || "emergency"));
       return;
     }
     if (!exited) {
