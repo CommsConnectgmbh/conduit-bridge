@@ -378,3 +378,16 @@ test("an answer that completes while the user's Stop ends it is recorded as stop
   await stopBridge("SIGTERM");
   killFakes();
 });
+
+test("an answer that completes while the hard turn limit ends it is recorded as deadline, not ok", { skip: !POSIX, timeout: 60_000 }, async () => {
+  bridge = await startBridge({ warm: true, env: { CONDUIT_MAX_TURN_MS: "2000" } });
+  const c = await client({ sid: SID_B });
+  await c.prompt("R3", "result-on-term", { engine: "claude" });
+  const t = await c.waitFor(isTerminal("a-R3"), "R3 terminal", 20_000);
+  assert.equal(t.type, "error", JSON.stringify(t));
+  const hist = await c.call("GET", `/api/sessions/${SID_B}/messages`);
+  assert.notEqual(hist.body.messages.find((m) => m.id === "a-R3").turnStatus, "ok");
+  await c.close();
+  await stopBridge("SIGTERM");
+  killFakes();
+});
