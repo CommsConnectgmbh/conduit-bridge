@@ -105,6 +105,7 @@ export function createAlexaSession({
       ...permissionArgs, ...sessionArgs, "--", prompt];
     return new Promise((resolve) => {
       let child;
+      if (cancelled) return resolve({ spawnError: null, code: null, stderr: "", text: "", killedByTimeout: false, cancelled: true });
       try {
         child = run(args, { cwd, env: { ...process.env, FORCE_COLOR: "0" }, stdio: ["ignore", "pipe", "pipe"] });
       } catch (e) {
@@ -142,11 +143,13 @@ export function createAlexaSession({
       });
       // A failed spawn emits BOTH 'error' and 'close'; the first one wins.
       let done = false;
+      current = child;
       const finish = (r) => {
         if (done) return;
         done = true;
         clearTimeout(killTimer);
-        resolve({ stderr, text: collected, killedByTimeout, ...r });
+        if (current === child) current = null;
+        resolve({ stderr, text: collected, killedByTimeout, cancelled, ...r });
       };
       child.on("close", (code) => finish({ code, spawnError: null }));
       child.on("error", (e) => finish({ code: null, spawnError: e.message }));
@@ -155,6 +158,14 @@ export function createAlexaSession({
 
   let sessionId = load();
   let inFlight = false;
+  // The running CLI process and whether stop() ended the current question.
+  let current = null;
+  let cancelled = false;
+
+  function stoppedReply() {
+    log("warn", "alexa_stopped", {});
+    return { code: 503, body: { ok: false, error: "stopped" } };
+  }
 
   async function askLocked(query, budgetMs) {
     const prompt = `${SYSTEM_HINT}\n\nFrage: ${query}`;
@@ -166,6 +177,7 @@ export function createAlexaSession({
     if (resumeId) {
       log("info", "alexa_spawn", { resume: true, qLen: query.length });
       r = await runClaude(prompt, ["--resume", resumeId], deadline - Date.now());
+      if (r.cancelled) return stoppedReply();
       if (isMissing(r, resumeId)) {
         log("warn", "alexa_session_missing", { ms: Date.now() - started });
         clear();
@@ -180,6 +192,7 @@ export function createAlexaSession({
       const newId = randomUUID();
       log("info", "alexa_spawn", { resume: false, qLen: query.length });
       r = await runClaude(prompt, ["--session-id", newId], deadline - Date.now());
+      if (r.cancelled) return stoppedReply();
       if (!r.killedByTimeout && !r.spawnError && r.code === 0) {
         sessionId = newId;
         save(newId);
@@ -215,11 +228,26 @@ export function createAlexaSession({
       // Claimed before the first await and released only in the finally:
       // concurrent --resume on one session corrupts its transcript.
       inFlight = true;
+      cancelled = false;
       try {
         return await askLocked(query, long ? longTimeoutMs : timeoutMs);
       } finally {
         inFlight = false;
       }
+    },
+    /**
+     * End the running question, if any (the bridge's emergency stop). SIGTERM,
+     * then SIGKILL; the question answers with error "stopped".
+     */
+    stop() {
+      if (!inFlight) return false;
+      cancelled = true;
+      const child = current;
+      if (child) {
+        try { child.kill("SIGTERM"); } catch {}
+        setTimeout(() => { try { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); } catch {} }, 1500).unref?.();
+      }
+      return true;
     },
     /** A turn is running (a restart now would kill it). */
     get busy() { return inFlight; },

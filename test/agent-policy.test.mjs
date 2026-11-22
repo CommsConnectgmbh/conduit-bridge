@@ -199,3 +199,27 @@ test("warm pool: policy flags reach the CLI and a refusal is reported before the
       pool.killAll();
     }
   });
+
+test("read-only runs get only Read/Grep/Glob, no MCP server and no bypass, whatever the policy", async () => {
+  const { claudeReadOnlyArgs, CLAUDE_READ_ONLY_TOOLS } = await import("../src/agent-policy.mjs");
+  assert.deepEqual(CLAUDE_READ_ONLY_TOOLS, ["Read", "Grep", "Glob"]);
+  const full = readAgentPolicy({});
+  assert.deepEqual(claudeReadOnlyArgs(full.claude), [
+    "--permission-mode", "dontAsk", "--permission-prompts", "none",
+    "--tools", "Read,Grep,Glob", "--allowedTools", "Read,Grep,Glob", "--strict-mcp-config",
+  ]);
+  // The operator's own bans and settings still apply on top; their allow list
+  // never widens the read-only set.
+  const settings = join(dir, "ro-settings.json");
+  writeFileSync(settings, "{}");
+  const strict = readAgentPolicy({
+    CONDUIT_CLAUDE_PERMISSION_MODE: "acceptEdits",
+    CONDUIT_CLAUDE_ALLOWED_TOOLS: "Bash,Write",
+    CONDUIT_CLAUDE_DISALLOWED_TOOLS: "Grep",
+    CONDUIT_CLAUDE_SETTINGS: settings,
+  });
+  const args = claudeReadOnlyArgs(strict.claude);
+  assert.ok(!args.includes("bypassPermissions") && !args.includes("acceptEdits"));
+  assert.ok(!args.join(" ").includes("Bash") && !args.join(" ").includes("Write"));
+  assert.deepEqual(args.slice(-4), ["--disallowedTools", "Grep", "--settings", settings]);
+});

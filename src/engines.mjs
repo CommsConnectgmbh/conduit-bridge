@@ -21,7 +21,7 @@ import { accessSync, readFileSync, statSync, constants as FS } from "node:fs";
 import { listMessages, setClaudeSessionId, setAgyConversationId, setCodexThreadId } from "./db.mjs";
 import { claudeAlias, claudeModels, noteClaudeModel, agyModels, refreshAgyModels, looksLikeGeminiModel } from "./models.mjs";
 import {
-  readAgentPolicy, claudePermissionArgs, codexPermissionArgs, agyPermissionArgs, deniedNotice,
+  readAgentPolicy, claudePermissionArgs, claudeReadOnlyArgs, codexPermissionArgs, agyPermissionArgs, deniedNotice,
 } from "./agent-policy.mjs";
 
 // Rechte-Einstellung der Firma (agent-policy.mjs). Einmal beim Start gelesen,
@@ -107,15 +107,20 @@ const CLAUDE = {
 
   // Dieselben Rechte für Ein-Turn-Pfad, Warm-Pool und Alexa. Voreinstellung
   // bleibt bypassPermissions; siehe agent-policy.mjs.
-  permissionArgs() { return claudePermissionArgs(AGENT_POLICY.claude); },
+  // readOnly: der Lesemodus (agent-policy.mjs, claudeReadOnlyArgs).
+  permissionArgs({ readOnly = false } = {}) {
+    return readOnly ? claudeReadOnlyArgs(AGENT_POLICY.claude) : claudePermissionArgs(AGENT_POLICY.claude);
+  },
+  // Kann einen Lauf so starten, dass er nur lesen darf.
+  supportsReadOnly: true,
 
-  buildArgs({ prompt, model, resumeId, sessionId, systemAppend = null }) {
+  buildArgs({ prompt, model, resumeId, sessionId, systemAppend = null, readOnly = false }) {
     const args = [
       "-p",
       "--model", model,
       "--output-format", "stream-json",
       "--verbose",
-      ...this.permissionArgs(),
+      ...this.permissionArgs({ readOnly }),
     ];
     // Bridge context (journal + checkpoint file), never text from the device.
     if (systemAppend) args.push("--append-system-prompt", systemAppend);

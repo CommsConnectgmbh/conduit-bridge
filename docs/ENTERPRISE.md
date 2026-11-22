@@ -126,6 +126,16 @@ Antigravity has no permission modes or tool lists on its command line. In a test
 
 No tools, nothing to restrict. Text in, text out.
 
+### Read-only runs
+
+A client can restrict a single message to reading by sending `readOnly: true` with the prompt (it can never widen the rights). Claude then starts with `--permission-mode dontAsk --permission-prompts none --tools Read,Grep,Glob --allowedTools Read,Grep,Glob --strict-mcp-config`: no shell, no file writes, no web access and no MCP server exist in that run, and `bypassPermissions` is never passed. The operator's `CONDUIT_CLAUDE_DISALLOWED_TOOLS` and `CONDUIT_CLAUDE_SETTINGS` still apply on top. Checked against claude 2.1.322: the run lists only Glob, Grep and Read, no MCP server, and a request to write a file or run a command is refused (`CONDUIT_TEST_REAL_CLAUDE=1 node --test test/readonly-real-claude.test.mjs` repeats the check). A warm process is started for one kind of run only; switching between read-only and normal restarts it. Ollama has no tools and runs as usual. Codex and Antigravity refuse a read-only message instead of running it with their usual rights.
+
+Read access itself is not confined to a folder: a read-only run can read whatever the bridge's user can read.
+
+## Emergency stop
+
+`POST /api/emergency-stop` (inside the end-to-end session; the app's Tasks page has the button) stops every running answer of every chat, drops all queued messages, ends the warm processes and a running Alexa question, and refuses every new run until `POST /api/emergency-release`. Open chats get a frame `{ type: "emergency", active }`. The state is kept in `.emergency-stop.json` in the log folder, so it survives a restart of the bridge; if that file cannot be read it counts as pressed. If the file cannot be written (for example a full disk), the stop still takes effect at once, the answer says `persisted: false` and the app shows a warning: in that case a restart of the bridge would lift it. `GET /api/emergency` and `/api/status` (`emergencyStop`) show it. Stopped and refused runs are recorded with the end `emergency` in the journal.
+
 ## Updates
 
 The bridge checks for a new release every 6 hours (`CONDUIT_SELFUPDATE_INTERVAL_MS`) while idle, downloads it, verifies its Ed25519 signature against the key compiled into the bridge, installs dependencies only from the signed lockfile without install scripts, and restarts under the service manager. A failed install rolls back. There is no setting to accept unsigned packages.

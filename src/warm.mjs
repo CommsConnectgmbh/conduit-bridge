@@ -286,7 +286,7 @@ export function createWarmPool({
     }
   }
 
-  function spawnProc(sid, sess, cwdIn, modelIn) {
+  function spawnProc(sid, sess, cwdIn, modelIn, readOnly = false) {
     // defaultCwd was destructured and never used; an undefined cwd meant the
     // child silently inherited the BRIDGE's working directory.
     const cwd = cwdIn || defaultCwd;
@@ -308,7 +308,7 @@ export function createWarmPool({
       "--verbose",
       // Same policy as the one-shot path (agent-policy.mjs); default
       // bypassPermissions.
-      ...getEngine("claude").permissionArgs(),
+      ...getEngine("claude").permissionArgs({ readOnly }),
     ];
     if (targetModel) args.push("--model", targetModel);
     const systemAppend = systemPromptFor ? systemPromptFor(sid) : null;
@@ -328,6 +328,8 @@ export function createWarmPool({
       lastUsed: Date.now(), lastOutAt: Date.now(),
       claudeSessionId: resumeId || null,
       model: targetModel,
+      // Rechte stehen beim Start fest; ein Wechsel heißt neuer Prozess.
+      readOnly: !!readOnly,
       stdoutBuf: "", stderrBuf: "", turn: null,
       // Decode across chunk boundaries; a split multi-byte character would
       // otherwise land in the transcript as U+FFFD.
@@ -357,7 +359,7 @@ export function createWarmPool({
    * handlers: { onSessionId, onChunk, onToolUse, onToolResult, onPermissionDenied, onUsageEvent, onDone, onError }
    * Returns true if the turn was started, false if the proc was busy.
    */
-  function runTurn({ sid, sess, cwd, prompt, model: modelIn, handlers }) {
+  function runTurn({ sid, sess, cwd, prompt, model: modelIn, readOnly = false, handlers }) {
     let p = procs.get(sid);
     let targetModel = modelIn || sess?.model || model;
     // Dieselbe Abbildung wie im Prozess-Pfad. Vorher standen hier exakte
@@ -369,11 +371,13 @@ export function createWarmPool({
     // afterwards meant a concurrent turn with a different cwd silently killed
     // the one already streaming instead of being told the session is busy.
     if (p && p.alive && p.busy) { handlers.onError?.("warm proc busy"); return false; }
-    if (!p || !p.alive) p = spawnProc(sid, sess, cwd, targetModel);
-    // Compare against effective cwd and model. If changed, respawn.
-    else if (p.cwd !== (cwd || defaultCwd) || (p.model && targetModel && p.model !== targetModel)) {
+    if (!p || !p.alive) p = spawnProc(sid, sess, cwd, targetModel, readOnly);
+    // Compare against effective cwd, model and rights. If changed, respawn: a
+    // process started with full rights must never run a read-only turn, and
+    // a read-only one never a normal turn.
+    else if (p.cwd !== (cwd || defaultCwd) || (p.model && targetModel && p.model !== targetModel) || p.readOnly !== !!readOnly) {
       killProc(p, "config_change");
-      p = spawnProc(sid, sess, cwd, targetModel);
+      p = spawnProc(sid, sess, cwd, targetModel, readOnly);
     }
     // Pool saturated with busy procs. Caller falls back / surfaces the error;
     // the turn is not started rather than pushed onto an unbounded pool.
