@@ -1697,7 +1697,9 @@ function killInflight(rt, reason) {
     // Mark it, like the stall path does. Without a flag the close handler maps
     // SIGTERM onto the `done` branch, so a turn the user cancelled came back as
     // a completed answer with whatever text had arrived so far.
-    inf.abortedByStop = reason;
+    // The first reason wins: a later kill (a new prompt finding the stopped
+    // process) must not turn an emergency or user stop into "superseded".
+    inf.abortedByStop = inf.abortedByStop || reason;
     // Kindprozess: eskalierendes Signal. HTTP: AbortController. Welches davon,
     // entscheidet das Transport-Handle — hier steht nur noch „abbrechen".
     inf.proc.stop(`killInflight:${reason}`);
@@ -1707,7 +1709,9 @@ function killInflight(rt, reason) {
     // covered the one-shot path, so on the warm path — the normal one — a
     // cancelled turn still came back as a finished answer.
     inf.stopRequested = true;
-    inf.abortedByStop = reason;
+    // The first reason wins: a later kill (a new prompt finding the stopped
+    // process) must not turn an emergency or user stop into "superseded".
+    inf.abortedByStop = inf.abortedByStop || reason;
     warmPool.stop(rt.sid);
   } else {
     return;

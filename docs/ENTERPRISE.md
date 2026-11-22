@@ -134,7 +134,7 @@ Read access itself is not confined to a folder: a read-only run can read whateve
 
 ## Emergency stop
 
-`POST /api/emergency-stop` (inside the end-to-end session; the app's Tasks page has the button) stops every running answer of every chat, drops all queued messages, ends the warm processes and a running Alexa question, and refuses every new run until `POST /api/emergency-release`. Open chats get a frame `{ type: "emergency", active }`. The state is kept in `.emergency-stop.json` in the log folder, so it survives a restart of the bridge; if that file cannot be read it counts as pressed. `GET /api/emergency` and `/api/status` (`emergencyStop`) show it. Stopped and refused runs are recorded with the end `emergency` in the journal.
+`POST /api/emergency-stop` (inside the end-to-end session; the app's Tasks page has the button) stops every running answer of every chat, drops all queued messages, ends the warm processes and a running Alexa question, and refuses every new run until `POST /api/emergency-release`. Open chats get a frame `{ type: "emergency", active }`. The state is kept in `.emergency-stop.json` in the log folder, so it survives a restart of the bridge; if that file cannot be read it counts as pressed. If the file cannot be written (for example a full disk), the stop still takes effect at once, the answer says `persisted: false` and the app shows a warning: in that case a restart of the bridge would lift it. `GET /api/emergency` and `/api/status` (`emergencyStop`) show it. Stopped and refused runs are recorded with the end `emergency` in the journal.
 
 ## Updates
 
