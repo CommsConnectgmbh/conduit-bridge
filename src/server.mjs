@@ -42,6 +42,7 @@ import { createAlexaVerifier } from "./alexa-verify.mjs";
 import { handleAlexaRequest } from "./alexa.mjs";
 import { createAlexaSession } from "./alexa-session.mjs";
 import { createEmergencyStop } from "./emergency.mjs";
+import { spokenPrompt } from "./spoken.mjs";
 import { createSpeaker, findIds } from "./speaker.mjs";
 import { PLAYER_ID } from "./sonos.mjs";
 
@@ -1076,8 +1077,9 @@ async function handleApi(req, res, u, auth) {
       // Features a client can rely on: turnStatus on every turn frame, the
       // /messages and /inflight fields.
       // emergencyStop: POST /api/emergency-stop|release; readOnly: prompt
-      // frames take `readOnly: true`.
-      features: { turnStatus: 1, emergencyStop: 1, readOnly: 1 },
+      // frames take `readOnly: true`; spokenReplies: prompt frames take
+      // `spoken: true` (short answer first, details after a "---" line).
+      features: { turnStatus: 1, emergencyStop: 1, readOnly: 1, spokenReplies: 1 },
       emergencyStop: emergency.status(),
     });
   }
@@ -1606,7 +1608,7 @@ function maybeFlushQueue(rt) {
     turnStatus: "running",
   });
   log("info", "queue_flush_start", { sid: rt.sid, remaining: rt.promptQueue.length });
-  spawnInflight(rt, next.sess, next.content, next.assistantId, next.userMessageId, next.engine, next.model, { readOnly: next.readOnly === true });
+  spawnInflight(rt, next.sess, next.content, next.assistantId, next.userMessageId, next.engine, next.model, { readOnly: next.readOnly === true, spoken: next.spoken === true });
 }
 
 function broadcast(rt, obj) {
@@ -2159,10 +2161,13 @@ function spawnInflight(rt, sess, prompt, assistantId, userMessageId = null, engi
   // Persisted BEFORE anything is spawned: from this point a crash must read as
   // "interrupted" (tools may have run), not as "never started".
   recordTurnAccepted(rt, { state: "running", assistantId, userMessageId, engine: engineDef.id, model: model || rt.model || sess.model });
+  // The stored user message stays what the user said; only the engine sees
+  // the bridge's spoken-reply instruction.
+  const enginePrompt = opts.spoken === true ? spokenPrompt(prompt) : prompt;
   if (engineDef.usesWarmPool && warmPool) {
-    return spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId, model || rt.model || sess.model, { readOnly });
+    return spawnInflightWarm(rt, sess, enginePrompt, assistantId, userMessageId, model || rt.model || sess.model, { readOnly });
   }
-  return runInflightTurn(engineDef, rt, sess, prompt, assistantId, userMessageId, model || rt.model || sess.model, { readOnly });
+  return runInflightTurn(engineDef, rt, sess, enginePrompt, assistantId, userMessageId, model || rt.model || sess.model, { readOnly });
 }
 
 // V3.0: stream the turn through the warm process pool (token-by-token, no boot).
@@ -2953,6 +2958,9 @@ function handleSocket(ws) {
       // budget ran out and the real reason was buried under a generic timeout.
       // The client may restrict its own turn to reading (never widen it).
       const readOnly = msg.readOnly === true;
+      // Part of a spoken conversation: ask for a short answer that reads well
+      // aloud (spoken.mjs). Changes only the wording, never the rights.
+      const spoken = msg.spoken === true;
       const promptBytes = Buffer.byteLength(msg.content, "utf8");
       if (promptBytes > MAX_PROMPT_BYTES) {
         send({ type: "error", assistantMessageId: msg.assistantMessageId, message: `Message too long (${promptBytes} bytes, max ${MAX_PROMPT_BYTES}). Please attach it as a file.` });
@@ -3044,7 +3052,7 @@ function handleSocket(ws) {
             const qUser = msg.userMessageId || cryptoRandom();
             try { insertUserMessage(sid, qUser, msg.content); } catch { /* dup id ignored */ }
             const qAsst = newAssistantId(sid, msg.assistantMessageId, qUser, targetModel, targetEngine);
-            rt.promptQueue.push({ content: msg.content, userMessageId: qUser, assistantId: qAsst, sess: sess2, engine: targetEngine, model: targetModel, readOnly });
+            rt.promptQueue.push({ content: msg.content, userMessageId: qUser, assistantId: qAsst, sess: sess2, engine: targetEngine, model: targetModel, readOnly, spoken });
             recordTurnAccepted(rt, { state: "queued", assistantId: qAsst, userMessageId: qUser, engine: targetEngine, model: targetModel, queuePosition: rt.promptQueue.length });
             broadcast(rt, { type: "queued", userMessageId: qUser, assistantMessageId: qAsst, queuePosition: rt.promptQueue.length, turnStatus: "queued" });
             rt.inflight = null;
@@ -3083,6 +3091,7 @@ function handleSocket(ws) {
             engine: targetEngine,
             model: targetModel,
             readOnly,
+            spoken,
           });
           recordTurnAccepted(rt, { state: "queued", assistantId: qAssistantId, userMessageId: qUserMsgId, engine: targetEngine, model: targetModel, queuePosition: rt.promptQueue.length });
           broadcast(rt, {
@@ -3127,7 +3136,7 @@ function handleSocket(ws) {
       rt.claudeSessionId = sess.claude_session_id || rt.claudeSessionId || null;
       rt.lastUsed = Date.now();
 
-      spawnInflight(rt, sess, msg.content, assistantId, userMsgId, targetEngine, targetModel, { readOnly });
+      spawnInflight(rt, sess, msg.content, assistantId, userMsgId, targetEngine, targetModel, { readOnly, spoken });
     }
    } catch (e) {
      log("error", "ws_message_failed", { sid, err: String(e?.stack || e).slice(0, 500) });
