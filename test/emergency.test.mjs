@@ -58,3 +58,73 @@ test("a release that cannot be saved leaves the stop on", { skip: process.platfo
     assert.equal(e2.active, true);
   } finally { chmodSync(dir, 0o700); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("a full disk cannot lift the stop on restart: the old file is emptied, which reads as pressed", { skip: process.platform === "win32" || process.getuid?.() === 0 }, () => {
+  const dir = fresh();
+  try {
+    let e = createEmergencyStop({ stateDir: dir });
+    e.engage("o"); e.release();          // leaves {"active":false} on disk
+    chmodSync(dir, 0o500);               // no new file (the temp file) can be created
+    const logs = [];
+    e = createEmergencyStop({ stateDir: dir, log: (l, ev) => logs.push(ev) });
+    const r = e.engage("o");
+    assert.ok(logs.includes("emergency_state_write_failed"));
+    assert.equal(r.persisted, true);
+    assert.equal(e.status().unsaved, false);
+    assert.equal(readFileSync(join(dir, EMERGENCY_FILE), "utf8"), "");
+    // Restart: pressed.
+    assert.equal(createEmergencyStop({ stateDir: dir }).active, true);
+  } finally { chmodSync(dir, 0o700); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("when nothing at all can be written the stop holds in memory and status keeps saying unsaved", { skip: process.platform === "win32" || process.getuid?.() === 0 }, () => {
+  const dir = fresh();
+  try {
+    chmodSync(dir, 0o500);               // no file exists and none can be created
+    const e = createEmergencyStop({ stateDir: dir });
+    const r = e.engage("o");
+    assert.equal(r.persisted, false);
+    assert.equal(e.active, true);
+    // Every later read (the app opening Tasks again) still sees it.
+    assert.equal(e.status().unsaved, true);
+    assert.equal(e.status().unsaved, true);
+    chmodSync(dir, 0o700);
+    // A later press that can save clears the warning.
+    e.engage("o");
+    assert.equal(e.status().unsaved, false);
+    assert.equal(createEmergencyStop({ stateDir: dir }).active, true);
+  } finally { chmodSync(dir, 0o700); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("the state file exists from the first start, so even a first press on a full disk survives a restart", { skip: process.platform === "win32" || process.getuid?.() === 0 }, () => {
+  const dir = fresh();
+  try {
+    createEmergencyStop({ stateDir: dir });
+    assert.deepEqual(JSON.parse(readFileSync(join(dir, EMERGENCY_FILE), "utf8")), { active: false, since: null, by: null });
+    chmodSync(dir, 0o500);
+    const e = createEmergencyStop({ stateDir: dir });
+    assert.equal(e.engage("o").persisted, true);
+    assert.equal(createEmergencyStop({ stateDir: dir }).active, true);
+  } finally { chmodSync(dir, 0o700); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a state file that exists but cannot be read counts as pressed, not as missing", { skip: process.platform === "win32" || process.getuid?.() === 0 }, () => {
+  const dir = fresh();
+  try {
+    createEmergencyStop({ stateDir: dir });      // writes {active:false}
+    chmodSync(join(dir, EMERGENCY_FILE), 0o000);
+    const logs = [];
+    assert.equal(createEmergencyStop({ stateDir: dir, log: (l, ev) => logs.push(ev) }).active, true);
+    assert.ok(logs.includes("emergency_state_unreadable"));
+  } finally { try { chmodSync(join(dir, EMERGENCY_FILE), 0o600); } catch {} rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("if the file cannot be created at the first start, status says unsaved from the start", { skip: process.platform === "win32" || process.getuid?.() === 0 }, () => {
+  const dir = fresh();
+  try {
+    chmodSync(dir, 0o500);
+    const e = createEmergencyStop({ stateDir: dir });
+    assert.equal(e.active, false);
+    assert.equal(e.status().unsaved, true);
+  } finally { chmodSync(dir, 0o700); rmSync(dir, { recursive: true, force: true }); }
+});

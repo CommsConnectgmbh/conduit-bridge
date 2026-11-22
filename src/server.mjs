@@ -2326,7 +2326,14 @@ function spawnInflightWarm(rt, sess, prompt, assistantId, userMessageId = null, 
       onToolResult: (block) => { armStall(); emitActivityEnd(rt, inflight, block); },
       onPermissionDenied: (names) => emitDeniedNotice(rt, inflight, CLAUDE_ENGINE, names),
       onUsageEvent: (ev) => { armStall(); applyResultUsage(rt, ev); },
-      onDone: () => finishTurn(null),
+      // A result that lands while a stop (Stop, emergency stop, orphan limit
+      // …) ends this process still counts as stopped, so journal and replay
+      // say it was stopped (the text that arrived is kept).
+      onDone: () => (inflight.deadlineHit
+        ? finishTurn(inflight.errorMsg, "deadline")
+        : inflight.abortedByStop
+          ? finishTurn(stopMessage(inflight.abortedByStop), stopKind(inflight.abortedByStop))
+          : finishTurn(null)),
       onError: (msg, info) => {
         if (inflight.stopRequested) {
           // Every stop is reported as one. Passing null for anything but a
