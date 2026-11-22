@@ -47,7 +47,7 @@ test("warm: a claude without any output is ended as a startup failure", skipWin,
 });
 
 test("warm: a claude that printed its init may answer later than startupMs", skipWin, async () => {
-  const r = await runOne({ startupMs: 300, env: { FAKE_CLAUDE_INIT_THEN_DELAY_MS: "900" } });
+  const r = await runOne({ startupMs: 2000, env: { FAKE_CLAUDE_INIT_THEN_DELAY_MS: "4000" } });
   assert.equal(r.error, undefined, r.error);
   assert.equal(r.done, true);
   assert.equal(r.chunks.join(""), "late but here");
