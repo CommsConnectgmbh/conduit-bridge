@@ -155,8 +155,10 @@ export function runIsolatedClaude({ bin = "claude", input, cwd, model = null, en
     child.stdout.setEncoding("utf8");
     const feed = (line) => {
       if (!line.trim()) return;
-      let ev; try { ev = JSON.parse(line); } catch { return; }
-      try { onEvent(ev); } catch { /* malformed event: ignore */ }
+      // A line that is not a valid event could have been anything, an init
+      // included: the run is not trusted (fail closed).
+      let ev; try { ev = JSON.parse(line); } catch { problems = problems.length ? problems : ["unreadable_output"]; stop("summarize_failed"); return; }
+      try { onEvent(ev); } catch { problems = problems.length ? problems : ["unreadable_output"]; stop("summarize_failed"); }
     };
     child.stdout.on("data", (chunk) => {
       buf += chunk;
@@ -177,14 +179,16 @@ export function runIsolatedClaude({ bin = "claude", input, cwd, model = null, en
       clearTimeout(deadline);
       clearTimeout(initTimer);
       if (!initOk && !errorClass) { errorClass = "profile_mismatch"; if (!problems.length) problems = ["init_missing"]; }
-      // A run that was stopped keeps no answer: it was never confirmed whole.
-      if (errorClass === "profile_mismatch") text = "";
+
       // Nothing of this run may outlive it (see automation-commands.mjs).
       try { process.kill(-child.pid, "SIGKILL"); } catch { /* group already empty */ }
       register?.(handle, false);
       const durationMs = now() - started;
       if (!errorClass && (!resultSeen || resultIsError || code !== 0)) errorClass = "summarize_failed";
       if (!errorClass && !text.trim()) errorClass = "summarize_failed";
+      // A run that did not end cleanly keeps no answer, whatever the reason:
+      // it was never confirmed whole.
+      if (errorClass) text = "";
       // Published only now, after the whole run was checked: a later event
       // (a contradicting init) could still have withdrawn it.
       if (!errorClass && text) onText?.(text);

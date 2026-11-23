@@ -38,6 +38,8 @@ process.stdin.on("end", () => {
   else if (sc === "exit-empty") { process.exit(0); }
   else if (sc === "second-init-tools") { out(init); out({ ...init, tools: ["Read"] }); say(); done(); }
   else if (sc === "text-then-bad-init") { out(init); say(); out({ ...init, tools: ["Read"] }); done(); }
+  else if (sc === "garbled-last-line") { out(init); say(); done(); process.stdout.write('{"type":"system","subtype":"init","tools":["Ba'); }
+  else if (sc === "text-then-timeout") { out(init); say(); setInterval(() => {}, 1000); return; }
   else if (sc === "bad-init-no-newline") { out(init); say(); done(); process.stdout.write(JSON.stringify({ ...init, tools: ["Bash"] })); }
   process.exit(0);
 });
@@ -58,7 +60,7 @@ test("a confirmed profile yields the answer", { skip: !POSIX }, async () => {
   assert.deepEqual(r.seen, ["fine"], "published once, after the check");
 });
 
-for (const [sc, why] of [
+for (const [sc, why, cls = "profile_mismatch"] of [
   ["no-init", "answer without any init"],
   ["late-init", "answer before the init"],
   ["init-no-tools-field", "init without a tools field"],
@@ -69,10 +71,11 @@ for (const [sc, why] of [
   ["second-init-tools", "a second init that reports a tool"],
   ["text-then-bad-init", "an answer, then an init that contradicts the first (nothing streamed early)"],
   ["bad-init-no-newline", "a contradicting init as the last line without a newline"],
+  ["garbled-last-line", "an unreadable last line", "summarize_failed"],
 ]) {
   test(`fail closed: ${why}`, { skip: !POSIX }, async () => {
     const r = await run(sc);
-    assert.equal(r.errorClass, "profile_mismatch", JSON.stringify(r.problems));
+    assert.equal(r.errorClass, cls, JSON.stringify(r.problems));
     assert.equal(r.text, "", "no text may be kept");
     assert.equal(r.seen.join("").includes("LEAKED"), false, "no text may be streamed");
     assert.ok(r.problems.length > 0);
@@ -89,6 +92,13 @@ test("fail closed: the overall deadline before any init is a profile mismatch, n
   const r = await run("silent", { deadlineMs: 200, initTimeoutMs: 5_000 });
   assert.equal(r.errorClass, "profile_mismatch");
   assert.deepEqual(r.problems, ["init_missing"]);
+});
+
+test("a run that times out after some text keeps none of it", { skip: !POSIX, timeout: 10_000 }, async () => {
+  const r = await run("text-then-timeout", { deadlineMs: 400 });
+  assert.equal(r.errorClass, "summarize_timeout");
+  assert.equal(r.text, "");
+  assert.deepEqual(r.seen, []);
 });
 
 test("checkInit wants every field present and empty", () => {
