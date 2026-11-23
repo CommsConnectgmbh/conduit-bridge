@@ -122,7 +122,9 @@ export function validateConfig(raw, { knownOwners = [] } = {}) {
   let push = null;
   if (raw.push !== undefined) {
     onlyKeys(raw.push, PUSH_KEYS, "push");
-    if (!/^mailto:[^\s@]+@[^\s@]+$/.test(String(raw.push.contact || ""))) throw new ConfigError("invalid_config", "push.contact must be a mailto: address (push services require a contact)");
+    // Sent to the push services (Apple, Google …) in every request: an https
+    // URL keeps a personal address out of it.
+    if (!/^(mailto:[^\s@]+@[^\s@]+|https:\/\/[^\s]{3,200})$/.test(String(raw.push.contact || ""))) throw new ConfigError("invalid_config", "push.contact must be a mailto: address or an https: URL (push services require a contact)");
     push = { contact: raw.push.contact };
   }
 

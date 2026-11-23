@@ -22,21 +22,10 @@ import { b64u, generateVapidPrivateKey, sendPush, validateSubscription, vapidKey
 import { addDays, dayBounds, localDate, systemZone } from "./schedule-time.mjs";
 import { FAILURE_SUMMARY } from "./automation-text.mjs";
 
-export const VAPID_ENV = "CONDUIT_VAPID_PRIVATE_KEY";
+export { VAPID_ENV, takeVapidKeyFromEnv } from "./vapid-env.mjs";
 const VAPID_FILE = "vapid-private.key";
 const VAPID_FP_KEY = "vapid_public_fp";
 const PUSH_TEST_THROTTLE_MS = 60_000;
-
-/**
- * Read the VAPID private key ONCE at start and remove it from process.env, so
- * no child process (every agent run inherits the bridge's environment) can
- * read it. Call before anything is spawned.
- */
-export function takeVapidKeyFromEnv(env = process.env) {
-  const v = env[VAPID_ENV];
-  delete env[VAPID_ENV];
-  return typeof v === "string" && v.trim() ? v.trim() : null;
-}
 
 /**
  * Key resolution, failing closed on a change: a new key would silently
@@ -84,7 +73,7 @@ export function createPhase4({ dbDir, db, emergency, journal = null, log, claude
   function config() { return automations.enabled ? automations._config() : null; }
 
   /** One scheduled run: its own chat (origin schedule), the model without tools. */
-  async function summarize({ run, automation, prompt, cwd, register }) {
+  async function summarize({ run, automation, prompt, cwd, register, deadlineMs }) {
     const cfg = config();
     const sid = randomUUID();
     const userId = randomUUID();
@@ -99,7 +88,7 @@ export function createPhase4({ dbDir, db, emergency, journal = null, log, claude
     summarizing++;
     let r;
     try {
-      r = await runIsolatedClaude({ bin: claudeBin, input: prompt, cwd, model: claudeModel, register });
+      r = await runIsolatedClaude({ bin: claudeBin, input: prompt, cwd, model: claudeModel, register, ...(deadlineMs ? { deadlineMs } : {}) });
     } finally { summarizing--; }
     if (r.text) appendAssistant(assistantId, r.text + (r.truncated ? "\n\n[answer cut at the length limit]" : ""), sid);
     const ok = r.ok;
@@ -113,11 +102,11 @@ export function createPhase4({ dbDir, db, emergency, journal = null, log, claude
     return { ok, errorClass: r.errorClass, sessionId: sid, messageId: assistantId, text: r.text, usage: r.usage, durationMs: r.durationMs };
   }
 
-  async function pushOne(sub, payload) {
+  async function pushOne(sub, payload, signal) {
     if (!vapid.keys) return "off";
     const cfg = config();
     try {
-      const { status } = await sendPush({ subscription: sub, payload, keys: vapid.keys, subject: cfg.push.contact });
+      const { status } = await sendPush({ subscription: sub, payload, keys: vapid.keys, subject: cfg.push.contact, signal });
       if (status >= 200 && status < 300) { recordPushResult(sub.endpoint, "sent"); return "sent"; }
       if (status === 404 || status === 410) { deletePushEndpoint(sub.endpoint); return "failed"; }
       if (status === 401 || status === 403) { recordPushResult(sub.endpoint, "vapid_rejected"); return "vapid_rejected"; }
@@ -129,12 +118,12 @@ export function createPhase4({ dbDir, db, emergency, journal = null, log, claude
     }
   }
 
-  async function pushToOwner({ payload }) {
+  async function pushToOwner({ payload, signal }) {
     const cfg = config();
     if (!cfg?.push || !vapid.keys) return "off";
     const subs = pushSubscriptionsForOwner(cfg.owner);
     if (!subs.length) return "off";
-    const results = await Promise.all(subs.map((s) => pushOne(s, payload)));
+    const results = await Promise.all(subs.map((s) => pushOne(s, payload, signal)));
     return results.includes("sent") ? "sent" : "failed";
   }
 
@@ -144,11 +133,12 @@ export function createPhase4({ dbDir, db, emergency, journal = null, log, claude
   }
 
   /** 7 local days, oldest first. Counted from stored facts only. */
-  function week(email) {
+  function week(email, { withBriefings = true } = {}) {
     const tz = config()?.tz || systemZone();
     const today = localDate(Date.now(), tz);
     const from = addDays(today, -6);
-    const runs = automations.enabled ? automations.runsBetween(from, today) : [];
+    // Briefing facts only for the automations' owner; turns are per account anyway.
+    const runs = automations.enabled && withBriefings ? automations.runsBetween(from, today) : [];
     const days = [];
     for (let i = 6; i >= 0; i--) {
       const date = addDays(today, -i);
@@ -169,7 +159,7 @@ export function createPhase4({ dbDir, db, emergency, journal = null, log, claude
   /** Returns true when the request was handled. */
   async function handle(req, res, u, auth, { json, readJson }) {
     const path = u.pathname;
-    if (path === "/api/week" && req.method === "GET") return json(res, 200, week(auth.email)), true;
+    if (path === "/api/week" && req.method === "GET") return json(res, 200, week(auth.email, { withBriefings: isOwner(auth) })), true;
 
     if (path === "/api/automations" && req.method === "GET") {
       const st = automations.status();

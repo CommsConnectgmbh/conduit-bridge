@@ -1,3 +1,6 @@
+// Must stay the first import: takes secrets out of process.env before any
+// other module can spawn a process (see bridge-secrets.mjs).
+import { VAPID_ENV_KEY } from "./bridge-secrets.mjs";
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { existsSync, appendFileSync, statSync, writeFileSync, realpathSync, mkdtempSync, rmSync } from "node:fs";
@@ -45,14 +48,11 @@ import { createEmergencyStop } from "./emergency.mjs";
 import { spokenPrompt } from "./spoken.mjs";
 import { createSpeaker, findIds } from "./speaker.mjs";
 import { PLAYER_ID } from "./sonos.mjs";
-import { createPhase4, takeVapidKeyFromEnv } from "./phase4.mjs";
+import { createPhase4 } from "./phase4.mjs";
 import { runIsolatedClaude } from "./isolated-claude.mjs";
 import { followUpPrompt } from "./automation-text.mjs";
 import { sessionOrigin, setTurnOrigin, setTurnEnd } from "./db.mjs";
 
-// The Web Push signing key must never reach a child process: every agent run
-// inherits this process's environment. Taken out before anything is spawned.
-const VAPID_ENV_KEY = takeVapidKeyFromEnv(process.env);
 // Automations, week view, Web Push; created just before listen (see below).
 let phase4 = null;
 
@@ -1114,6 +1114,8 @@ async function handleApi(req, res, u, auth) {
     }
     log("warn", "emergency_stop_released", { by: email });
     for (const rt of runtime.values()) broadcast(rt, { type: "emergency", active: false });
+    // Runs held back by the stop continue now, not at their next retry time.
+    try { phase4?.automations.resumeAfterEmergency(); } catch {}
     return json(res, 200, { ok: true, emergencyStop: emergency.status() });
   }
 
@@ -3506,6 +3508,9 @@ function shutdown(sig) {
   try { speech.close(); } catch {}
   try { warmPool?.killAll(); } catch {}
   try { killAllInflightChildren(); } catch {}
+  // Scheduled runs live in their own process groups; without this they would
+  // keep running after the bridge, and the next start would collect again.
+  try { phase4?.automations.killAllNow(); } catch {}
   log("info", "bridge_shutdown", { sig });
   process.exit(0);
 }

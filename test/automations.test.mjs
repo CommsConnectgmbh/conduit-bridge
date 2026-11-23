@@ -32,7 +32,7 @@ const SOURCES_ALL_FAIL = JSON.stringify({ version: 1, sources: [
   { id: "mail", title: "Unread mail", status: "error", count: null, fetchedAt: "2026-11-24T06:00:01+01:00", text: "" },
 ] });
 
-function setup({ collectBody = `cat <<'EOF'\n${SOURCES_OK}\nEOF`, deliver = true, push = true, extra = {}, summarize, emergency = { active: false }, capacity = () => true, clock } = {}) {
+function setup({ pushImpl: pushFn = null, collectBody = `cat <<'EOF'\n${SOURCES_OK}\nEOF`, deliver = true, push = true, extra = {}, summarize, emergency = { active: false }, capacity = () => true, clock } = {}) {
   const dir = sandbox();
   const out = join(dir, "delivered.jsonl");
   const collect = script(dir, "collect", collectBody);
@@ -54,7 +54,7 @@ function setup({ collectBody = `cat <<'EOF'\n${SOURCES_OK}\nEOF`, deliver = true
       knownOwners: () => [OWNER],
       capacity,
       summarize: summarize || (async (x) => { calls.summarize.push(x); return { ok: true, sessionId: "s1", messageId: "m1", text: "Short summary.\n---\nDetails here.", usage: { in: 100, out: 20 }, durationMs: 1234 }; }),
-      push: async (x) => { calls.push.push(x); return "sent"; },
+      push: pushFn || (async (x) => { calls.push.push(x); return "sent"; }),
     },
   });
   const auto = make();
@@ -287,4 +287,74 @@ test("deliverFull adds the full text", async () => {
   const s = setup({ extra: { deliverFull: true } });
   await s.auto.tick();
   assert.equal(s.delivered()[0].full, "Short summary.\n---\nDetails here.");
+});
+
+test("review fix: the bridge's first import takes the VAPID key out before anything can spawn", () => {
+  const src = readFileSync(new URL("../src/server.mjs", import.meta.url), "utf8");
+  const first = src.split("\n").find((l) => /^import\s/.test(l));
+  assert.match(first, /bridge-secrets\.mjs/);
+  const sec = readFileSync(new URL("../src/bridge-secrets.mjs", import.meta.url), "utf8");
+  assert.equal(/^import .*(engines|server|models|phase4)/m.test(sec), false, "bridge-secrets must not pull in modules that spawn");
+});
+
+test("review fix: a push in flight is stopped by the emergency stop and recorded as unknown", async () => {
+  let started;
+  const begun = new Promise((r) => { started = r; });
+  const s = setup({ pushImpl: ({ signal }) => new Promise((resolve) => { started(); signal.addEventListener("abort", () => resolve("failed")); }) });
+  const p = s.auto.tick();
+  await begun;
+  assert.equal(s.auto.activeCount(), 1, "a push in flight counts as busy (self-update waits)");
+  s.emergency.active = true;
+  s.auto.stopAll();
+  await p;
+  assert.equal(s.auto.status().automations[0].lastRun.delivery.push, "unknown");
+});
+
+test("review fix: a deferred manual run is picked up again", async () => {
+  let free = false;
+  const s = setup({ capacity: () => free });
+  s.time.t += 8 * 3600000; // no scheduled slot due
+  const r = s.auto.runNow("briefing");
+  for (let i = 0; i < 50 && s.auto._get(r.runId).errorClass !== "capacity"; i++) await new Promise((x) => setTimeout(x, 10));
+  assert.equal(s.auto._get(r.runId).state, "claimed");
+  free = true;
+  s.time.t += 61_000;
+  await s.auto.tick();
+  assert.equal(s.auto._get(r.runId).state, "done");
+});
+
+test("review fix: capacity is checked again right before the model starts", async () => {
+  let n = 0;
+  const s = setup({ capacity: () => ++n === 1 });
+  await s.auto.tick();
+  const run = s.auto.status().automations[0].lastRun;
+  assert.equal(run.errorClass, "capacity");
+  assert.equal(run.attempts, 0);
+  assert.equal(s.calls.summarize.length, 0);
+});
+
+test("review fix: recovery never allows a fourth attempt", () => {
+  const s = setup();
+  s.db.prepare(`INSERT INTO automation_runs (id, automation_id, kind, slot_date, slot_at, tz, state, attempts, delivery, created_at) VALUES ('r_x', 'briefing', 'manual', NULL, NULL, ?, 'summarizing', ?, '{}', 1)`).run(TZ, MAX_ATTEMPTS);
+  s.auto.sweep();
+  assert.equal(s.auto._get("r_x").state, "failed");
+});
+
+test("review fix: a briefing finished after its window is kept but not delivered", async () => {
+  const s = setup({ summarize: async () => { s.time.t += 7 * 3600000; return { ok: true, sessionId: "s", messageId: "m", text: "Late.\n---\nx", usage: null, durationMs: 1 }; } });
+  await s.auto.tick();
+  const run = s.auto._get(s.db.prepare("SELECT id FROM automation_runs WHERE state <> 'skipped' LIMIT 1").get().id);
+  assert.equal(run.state, "done");
+  assert.equal(run.errorClass, "expired");
+  assert.equal(s.delivered().length, 0);
+  assert.equal(s.calls.push.length, 0);
+});
+
+test("review fix: days the bridge was off are all marked skipped (up to a week)", async () => {
+  const s = setup();
+  s.db.prepare("UPDATE automation_meta SET first_seen = ?").run(s.time.t - 5 * 86400000);
+  s.time.t += 7 * 3600000;
+  await s.auto.tick();
+  const n = s.db.prepare("SELECT COUNT(*) AS n FROM automation_runs WHERE state = 'skipped'").get().n;
+  assert.equal(n, 6, "five earlier days and today");
 });

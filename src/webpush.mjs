@@ -186,7 +186,7 @@ function publicOnlyLookup(hostname, opts, cb) {
  * 404/410 mean the subscription is gone and the caller deletes it.
  * `transport` is injectable for tests.
  */
-export function sendPush({ subscription, payload, keys, subject, ttl = 3600, urgency = "high", now = Date.now(), transport = request }) {
+export function sendPush({ subscription, payload, keys, subject, ttl = 3600, urgency = "high", now = Date.now(), transport = request, signal = undefined }) {
   const u = endpointUrl(subscription.endpoint);
   const body = encryptPayload({ uaPublic: b64u.dec(subscription.p256dh), authSecret: b64u.dec(subscription.auth), plaintext: JSON.stringify(payload) });
   const jwt = vapidJwt({ audience: u.origin, subject, keys, now });
@@ -199,7 +199,7 @@ export function sendPush({ subscription, payload, keys, subject, ttl = 3600, urg
     Authorization: `vapid t=${jwt}, k=${b64u.enc(keys.publicRaw)}`,
   };
   return new Promise((resolve, reject) => {
-    const req = transport({ method: "POST", hostname: u.hostname, port: 443, path: u.pathname + u.search, headers, lookup: publicOnlyLookup, timeout: PUSH_TIMEOUT_MS }, (res) => {
+    const req = transport({ method: "POST", hostname: u.hostname, port: 443, path: u.pathname + u.search, headers, lookup: publicOnlyLookup, timeout: PUSH_TIMEOUT_MS, signal }, (res) => {
       let read = 0;
       res.on("data", (c) => { read += c.length; if (read > MAX_RESPONSE_BYTES) res.destroy(); });
       res.on("end", () => resolve({ status: res.statusCode }));

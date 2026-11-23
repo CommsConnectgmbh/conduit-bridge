@@ -33,6 +33,7 @@ import { checkExecutable, loadAutomationsConfig } from "./automations-config.mjs
 import { COLLECT_TIMEOUT_MS, DELIVER_TIMEOUT_MS, MAX_COLLECT_BYTES, commandEnv, parseCollectOutput, runCommand } from "./automation-commands.mjs";
 import { FAILURE_SUMMARY, deliveryPayload, headerFacts, renderHeader, scheduledPrompt, summaryOf } from "./automation-text.mjs";
 import { addDays, dueSlot, localDate, nextSlot, slotOn } from "./schedule-time.mjs";
+import { SUMMARIZE_DEADLINE_MS } from "./isolated-claude.mjs";
 
 export const MAX_ATTEMPTS = 3;
 export const RETRY_MS = 10 * 60 * 1000;
@@ -148,6 +149,7 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
     lock: db.prepare(`INSERT INTO automation_locks (automation_id, run_id, locked_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`),
     unlock: db.prepare(`DELETE FROM automation_locks WHERE automation_id = ? AND run_id = ?`),
     clearLocks: db.prepare(`DELETE FROM automation_locks`),
+    resumeHeld: db.prepare(`UPDATE automation_runs SET next_attempt_at = ? WHERE state = 'claimed' AND error_class = 'emergency'`),
     isLocked: db.prepare(`SELECT 1 FROM automation_locks WHERE automation_id = ?`),
     runsBetween: db.prepare(`SELECT * FROM automation_runs WHERE kind = 'schedule' AND slot_date >= ? AND slot_date <= ? ORDER BY slot_date ASC`),
   };
@@ -181,9 +183,10 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
     for (const row of Q.open.all()) {
       const r = rowToRun(row);
       if (r.state === "collecting" || r.state === "summarizing") {
-        r.state = "claimed";
+        // The interrupted attempt was counted when it started.
         r.errorClass = "bridge_restart";
-        r.nextAttemptAt = now();
+        if (r.attempts >= MAX_ATTEMPTS) { r.state = "failed"; r.endedAt = now(); }
+        else { r.state = "claimed"; r.nextAttemptAt = now(); }
         save(r);
         log("warn", "automation_run_recovered", { id: r.id, automation: row.automation_id, from: row.state });
       } else if (r.state === "delivering") {
@@ -234,9 +237,14 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
       if (stopped()) r.delivery.push = "held";
       else {
         let res = "failed";
+        const ac = new AbortController();
+        const h = { stop: () => ac.abort(), killNow: () => ac.abort() };
+        register(h, true);
         try {
-          res = await deps.push({ automation: a, run: r, payload: { t: "briefing", a: a.id, r: r.id, title: r.errorClass ? `${a.title}: failed` : `${a.title} ready`, body: "Tap to open" } });
-        } catch { res = "failed"; }
+          res = await deps.push({ automation: a, run: r, signal: ac.signal, payload: { t: "briefing", a: a.id, r: r.id, title: r.errorClass ? `${a.title}: failed` : `${a.title} ready`, body: "Tap to open" } });
+        } catch { res = "failed"; } finally { register(h, false); }
+        // Stopped while sending: it may have reached the push service.
+        if (ac.signal.aborted) res = "unknown";
         r.delivery.push = CHANNEL_STATES.has(res) ? res : "failed";
       }
       save(r);
@@ -260,8 +268,7 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
   }
 
   async function fail(a, r, cls) {
-    const windowEnd = r.slotAt !== null ? r.slotAt + a.windowMs : now();
-    const retry = r.kind === "schedule" && !NON_RETRYABLE.has(cls) && r.attempts < MAX_ATTEMPTS && now() + RETRY_MS < windowEnd;
+    const retry = !NON_RETRYABLE.has(cls) && cls !== "expired" && r.attempts < MAX_ATTEMPTS && now() + RETRY_MS < windowEnd(a, r);
     r.errorClass = cls;
     if (retry) {
       r.state = "claimed";
@@ -277,11 +284,19 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
     await notifyFailure(a, r, cls);
   }
 
+  /** End of the time a run may still deliver in: slot (or creation) + window. */
+  function windowEnd(a, r) {
+    return (r.kind === "schedule" && r.slotAt !== null ? r.slotAt : r.createdAt) + a.windowMs;
+  }
+  const pastWindow = (a, r) => now() >= windowEnd(a, r);
+
   async function execute(a, r) {
     if (!tryLock(a.id, r.id)) return "busy";
     let tmp = null;
     try {
       if (stopped()) { defer(r, "emergency"); return "emergency"; }
+      if (pastWindow(a, r)) { await fail(a, r, "expired"); return "failed"; }
+      if (r.attempts >= MAX_ATTEMPTS) { await fail(a, r, r.errorClass || "summarize_failed"); return "failed"; }
       if (!deps.capacity()) { defer(r, "capacity"); return "capacity"; }
       r.attempts += 1;
       r.state = "collecting";
@@ -296,12 +311,16 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
       save(r);
       if (sources.length && sources.every((s) => s.status === "error")) { await fail(a, r, "all_sources_failed"); return "failed"; }
 
+      if (pastWindow(a, r)) { await fail(a, r, "expired"); return "failed"; }
+      // Collecting took time; live chats may have filled every slot since.
+      if (!deps.capacity()) { r.attempts -= 1; defer(r, "capacity"); return "capacity"; }
       r.state = "summarizing";
       save(r);
       tmp = mkdtempSync(join(workDir, "run-"));
       const date = r.slotDate || localDate(now(), loaded.config.tz);
       const prompt = scheduledPrompt({ title: a.title, date, tz: loaded.config.tz, ownerPrompt: a.prompt, sources });
-      const s = await deps.summarize({ run: r, automation: a, prompt, header: renderHeader(sources), cwd: tmp, register });
+      const s = await deps.summarize({ run: r, automation: a, prompt, header: renderHeader(sources), cwd: tmp, register,
+        deadlineMs: Math.max(1000, Math.min(SUMMARIZE_DEADLINE_MS, windowEnd(a, r) - now())) });
       r.sessionId = s.sessionId ?? r.sessionId;
       r.messageId = s.messageId ?? r.messageId;
       r.durationMs = s.durationMs ?? null;
@@ -310,6 +329,14 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
       if (s.errorClass === "stopped" || stopped()) { r.attempts -= 1; defer(r, "emergency"); return "emergency"; }
       if (!s.ok) { await fail(a, r, s.errorClass || "summarize_failed"); return "failed"; }
       r.summary = summaryOf(s.text);
+      // Written, but the window is over (e.g. the Mac slept meanwhile): keep
+      // it in the app, do not send a morning briefing in the afternoon.
+      if (pastWindow(a, r)) {
+        r.state = "done"; r.errorClass = "expired"; r.endedAt = now();
+        r.delivery = { telegram: "off", push: "off" };
+        save(r);
+        return "done";
+      }
       r.state = "delivering";
       save(r);
       await deliver(a, r, { header: renderHeader(sources), summary: r.summary, fullText: s.text });
@@ -341,7 +368,8 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
     const tz = loaded.config.tz;
     for (const a of loaded.config.automations) {
       // Windows that ended without any run: the bridge was off (skipped).
-      for (const date of [addDays(localDate(t, tz), -1), localDate(t, tz)]) {
+      for (let back = 7; back >= 0; back--) {
+        const date = addDays(localDate(t, tz), -back);
         const s = slotOn(a.schedule, date, tz);
         const since = Q.firstSeen.get(a.id)?.first_seen ?? t;
         if (s && s.slotAt >= since && t >= s.slotAt + a.windowMs && !Q.bySlot.get(a.id, date)) {
@@ -354,12 +382,17 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
       // Open runs whose window is over: expired.
       for (const row of Q.open.all()) {
         const o = rowToRun(row);
-        if (row.automation_id !== a.id || o.kind !== "schedule" || Q.isLocked.get(a.id)) continue;
-        if (o.slotAt !== null && t >= o.slotAt + a.windowMs) {
+        if (row.automation_id !== a.id || Q.isLocked.get(a.id)) continue;
+        if (t >= windowEnd(a, o)) {
           o.state = "failed"; o.errorClass = "expired"; o.endedAt = t; save(o);
           log("warn", "automation_run_expired", { id: o.id, automation: a.id });
           await notifyFailure(a, o, "expired");
         }
+      }
+      // Manual runs that were deferred (emergency stop, no free slot, restart).
+      for (const row of Q.open.all()) {
+        if (row.automation_id !== a.id || row.kind !== "manual" || row.state !== "claimed") continue;
+        if ((row.next_attempt_at ?? 0) <= now() && !Q.isLocked.get(a.id)) await execute(a, rowToRun(row));
       }
       if (!r) continue;
       r = get(r.id);
@@ -407,6 +440,17 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
       return n;
     },
     activeCount() { return active.size; },
+    /** After the emergency stop is released: held runs go on right away. */
+    resumeAfterEmergency() {
+      Q.resumeHeld.run(now());
+      setImmediate(() => tick());
+    },
+    /** Bridge shutdown: the groups are detached and would outlive us. */
+    killAllNow() {
+      if (timer) clearInterval(timer);
+      timer = null;
+      for (const h of [...active]) { try { (h.killNow || h.stop)(); } catch { /* gone */ } }
+    },
 
     status() {
       const t = now();

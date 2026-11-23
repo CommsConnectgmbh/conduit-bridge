@@ -46,7 +46,7 @@ export function runCommand({ argv, stdin = "", timeoutMs, maxBytes = 64 * 1024, 
       killGroup("SIGTERM");
       const t = setTimeout(() => killGroup("SIGKILL"), 3000); t.unref?.();
     };
-    const handle = { stop: () => { stopped = true; end(); }, pid: child.pid };
+    const handle = { stop: () => { stopped = true; end(); }, killNow: () => killGroup("SIGKILL"), pid: child.pid };
     register?.(handle, true);
     const timer = setTimeout(() => { timedOut = true; end(); }, timeoutMs); timer.unref?.();
     child.stdout.on("data", (c) => {

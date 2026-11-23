@@ -84,7 +84,7 @@ export function runIsolatedClaude({ bin = "claude", input, cwd, model = null, en
       const t = setTimeout(() => killGroup("SIGKILL"), 3000);
       t.unref?.();
     };
-    const handle = { stop: () => stop("stopped"), pid: child.pid };
+    const handle = { stop: () => stop("stopped"), killNow: () => killGroup("SIGKILL"), pid: child.pid };
     register?.(handle, true);
 
     const deadline = setTimeout(() => stop("summarize_timeout"), deadlineMs);

@@ -325,5 +325,19 @@ test("scheduled briefing end to end, follow-up, profile check, emergency stop, s
   const all = files.map((n) => readFileSync(join(journalDir, n), "utf8")).join("\n");
   assert.match(all, /Herkunft: `schedule` · Rechte: `scheduled`/);
   assert.match(all, /Herkunft: `live` · Rechte: `full`/);
+
+  // 8. After the release the deferred manual run is picked up again; stopping
+  // the bridge in the middle of its collect kills the detached group too.
+  const t0 = Date.now();
+  let pid2 = pid;
+  while (Date.now() - t0 < 15_000 && (pid2 === pid || !alive(pid2))) {
+    await sleep(250);
+    try { pid2 = Number(readFileSync(collectPidFile, "utf8")); } catch { /* not yet */ }
+  }
+  assert.notEqual(pid2, pid, "a run held by the emergency stop continues right after the release");
+  assert.ok(alive(pid2));
   await c.close();
+  await stopBridge();
+  for (let i = 0; i < 40 && alive(pid2); i++) await sleep(50);
+  assert.equal(alive(pid2), false, "collect outlived the bridge");
 });
