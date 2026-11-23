@@ -8,6 +8,9 @@ import { createAutomations, MAX_ATTEMPTS, RETRY_MS, LATE_AFTER_MS } from "../src
 import { loadAutomationsConfig } from "../src/automations-config.mjs";
 import { zonedTime } from "../src/schedule-time.mjs";
 
+// Automations are POSIX-only (owner/mode checks, process groups, sh scripts).
+const POSIX = process.platform !== "win32";
+const ptest = (name, fn) => test(name, { skip: !POSIX }, fn);
 const TZ = "Europe/Berlin";
 const OWNER = "owner@example.com";
 
@@ -64,7 +67,7 @@ function setup({ deliverBody = null, pushImpl: pushFn = null, collectBody = `cat
   return { dir, db, auto, make, calls, time, delivered, configPath, emergency };
 }
 
-test("config: owner-only file, no unknown fields, argv only, known owner", () => {
+ptest("config: owner-only file, no unknown fields, argv only, known owner", () => {
   const dir = sandbox();
   const prog = script(dir, "c", "true");
   const p = join(dir, "automations.json");
@@ -86,7 +89,7 @@ test("config: owner-only file, no unknown fields, argv only, known owner", () =>
   assert.equal(loadAutomationsConfig(join(dir, "missing.json"), { knownOwners: [OWNER] }).reason, "not_configured");
 });
 
-test("a scheduled run: collect, summarize, deliver header + summary, push", async () => {
+ptest("a scheduled run: collect, summarize, deliver header + summary, push", async () => {
   const s = setup();
   await s.auto.tick();
   const st = s.auto.status();
@@ -112,7 +115,7 @@ test("a scheduled run: collect, summarize, deliver header + summary, push", asyn
   assert.equal(JSON.stringify(s.calls.push[0].payload).includes("Short summary"), false, "push carries no content");
 });
 
-test("never twice per slot: repeated ticks and a restart", async () => {
+ptest("never twice per slot: repeated ticks and a restart", async () => {
   const s = setup();
   await s.auto.tick();
   await s.auto.tick();
@@ -126,7 +129,7 @@ test("never twice per slot: repeated ticks and a restart", async () => {
   assert.equal(s.delivered().length, 1);
 });
 
-test("emergency stop active: nothing runs, no attempt used; after release it runs", async () => {
+ptest("emergency stop active: nothing runs, no attempt used; after release it runs", async () => {
   const marker = join(tmpdir(), `conduit-collect-ran-${process.pid}-${Date.now()}`);
   const s = setup({ emergency: { active: true }, collectBody: `touch "${marker}"\ncat <<'EOF'\n${SOURCES_OK}\nEOF` });
   await s.auto.tick();
@@ -143,7 +146,7 @@ test("emergency stop active: nothing runs, no attempt used; after release it run
   assert.equal(run.attempts, 1);
 });
 
-test("stopAll during collect kills the process group and never delivers", async () => {
+ptest("stopAll during collect kills the process group and never delivers", async () => {
   const s = setup({ collectBody: `sleep 30 & wait` });
   const p = s.auto.tick();
   for (let i = 0; i < 100 && s.auto.activeCount() === 0; i++) await new Promise((r) => setTimeout(r, 20));
@@ -158,7 +161,7 @@ test("stopAll during collect kills the process group and never delivers", async 
   assert.equal(s.calls.summarize.length, 0);
 });
 
-test("emergency stop during summarize: no delivery, no push", async () => {
+ptest("emergency stop during summarize: no delivery, no push", async () => {
   const em = { active: false };
   let release;
   const s = setup({ emergency: em, summarize: async () => { em.active = true; await new Promise((r) => { release = r; setTimeout(r, 10); }); return { ok: false, errorClass: "stopped", sessionId: "s1", messageId: "m1", text: "" }; } });
@@ -170,7 +173,7 @@ test("emergency stop during summarize: no delivery, no push", async () => {
   assert.equal(s.calls.push.length, 0);
 });
 
-test("collect failure: retried with spacing, then failed with one failure notice", async () => {
+ptest("collect failure: retried with spacing, then failed with one failure notice", async () => {
   const s = setup({ collectBody: "exit 3" });
   for (let i = 0; i < MAX_ATTEMPTS + 2; i++) { await s.auto.tick(); s.time.t += RETRY_MS + 1000; }
   const run = s.auto.status().automations[0].lastRun;
@@ -183,7 +186,7 @@ test("collect failure: retried with spacing, then failed with one failure notice
   assert.equal(s.calls.summarize.length, 0);
 });
 
-test("all sources unavailable: no model run, a failure notice instead", async () => {
+ptest("all sources unavailable: no model run, a failure notice instead", async () => {
   const s = setup({ collectBody: `cat <<'EOF'\n${SOURCES_ALL_FAIL}\nEOF` });
   for (let i = 0; i < MAX_ATTEMPTS + 1; i++) { await s.auto.tick(); s.time.t += RETRY_MS + 1000; }
   assert.equal(s.calls.summarize.length, 0);
@@ -192,7 +195,7 @@ test("all sources unavailable: no model run, a failure notice instead", async ()
   assert.equal(s.delivered()[0].errorClass, "all_sources_failed");
 });
 
-test("invalid or oversized collect output fails without retry", async () => {
+ptest("invalid or oversized collect output fails without retry", async () => {
   const s = setup({ collectBody: "echo '{\"version\":2}'" });
   await s.auto.tick();
   assert.equal(s.auto.status().automations[0].lastRun.state, "failed");
@@ -202,7 +205,7 @@ test("invalid or oversized collect output fails without retry", async () => {
   assert.equal(big.auto.status().automations[0].lastRun.errorClass, "collect_too_large");
 });
 
-test("no free turn slot: deferred, attempt not used", async () => {
+ptest("no free turn slot: deferred, attempt not used", async () => {
   let free = false;
   const s = setup({ capacity: () => free });
   await s.auto.tick();
@@ -213,7 +216,7 @@ test("no free turn slot: deferred, attempt not used", async () => {
   assert.equal(s.auto.status().automations[0].lastRun.state, "done");
 });
 
-test("restart recovery: delivering becomes done with unknown delivery; collecting is retried", () => {
+ptest("restart recovery: delivering becomes done with unknown delivery; collecting is retried", () => {
   const s = setup();
   const ins = s.db.prepare(`INSERT INTO automation_runs (id, automation_id, kind, slot_date, slot_at, tz, state, attempts, delivery, created_at) VALUES (?, 'briefing', ?, ?, ?, ?, ?, 1, ?, ?)`);
   ins.run("r_a", "manual", null, null, TZ, "delivering", JSON.stringify({ telegram: "sent", push: "pending" }), 1);
@@ -228,7 +231,7 @@ test("restart recovery: delivering becomes done with unknown delivery; collectin
   assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM automation_locks").get().n, 0, "stale locks cleared");
 });
 
-test("window passed while the bridge was off: skipped, nothing runs", async () => {
+ptest("window passed while the bridge was off: skipped, nothing runs", async () => {
   const s = setup();
   s.time.t = zonedTime("2026-11-24", 7, 0, TZ) + 7 * 3600000;
   await s.auto.tick();
@@ -237,7 +240,7 @@ test("window passed while the bridge was off: skipped, nothing runs", async () =
   assert.equal(s.calls.summarize.length, 0);
 });
 
-test("late notice is sent once, never during an emergency stop", async () => {
+ptest("late notice is sent once, never during an emergency stop", async () => {
   let free = false;
   const em = { active: false };
   const s = setup({ capacity: () => free, emergency: em });
@@ -256,7 +259,7 @@ test("late notice is sent once, never during an emergency stop", async () => {
   void free;
 });
 
-test("manual run: busy, throttled and emergency are refused", async () => {
+ptest("manual run: busy, throttled and emergency are refused", async () => {
   const em = { active: false };
   const s = setup({ emergency: em, collectBody: `sleep 0.3\ncat <<'EOF'\n${SOURCES_OK}\nEOF` });
   const first = s.auto.runNow("briefing");
@@ -271,7 +274,7 @@ test("manual run: busy, throttled and emergency are refused", async () => {
   assert.equal(s.auto.runNow("nope").error, "disabled");
 });
 
-test("resend sends only the stored header and summary", async () => {
+ptest("resend sends only the stored header and summary", async () => {
   const s = setup();
   await s.auto.tick();
   const id = s.auto.status().automations[0].lastRun.id;
@@ -283,7 +286,7 @@ test("resend sends only the stored header and summary", async () => {
   assert.equal(s.auto.redeliver(id).error, "throttled");
 });
 
-test("deliverFull adds the full text", async () => {
+ptest("deliverFull adds the full text", async () => {
   const s = setup({ extra: { deliverFull: true } });
   await s.auto.tick();
   assert.equal(s.delivered()[0].full, "Short summary.\n---\nDetails here.");
@@ -297,7 +300,7 @@ test("review fix: the bridge's first import takes the VAPID key out before anyth
   assert.equal(/^import .*(engines|server|models|phase4)/m.test(sec), false, "bridge-secrets must not pull in modules that spawn");
 });
 
-test("review fix: a push in flight is stopped by the emergency stop and recorded as unknown", async () => {
+ptest("review fix: a push in flight is stopped by the emergency stop and recorded as unknown", async () => {
   let started;
   const begun = new Promise((r) => { started = r; });
   const s = setup({ pushImpl: ({ signal }) => new Promise((resolve) => { started(); signal.addEventListener("abort", () => resolve("failed")); }) });
@@ -310,7 +313,7 @@ test("review fix: a push in flight is stopped by the emergency stop and recorded
   assert.equal(s.auto.status().automations[0].lastRun.delivery.push, "unknown");
 });
 
-test("review fix: a deferred manual run is picked up again", async () => {
+ptest("review fix: a deferred manual run is picked up again", async () => {
   let free = false;
   const s = setup({ capacity: () => free });
   s.time.t += 8 * 3600000; // no scheduled slot due
@@ -323,7 +326,7 @@ test("review fix: a deferred manual run is picked up again", async () => {
   assert.equal(s.auto._get(r.runId).state, "done");
 });
 
-test("review fix: capacity is checked again right before the model starts", async () => {
+ptest("review fix: capacity is checked again right before the model starts", async () => {
   let n = 0;
   const s = setup({ capacity: () => ++n === 1 });
   await s.auto.tick();
@@ -333,14 +336,14 @@ test("review fix: capacity is checked again right before the model starts", asyn
   assert.equal(s.calls.summarize.length, 0);
 });
 
-test("review fix: recovery never allows a fourth attempt", () => {
+ptest("review fix: recovery never allows a fourth attempt", () => {
   const s = setup();
   s.db.prepare(`INSERT INTO automation_runs (id, automation_id, kind, slot_date, slot_at, tz, state, attempts, delivery, created_at) VALUES ('r_x', 'briefing', 'manual', NULL, NULL, ?, 'summarizing', ?, '{}', 1)`).run(TZ, MAX_ATTEMPTS);
   s.auto.sweep();
   assert.equal(s.auto._get("r_x").state, "failed");
 });
 
-test("review fix: a briefing finished after its window is kept but not delivered", async () => {
+ptest("review fix: a briefing finished after its window is kept but not delivered", async () => {
   const s = setup({ summarize: async () => { s.time.t += 7 * 3600000; return { ok: true, sessionId: "s", messageId: "m", text: "Late.\n---\nx", usage: null, durationMs: 1 }; } });
   await s.auto.tick();
   const run = s.auto._get(s.db.prepare("SELECT id FROM automation_runs WHERE state <> 'skipped' LIMIT 1").get().id);
@@ -350,7 +353,7 @@ test("review fix: a briefing finished after its window is kept but not delivered
   assert.equal(s.calls.push.length, 0);
 });
 
-test("review fix: days the bridge was off are all marked skipped (up to a week)", async () => {
+ptest("review fix: days the bridge was off are all marked skipped (up to a week)", async () => {
   const s = setup();
   s.db.prepare("UPDATE automation_meta SET first_seen = ?").run(s.time.t - 5 * 86400000);
   s.time.t += 7 * 3600000;
@@ -359,7 +362,7 @@ test("review fix: days the bridge was off are all marked skipped (up to a week)"
   assert.equal(n, 6, "five earlier days and today");
 });
 
-test("review 2: a stop during the Telegram step ends the whole delivery, even after a quick release", async () => {
+ptest("review 2: a stop during the Telegram step ends the whole delivery, even after a quick release", async () => {
   const s = setup({ deliverBody: "sleep 30" });
   const p = s.auto.tick();
   for (let i = 0; i < 200; i++) {
@@ -377,7 +380,7 @@ test("review 2: a stop during the Telegram step ends the whole delivery, even af
   assert.equal(s.calls.push.length, 0);
 });
 
-test("review 2: a late notice holds the automation lock while it is sent", async () => {
+ptest("review 2: a late notice holds the automation lock while it is sent", async () => {
   let free = false;
   const s = setup({ capacity: () => free, deliverBody: "sleep 1" });
   await s.auto.tick();
@@ -389,7 +392,7 @@ test("review 2: a late notice holds the automation lock while it is sent", async
   await p;
 });
 
-test("review 2: a resend is recorded as delivering while it runs", async () => {
+ptest("review 2: a resend is recorded as delivering while it runs", async () => {
   const s = setup();
   await s.auto.tick();
   const id = s.auto.status().automations[0].lastRun.id;
@@ -398,4 +401,10 @@ test("review 2: a resend is recorded as delivering while it runs", async () => {
   assert.equal(s.auto._get(id).state, "delivering");
   for (let i = 0; i < 100 && s.auto._get(id).state !== "done"; i++) await new Promise((x) => setTimeout(x, 20));
   assert.equal(s.auto._get(id).state, "done");
+});
+
+test("Windows: automations stay off with a clear reason", () => {
+  const r = loadAutomationsConfig("/nonexistent/automations.json", { knownOwners: [OWNER], platform: "win32" });
+  assert.equal(r.enabled, false);
+  assert.equal(r.reason, "unsupported_platform");
 });

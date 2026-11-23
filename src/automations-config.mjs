@@ -170,6 +170,12 @@ export function validateConfig(raw, { knownOwners = [] } = {}) {
  * config }. `reason` is a fixed class for the app; `detail` is for the log.
  */
 export function loadAutomationsConfig(path, opts = {}) {
+  // macOS and Linux only: the guarantees above rest on POSIX owners and modes,
+  // and the emergency stop on killing whole process groups. Windows has
+  // neither in this form, so the feature stays off there rather than half on.
+  if ((opts.platform || process.platform) === "win32") {
+    return { enabled: false, reason: "unsupported_platform", detail: "automations need macOS or Linux", config: null };
+  }
   try {
     checkPrivateFile(path);
     let raw;

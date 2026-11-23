@@ -142,7 +142,7 @@ The app's conversation mode sends `spoken: true` with the prompt. The bridge the
 
 ## Automations (scheduled briefings)
 
-Off unless `automations.json` exists in the bridge's data folder (`DB_DIR`, by default `~/Library/conduit-bridge`). An automation runs at a local time on chosen weekdays and has three stages:
+macOS and Linux only (on Windows the feature reports `unsupported_platform`). Off unless `automations.json` exists in the bridge's data folder (`DB_DIR`, by default `~/Library/conduit-bridge`). An automation runs at a local time on chosen weekdays and has three stages:
 
 1. **collect**: your command fetches data. No model is involved. It prints JSON in format version 1: `{"version":1,"sources":[{"id","title","status":"ok|error|truncated","count","newCount","fetchedAt","text"}]}`. The bridge builds the fact header from this itself, so an unreachable source is reported as unavailable and never as "nothing new".
 2. **summarize**: Claude writes the briefing in the *scheduled profile*. That means no tool at all (not even Read), no MCP server, no user or project settings and therefore no hooks or plugins from them, no slash commands, and no session to resume. The prompt arrives on stdin. If the CLI's first event shows anything it could act with, the run is stopped (`profile_mismatch`). Every message in a chat created this way runs in the same profile, whatever engine or mode the client asks for.
