@@ -57,7 +57,8 @@ export function checkInit(ev) {
  * errorClass ∈ null | "profile_mismatch" | "summarize_timeout" | "summarize_failed" | "stopped" | "spawn".
  *
  * `register(handle)` lets the caller stop the run (emergency stop): handle.stop().
- * `onText(delta)` streams the answer as it arrives (follow-up chats).
+ * `onText(text)` gets the whole answer once, after the run was checked end to end
+ * (follow-up chats). Never earlier: nothing unconfirmed reaches a client.
  */
 export function runIsolatedClaude({ bin = "claude", input, cwd, model = null, env = process.env,
   deadlineMs = SUMMARIZE_DEADLINE_MS, initTimeoutMs = INIT_TIMEOUT_MS, maxChars = MAX_ANSWER_CHARS, onText = null, register = null, spawnFn = spawn, now = Date.now }) {
@@ -114,7 +115,6 @@ export function runIsolatedClaude({ bin = "claude", input, cwd, model = null, en
       const room = maxChars - text.length;
       if (delta.length > room) { delta = delta.slice(0, Math.max(0, room)); truncated = true; }
       text += delta;
-      if (delta) onText?.(delta);
     };
 
     const onEvent = (ev) => {
@@ -153,21 +153,26 @@ export function runIsolatedClaude({ bin = "claude", input, cwd, model = null, en
     };
 
     child.stdout.setEncoding("utf8");
+    const feed = (line) => {
+      if (!line.trim()) return;
+      let ev; try { ev = JSON.parse(line); } catch { return; }
+      try { onEvent(ev); } catch { /* malformed event: ignore */ }
+    };
     child.stdout.on("data", (chunk) => {
       buf += chunk;
       if (buf.length > MAX_LINE_BYTES) { stop("summarize_failed"); buf = ""; return; }
       let i;
       while ((i = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, i); buf = buf.slice(i + 1);
-        if (!line.trim()) continue;
-        let ev; try { ev = JSON.parse(line); } catch { continue; }
-        try { onEvent(ev); } catch { /* malformed event: ignore */ }
+        feed(line);
       }
     });
     child.stderr.on("data", () => { /* not surfaced: may echo input */ });
     child.stdin.on("error", () => { /* EPIPE: the process died early; close tells why */ });
     child.on("error", () => { if (!errorClass) errorClass = "spawn"; });
     child.on("close", (code) => {
+      // A last event without a trailing newline goes through the same gate.
+      if (buf) { const rest = buf; buf = ""; feed(rest); }
       finished = true;
       clearTimeout(deadline);
       clearTimeout(initTimer);
@@ -180,6 +185,9 @@ export function runIsolatedClaude({ bin = "claude", input, cwd, model = null, en
       const durationMs = now() - started;
       if (!errorClass && (!resultSeen || resultIsError || code !== 0)) errorClass = "summarize_failed";
       if (!errorClass && !text.trim()) errorClass = "summarize_failed";
+      // Published only now, after the whole run was checked: a later event
+      // (a contradicting init) could still have withdrawn it.
+      if (!errorClass && text) onText?.(text);
       resolve({ ok: !errorClass, text, truncated, usage, durationMs, errorClass, problems });
     });
     child.stdin.end(input);

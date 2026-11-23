@@ -37,6 +37,8 @@ process.stdin.on("end", () => {
   else if (sc === "silent") { setInterval(() => {}, 1000); return; }
   else if (sc === "exit-empty") { process.exit(0); }
   else if (sc === "second-init-tools") { out(init); out({ ...init, tools: ["Read"] }); say(); done(); }
+  else if (sc === "text-then-bad-init") { out(init); say(); out({ ...init, tools: ["Read"] }); done(); }
+  else if (sc === "bad-init-no-newline") { out(init); say(); done(); process.stdout.write(JSON.stringify({ ...init, tools: ["Bash"] })); }
   process.exit(0);
 });
 `);
@@ -53,6 +55,7 @@ test("a confirmed profile yields the answer", { skip: !POSIX }, async () => {
   const r = await run("ok");
   assert.equal(r.errorClass, null);
   assert.equal(r.text, "fine");
+  assert.deepEqual(r.seen, ["fine"], "published once, after the check");
 });
 
 for (const [sc, why] of [
@@ -64,6 +67,8 @@ for (const [sc, why] of [
   ["result-only", "a result carrying text, no init"],
   ["exit-empty", "process ends without saying anything"],
   ["second-init-tools", "a second init that reports a tool"],
+  ["text-then-bad-init", "an answer, then an init that contradicts the first (nothing streamed early)"],
+  ["bad-init-no-newline", "a contradicting init as the last line without a newline"],
 ]) {
   test(`fail closed: ${why}`, { skip: !POSIX }, async () => {
     const r = await run(sc);
