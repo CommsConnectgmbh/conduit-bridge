@@ -47,7 +47,8 @@ const CHANNEL_STATES = new Set(["sent", "failed", "unknown", "off", "pending", "
 
 export function ensureAutomationSchema(db) {
   for (const ddl of ["ALTER TABLE automation_runs ADD COLUMN notice_due INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE automation_runs ADD COLUMN delivery_started INTEGER NOT NULL DEFAULT 0"]) {
+    "ALTER TABLE automation_runs ADD COLUMN delivery_started INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE automation_runs ADD COLUMN late_sent INTEGER NOT NULL DEFAULT 0"]) {
     try { db.exec(ddl); } catch { /* table new or column present */ }
   }
   db.exec(`
@@ -77,6 +78,9 @@ export function ensureAutomationSchema(db) {
       -- Set when a delivery actually begins; only then can a cut-off delivery
       -- have gone out (and "pending" become "unknown" after a crash).
       delivery_started INTEGER NOT NULL DEFAULT 0,
+      -- The "late" warning is acknowledged on its own: it must never stand in
+      -- for the final failure notice.
+      late_sent INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL,
       started_at INTEGER,
       ended_at INTEGER
@@ -107,7 +111,7 @@ function rowToRun(r) {
     nextAttemptAt: r.next_attempt_at, errorClass: r.error_class, sessionId: r.session_id, messageId: r.msg_id,
     header, summary: r.summary, delivery: delivery || { telegram: "off", push: "off" },
     durationMs: r.duration_ms, tokens: r.tokens_in === null || r.tokens_in === undefined ? null : { in: r.tokens_in, out: r.tokens_out },
-    noticeSent: !!r.notice_sent, noticeDue: !!r.notice_due, deliveryStarted: !!r.delivery_started, createdAt: r.created_at, startedAt: r.started_at, endedAt: r.ended_at,
+    noticeSent: !!r.notice_sent, noticeDue: !!r.notice_due, deliveryStarted: !!r.delivery_started, lateSent: !!r.late_sent, createdAt: r.created_at, startedAt: r.started_at, endedAt: r.ended_at,
   };
 }
 
@@ -149,7 +153,7 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
     insert: db.prepare(`INSERT INTO automation_runs (id, automation_id, kind, slot_date, slot_at, tz, state, attempts, next_attempt_at, delivery, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?) ON CONFLICT DO NOTHING`),
     update: db.prepare(`UPDATE automation_runs SET state = ?, attempts = ?, next_attempt_at = ?, error_class = ?, session_id = ?, msg_id = ?,
-      header = ?, summary = ?, delivery = ?, duration_ms = ?, tokens_in = ?, tokens_out = ?, notice_sent = ?, notice_due = ?, delivery_started = ?, started_at = ?, ended_at = ? WHERE id = ?`),
+      header = ?, summary = ?, delivery = ?, duration_ms = ?, tokens_in = ?, tokens_out = ?, notice_sent = ?, notice_due = ?, delivery_started = ?, late_sent = ?, started_at = ?, ended_at = ? WHERE id = ?`),
     latest: db.prepare(`SELECT * FROM automation_runs WHERE automation_id = ? ORDER BY COALESCE(slot_at, created_at) DESC, rowid DESC LIMIT 1`),
     latestOk: db.prepare(`SELECT * FROM automation_runs WHERE automation_id = ? AND state = 'done' AND error_class IS NULL ORDER BY COALESCE(slot_at, created_at) DESC, rowid DESC LIMIT 1`),
     seen: db.prepare(`INSERT INTO automation_meta (automation_id, first_seen) VALUES (?, ?) ON CONFLICT DO NOTHING`),
@@ -168,7 +172,7 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
 
   const save = (r) => Q.update.run(r.state, r.attempts, r.nextAttemptAt ?? null, r.errorClass ?? null, r.sessionId ?? null, r.messageId ?? null,
     r.header ? JSON.stringify(r.header) : null, r.summary ?? null, JSON.stringify(r.delivery || { telegram: "off", push: "off" }),
-    r.durationMs ?? null, r.tokens ? r.tokens.in : null, r.tokens ? r.tokens.out : null, r.noticeSent ? 1 : 0, r.noticeDue ? 1 : 0, r.deliveryStarted ? 1 : 0, r.startedAt ?? null, r.endedAt ?? null, r.id);
+    r.durationMs ?? null, r.tokens ? r.tokens.in : null, r.tokens ? r.tokens.out : null, r.noticeSent ? 1 : 0, r.noticeDue ? 1 : 0, r.deliveryStarted ? 1 : 0, r.lateSent ? 1 : 0, r.startedAt ?? null, r.endedAt ?? null, r.id);
   const get = (id) => rowToRun(Q.byId.get(id));
 
   const register = (h, on) => { if (on) active.add(h); else active.delete(h); };
@@ -281,15 +285,21 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
   }
 
   async function notifyFailure(a, r, cls) {
-    if (r.noticeSent) return;
+    const late = cls === "late";
+    if (late ? (r.lateSent || r.noticeSent) : r.noticeSent) return;
     if (stopped()) {
       // Not now, but not forgotten: a failure is told after the release. A
       // "late" warning only matters while it is current, so it is dropped.
-      if (cls !== "late" && !r.noticeDue) { r.noticeDue = true; save(r); }
+      if (!late && !r.noticeDue) { r.noticeDue = true; save(r); }
       return;
     }
-    r.noticeSent = true;
-    r.noticeDue = false;
+    if (late) r.lateSent = true;
+    else { r.noticeSent = true; r.noticeDue = false; }
+    // One write: the notice is taken AND its delivery has begun. A crash after
+    // it leaves "pending" channels that the sweep marks unknown, never a notice
+    // that is neither owed nor sent.
+    r.delivery = { telegram: a.deliver ? "pending" : "off", push: a.push ? "pending" : "off" };
+    r.deliveryStarted = true;
     save(r);
     const summary = FAILURE_SUMMARY[cls] || FAILURE_SUMMARY.summarize_failed;
     await deliver(a, r, { header: r.header ? renderHeader(r.header.sources) : "", summary, fullText: null });
@@ -444,7 +454,7 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
       r = get(r.id);
       if (FINAL.has(r.state)) continue;
       // Late notice once, never during an emergency stop.
-      if (t - r.slotAt > LATE_AFTER_MS && !r.noticeSent && !stopped() && tryLock(a.id, r.id)) {
+      if (t - r.slotAt > LATE_AFTER_MS && !r.lateSent && !r.noticeSent && !stopped() && tryLock(a.id, r.id)) {
         try { await notifyFailure(a, r, "late"); } finally { Q.unlock.run(a.id, r.id); }
         r = get(r.id);
       }

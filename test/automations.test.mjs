@@ -475,3 +475,29 @@ ptest("review 5: a window that ends during an emergency stop is told after the r
   assert.equal(exp.length, 1);
   void free;
 });
+
+ptest("review 6: a late warning does not swallow the final failure notice", async () => {
+  const s = setup({ capacity: () => false });
+  await s.auto.tick();
+  s.time.t += LATE_AFTER_MS + 60_000;
+  await s.auto.tick();
+  s.time.t += 5 * 3600000; // window over
+  await s.auto.tick();
+  const d = s.delivered();
+  assert.equal(d.length, 2, "late warning and the final notice");
+  assert.equal(d[1].errorClass, "expired");
+});
+
+ptest("review 6: taking a notice and starting its delivery is one write", async () => {
+  const s = setup({ deliverBody: "sleep 30" });
+  s.time.t += 8 * 3600000;
+  s.db.prepare(`INSERT INTO automation_runs (id, automation_id, kind, slot_date, slot_at, tz, state, attempts, delivery, created_at, notice_due) VALUES ('r_n', 'briefing', 'manual', NULL, NULL, ?, 'failed', 3, ?, ?, 1)`).run(TZ, JSON.stringify({ telegram: "off", push: "off" }), s.time.t - 60_000);
+  const p = s.auto.tick();
+  for (let i = 0; i < 100 && s.auto.activeCount() === 0; i++) await new Promise((x) => setTimeout(x, 10));
+  // "Crash" here: a fresh instance sweeps the stored state.
+  const row = s.db.prepare("SELECT notice_sent, notice_due, delivery_started, delivery FROM automation_runs WHERE id = 'r_n'").get();
+  assert.equal(row.notice_sent, 1);
+  assert.equal(row.notice_due, 0);
+  assert.equal(row.delivery_started, 1, "delivery start stored together with taking the notice");
+  s.emergency.active = true; s.auto.stopAll(); await p;
+});
