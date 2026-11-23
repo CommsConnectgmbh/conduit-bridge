@@ -60,6 +60,10 @@ export function runCommand({ argv, stdin = "", timeoutMs, maxBytes = 64 * 1024, 
     child.on("close", (code, signal) => {
       done = true;
       clearTimeout(timer);
+      // Anything the command left running in its group (a background child
+      // with redirected output) ends with it: after this the handle is gone
+      // and neither the emergency stop nor shutdown could reach it.
+      try { process.kill(-child.pid, "SIGKILL"); } catch { /* group already empty */ }
       register?.(handle, false);
       resolve({ code, signal, stdout: Buffer.concat(chunks).toString("utf8"), tooLarge, timedOut, stopped, spawnError });
     });

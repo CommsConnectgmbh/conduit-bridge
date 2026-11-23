@@ -149,6 +149,7 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
     lock: db.prepare(`INSERT INTO automation_locks (automation_id, run_id, locked_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`),
     unlock: db.prepare(`DELETE FROM automation_locks WHERE automation_id = ? AND run_id = ?`),
     clearLocks: db.prepare(`DELETE FROM automation_locks`),
+    finalPending: db.prepare(`SELECT * FROM automation_runs WHERE state IN ('done', 'failed') AND delivery LIKE '%"pending"%'`),
     resumeHeld: db.prepare(`UPDATE automation_runs SET next_attempt_at = ? WHERE state = 'claimed' AND error_class = 'emergency'`),
     isLocked: db.prepare(`SELECT 1 FROM automation_locks WHERE automation_id = ?`),
     runsBetween: db.prepare(`SELECT * FROM automation_runs WHERE kind = 'schedule' AND slot_date >= ? AND slot_date <= ? ORDER BY slot_date ASC`),
@@ -180,6 +181,14 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
   /** Start-up recovery: see the header comment. */
   function sweep() {
     Q.clearLocks.run();
+    // A finished run whose delivery (briefing, failure or late notice, resend)
+    // was cut off: it may have gone out. Never sent again automatically.
+    for (const row of Q.finalPending.all()) {
+      const r = rowToRun(row);
+      for (const ch of ["telegram", "push"]) if (r.delivery[ch] === "pending") r.delivery[ch] = "unknown";
+      save(r);
+      log("warn", "automation_delivery_unknown", { id: r.id, automation: row.automation_id });
+    }
     for (const row of Q.open.all()) {
       const r = rowToRun(row);
       if (r.state === "collecting" || r.state === "summarizing") {

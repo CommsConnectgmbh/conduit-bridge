@@ -408,3 +408,20 @@ test("Windows: automations stay off with a clear reason", () => {
   assert.equal(r.enabled, false);
   assert.equal(r.reason, "unsupported_platform");
 });
+
+ptest("review 3: a background child left by collect is ended with the command", async () => {
+  const pidFile = join(tmpdir(), `conduit-bg-${process.pid}-${Date.now()}`);
+  const s = setup({ collectBody: `(sleep 60 > /dev/null 2>&1 < /dev/null & echo $! > "${pidFile}")\ncat <<'EOF'\n${SOURCES_OK}\nEOF` });
+  await s.auto.tick();
+  const pid = Number(readFileSync(pidFile, "utf8"));
+  let alive = true;
+  for (let i = 0; i < 40 && alive; i++) { try { process.kill(pid, 0); await new Promise((r) => setTimeout(r, 25)); } catch { alive = false; } }
+  assert.equal(alive, false, "the background child outlived its command");
+});
+
+ptest("review 3: a failure notice cut off by a crash ends as unknown, not pending", () => {
+  const s = setup();
+  s.db.prepare(`INSERT INTO automation_runs (id, automation_id, kind, slot_date, slot_at, tz, state, attempts, delivery, created_at) VALUES ('r_f', 'briefing', 'manual', NULL, NULL, ?, 'failed', 3, ?, 1)`).run(TZ, JSON.stringify({ telegram: "pending", push: "pending" }));
+  s.auto.sweep();
+  assert.deepEqual(s.auto._get("r_f").delivery, { telegram: "unknown", push: "unknown" });
+});

@@ -138,6 +138,8 @@ export function runIsolatedClaude({ bin = "claude", input, cwd, model = null, en
     child.on("close", (code) => {
       finished = true;
       clearTimeout(deadline);
+      // Nothing of this run may outlive it (see automation-commands.mjs).
+      try { process.kill(-child.pid, "SIGKILL"); } catch { /* group already empty */ }
       register?.(handle, false);
       const durationMs = now() - started;
       if (!errorClass && (!resultSeen || resultIsError || code !== 0)) errorClass = "summarize_failed";
