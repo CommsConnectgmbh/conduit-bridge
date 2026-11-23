@@ -151,6 +151,54 @@ export function claudeReadOnlyArgs(p) {
   return args;
 }
 
+// Zeitplan-Profil (Conduit 2.0, Phase 4): für alles, was die Bridge ohne den
+// Besitzer startet (Morgenbriefing) und für jede Nachricht in einem so
+// entstandenen Chat. Strenger als der Lesemodus, weil hier fremder Text
+// (Mails, Kalender, CRM) im Prompt steht:
+//   --tools ""             überhaupt kein Werkzeug, auch kein Read: Mit Read
+//                          könnte eine präparierte Mail den Agenten beliebige
+//                          Dateien ins Briefing schreiben lassen, und das
+//                          Briefing geht per Telegram nach draußen.
+//   --strict-mcp-config    kein MCP-Server.
+//   --setting-sources ""   keine Nutzer-, Projekt- oder lokalen Settings,
+//                          damit auch keine Hooks und keine Plugins daraus:
+//                          Hooks führen Befehle aus, unabhängig von Werkzeugen.
+//   --disable-slash-commands  keine Skills, keine Befehle.
+//   --no-session-persistence  nichts zum Fortsetzen; jeder Lauf ist frisch und
+//                          bekommt seinen Kontext von der Bridge.
+//   dontAsk + prompts none als zweite Linie, falls doch etwas auftaucht.
+// Bewusst NICHT --bare: das liest kein OAuth (nur ANTHROPIC_API_KEY), und die
+// Bridge läuft mit dem Abo des Besitzers.
+// Gemessen mit claude 2.1.322: init-Event tools [], mcp_servers [],
+// slash_commands [], permissionMode dontAsk, 0 Hook-Ereignisse (mit Settings
+// sind es 8). Beleg: test/scheduled-real-claude.test.mjs.
+// Betreiber-Optionen (disallowedTools, settings) werden NICHT übernommen: Eine
+// Settings-Datei könnte Hooks oder MCP wieder einschalten, und weniger als
+// "kein Werkzeug" gibt es nicht.
+export const CLAUDE_SCHEDULED_ARGS = Object.freeze([
+  "--tools", "",
+  "--strict-mcp-config",
+  "--setting-sources", "",
+  "--disable-slash-commands",
+  "--no-session-persistence",
+  "--permission-mode", "dontAsk",
+  "--permission-prompts", "none",
+]);
+
+/**
+ * Vollständige Argumente für einen Lauf im Zeitplan-Profil. Der Prompt kommt
+ * per stdin, nie als Argument (Länge, und kein fremder Text in argv).
+ */
+export function claudeScheduledArgs({ model = null } = {}) {
+  return [
+    "-p",
+    "--output-format", "stream-json",
+    "--verbose",
+    ...CLAUDE_SCHEDULED_ARGS,
+    ...(model ? ["--model", model] : []),
+  ];
+}
+
 /**
  * Argumente für `codex exec` und `codex exec resume`.
  *
