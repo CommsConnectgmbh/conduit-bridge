@@ -140,6 +140,26 @@ The app's conversation mode sends `spoken: true` with the prompt. The bridge the
 
 `POST /api/emergency-stop` (inside the end-to-end session; the app's Tasks page has the button) stops every running answer of every chat, drops all queued messages, ends the warm processes and a running Alexa question, and refuses every new run until `POST /api/emergency-release`. Open chats get a frame `{ type: "emergency", active }`. The state is kept in `.emergency-stop.json` in the log folder, so it survives a restart of the bridge; if that file cannot be read it counts as pressed. If the file cannot be written (for example a full disk), the bridge empties the existing file instead, which needs no space and reads as pressed after a restart. The bridge writes the file (as released) on its first start, so this fallback is available from then on. Only if not even that works (the file could never be created, for example a disk full since before the first start) the stop holds in memory alone: the answer says `persisted: false`, `/api/status` reports `emergencyStop.unsaved: true` on every read until a later press or the release can save, and the app shows that a restart would lift it. `GET /api/emergency` and `/api/status` (`emergencyStop`) show it. Stopped and refused runs are recorded with the end `emergency` in the journal, also an answer whose result arrives while the stop ends its process (the text that arrived is kept; the same holds for the normal Stop). A state file that exists but cannot be read counts as pressed; if it cannot be created at the first start, `unsaved` is reported from the start.
 
+## Automations (scheduled briefings)
+
+Off unless `automations.json` exists in the bridge's data folder (`DB_DIR`, by default `~/Library/conduit-bridge`). An automation runs at a local time on chosen weekdays and has three stages:
+
+1. **collect**: your command fetches data. No model is involved. It prints JSON in format version 1: `{"version":1,"sources":[{"id","title","status":"ok|error|truncated","count","newCount","fetchedAt","text"}]}`. The bridge builds the fact header from this itself, so an unreachable source is reported as unavailable and never as "nothing new".
+2. **summarize**: Claude writes the briefing in the *scheduled profile*. That means no tool at all (not even Read), no MCP server, no user or project settings and therefore no hooks or plugins from them, no slash commands, and no session to resume. The prompt arrives on stdin. If the CLI's first event shows anything it could act with, the run is stopped (`profile_mismatch`). Every message in a chat created this way runs in the same profile, whatever engine or mode the client asks for.
+3. **deliver**: your command gets JSON on stdin (`title`, `date`, `status`, `header`, `summary`, and `full` only with `deliverFull`). Optionally the bridge also sends a Web Push to the owner's installed PWA. The push carries no briefing text.
+
+Rules for the file:
+- The file is mode 0600 and owned by the bridge's user, in a folder nobody else can write to.
+- Unknown fields are refused, and so is the whole file.
+- `collect` and `deliver` are argv arrays, never shell strings. Each program is an absolute path, owned by the bridge's user or root, and not writable by group or others. The bridge checks this again before every run.
+- `owner` must be the bridge's account (`PAIR_OWNER_EMAIL`).
+
+Your `deliver` command must send plain text without link previews. The briefing contains other people's text, and a preview would fetch a link from it.
+
+Each automation runs at most once per local date (the IANA `tz`; a time that does not exist on a DST day runs at the first valid minute). It is retried up to 3 times, 10 minutes apart, inside its window (`windowHours`, default 6). It is marked late after 2 hours, with one notice. The emergency stop kills every stage and nothing is delivered. After a restart, a run that was delivering is marked `unknown` instead of being sent again. The bridge does not wake a sleeping Mac. If you need that, use `pmset repeat wakeorpoweron`. The app shows late runs.
+
+Web Push: VAPID keys come from `CONDUIT_VAPID_PRIVATE_KEY` (read once at start, then removed from the environment so no agent run can see it) or from a private file the bridge creates on first use. If the key changes, push stays off (`vapid_mismatch`) instead of silently invalidating every subscription. Endpoints must be https on port 443 at a known push service, resolve to a public address, and redirects are refused. The native app shells cannot receive Web Push; use your deliver command there.
+
 ## Updates
 
 The bridge checks for a new release every 6 hours (`CONDUIT_SELFUPDATE_INTERVAL_MS`) while idle, downloads it, verifies its Ed25519 signature against the key compiled into the bridge, installs dependencies only from the signed lockfile without install scripts, and restarts under the service manager. A failed install rolls back. There is no setting to accept unsigned packages.

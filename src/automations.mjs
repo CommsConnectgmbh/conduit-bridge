@@ -369,7 +369,7 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
         await notifyFailure(a, r, "late");
         r = get(r.id);
       }
-      if (r.state === "claimed" && (r.nextAttemptAt ?? 0) <= t) await execute(a, r);
+      if (r.state === "claimed" && (r.nextAttemptAt ?? 0) <= now()) await execute(a, r);
     }
   }
 

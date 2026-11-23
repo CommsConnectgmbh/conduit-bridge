@@ -3414,7 +3414,9 @@ function cryptoRandom() {
 // Everything a restart would destroy: unfinished turns in every stage, queued
 // prompts and the Alexa slot (see countBusyWork).
 function activeTurns() {
-  return countBusyWork(runtime, { alexaBusy: alexaSession.busy });
+  // A scheduled run in any stage (collect, model, deliver) counts as busy too:
+  // restarting under it would leave its delivery "unknown".
+  return countBusyWork(runtime, { alexaBusy: alexaSession.busy }) + (phase4?.automations.activeCount() || 0);
 }
 
 // Pull a newer bridge from the origin and, if we got one, restart to apply it.
