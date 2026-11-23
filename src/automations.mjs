@@ -46,6 +46,10 @@ const NON_RETRYABLE = new Set(["collect_invalid", "collect_too_large", "profile_
 const CHANNEL_STATES = new Set(["sent", "failed", "unknown", "off", "pending", "held"]);
 
 export function ensureAutomationSchema(db) {
+  for (const ddl of ["ALTER TABLE automation_runs ADD COLUMN notice_due INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE automation_runs ADD COLUMN delivery_started INTEGER NOT NULL DEFAULT 0"]) {
+    try { db.exec(ddl); } catch { /* table new or column present */ }
+  }
   db.exec(`
     CREATE TABLE IF NOT EXISTS automation_runs (
       id TEXT PRIMARY KEY,
@@ -67,6 +71,12 @@ export function ensureAutomationSchema(db) {
       tokens_in INTEGER,
       tokens_out INTEGER,
       notice_sent INTEGER NOT NULL DEFAULT 0,
+      -- A failure notice that is owed but not yet sent (emergency stop, lock
+      -- busy, restart). Kept in the table so it survives any number of restarts.
+      notice_due INTEGER NOT NULL DEFAULT 0,
+      -- Set when a delivery actually begins; only then can a cut-off delivery
+      -- have gone out (and "pending" become "unknown" after a crash).
+      delivery_started INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL,
       started_at INTEGER,
       ended_at INTEGER
@@ -97,7 +107,7 @@ function rowToRun(r) {
     nextAttemptAt: r.next_attempt_at, errorClass: r.error_class, sessionId: r.session_id, messageId: r.msg_id,
     header, summary: r.summary, delivery: delivery || { telegram: "off", push: "off" },
     durationMs: r.duration_ms, tokens: r.tokens_in === null || r.tokens_in === undefined ? null : { in: r.tokens_in, out: r.tokens_out },
-    noticeSent: !!r.notice_sent, createdAt: r.created_at, startedAt: r.started_at, endedAt: r.ended_at,
+    noticeSent: !!r.notice_sent, noticeDue: !!r.notice_due, deliveryStarted: !!r.delivery_started, createdAt: r.created_at, startedAt: r.started_at, endedAt: r.ended_at,
   };
 }
 
@@ -132,7 +142,6 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
   let lastTick = now();
   let ticking = false;
   const lastResend = new Map(); // runId -> ms
-  const owedNotices = []; // runs the sweep failed: their failure notice is still due
 
   const Q = {
     bySlot: db.prepare(`SELECT * FROM automation_runs WHERE automation_id = ? AND slot_date = ? AND kind = 'schedule'`),
@@ -140,7 +149,7 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
     insert: db.prepare(`INSERT INTO automation_runs (id, automation_id, kind, slot_date, slot_at, tz, state, attempts, next_attempt_at, delivery, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?) ON CONFLICT DO NOTHING`),
     update: db.prepare(`UPDATE automation_runs SET state = ?, attempts = ?, next_attempt_at = ?, error_class = ?, session_id = ?, msg_id = ?,
-      header = ?, summary = ?, delivery = ?, duration_ms = ?, tokens_in = ?, tokens_out = ?, notice_sent = ?, started_at = ?, ended_at = ? WHERE id = ?`),
+      header = ?, summary = ?, delivery = ?, duration_ms = ?, tokens_in = ?, tokens_out = ?, notice_sent = ?, notice_due = ?, delivery_started = ?, started_at = ?, ended_at = ? WHERE id = ?`),
     latest: db.prepare(`SELECT * FROM automation_runs WHERE automation_id = ? ORDER BY COALESCE(slot_at, created_at) DESC, rowid DESC LIMIT 1`),
     latestOk: db.prepare(`SELECT * FROM automation_runs WHERE automation_id = ? AND state = 'done' AND error_class IS NULL ORDER BY COALESCE(slot_at, created_at) DESC, rowid DESC LIMIT 1`),
     seen: db.prepare(`INSERT INTO automation_meta (automation_id, first_seen) VALUES (?, ?) ON CONFLICT DO NOTHING`),
@@ -150,7 +159,8 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
     lock: db.prepare(`INSERT INTO automation_locks (automation_id, run_id, locked_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`),
     unlock: db.prepare(`DELETE FROM automation_locks WHERE automation_id = ? AND run_id = ?`),
     clearLocks: db.prepare(`DELETE FROM automation_locks`),
-    finalPending: db.prepare(`SELECT * FROM automation_runs WHERE state IN ('done', 'failed') AND delivery LIKE '%"pending"%'`),
+    finalPending: db.prepare(`SELECT * FROM automation_runs WHERE state IN ('done', 'failed') AND delivery_started = 1 AND delivery LIKE '%"pending"%'`),
+    noticesDue: db.prepare(`SELECT * FROM automation_runs WHERE notice_due = 1 AND notice_sent = 0`),
     resumeHeld: db.prepare(`UPDATE automation_runs SET next_attempt_at = ? WHERE state = 'claimed' AND error_class = 'emergency'`),
     isLocked: db.prepare(`SELECT 1 FROM automation_locks WHERE automation_id = ?`),
     runsBetween: db.prepare(`SELECT * FROM automation_runs WHERE kind = 'schedule' AND slot_date >= ? AND slot_date <= ? ORDER BY slot_date ASC`),
@@ -158,7 +168,7 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
 
   const save = (r) => Q.update.run(r.state, r.attempts, r.nextAttemptAt ?? null, r.errorClass ?? null, r.sessionId ?? null, r.messageId ?? null,
     r.header ? JSON.stringify(r.header) : null, r.summary ?? null, JSON.stringify(r.delivery || { telegram: "off", push: "off" }),
-    r.durationMs ?? null, r.tokens ? r.tokens.in : null, r.tokens ? r.tokens.out : null, r.noticeSent ? 1 : 0, r.startedAt ?? null, r.endedAt ?? null, r.id);
+    r.durationMs ?? null, r.tokens ? r.tokens.in : null, r.tokens ? r.tokens.out : null, r.noticeSent ? 1 : 0, r.noticeDue ? 1 : 0, r.deliveryStarted ? 1 : 0, r.startedAt ?? null, r.endedAt ?? null, r.id);
   const get = (id) => rowToRun(Q.byId.get(id));
 
   const register = (h, on) => { if (on) active.add(h); else active.delete(h); };
@@ -199,7 +209,7 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
           // Out of attempts: final, and the owner is told on the next tick
           // through the normal notice path (once, never during a stop).
           r.state = "failed"; r.endedAt = now();
-          owedNotices.push(r.id);
+          r.noticeDue = true;
         } else { r.state = "claimed"; r.nextAttemptAt = now(); }
         save(r);
         log("warn", "automation_run_recovered", { id: r.id, automation: row.automation_id, from: row.state });
@@ -234,6 +244,7 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
       return;
     }
     r.delivery = { telegram: a.deliver ? "pending" : "off", push: a.push ? "pending" : "off" };
+    r.deliveryStarted = true;
     save(r);
     let haltedByStop = false;
     if (a.deliver) {
@@ -270,8 +281,15 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
   }
 
   async function notifyFailure(a, r, cls) {
-    if (r.noticeSent || stopped()) return;
+    if (r.noticeSent) return;
+    if (stopped()) {
+      // Not now, but not forgotten: a failure is told after the release. A
+      // "late" warning only matters while it is current, so it is dropped.
+      if (cls !== "late" && !r.noticeDue) { r.noticeDue = true; save(r); }
+      return;
+    }
     r.noticeSent = true;
+    r.noticeDue = false;
     save(r);
     const summary = FAILURE_SUMMARY[cls] || FAILURE_SUMMARY.summarize_failed;
     await deliver(a, r, { header: r.header ? renderHeader(r.header.sources) : "", summary, fullText: null });
@@ -382,12 +400,14 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
 
   async function tickOnce() {
     if (!loaded.enabled) return;
-    while (owedNotices.length && !stopped()) {
-      const id = owedNotices.shift();
-      const r = get(id);
-      const a = r ? automationById(Q.byId.get(id).automation_id) : null;
-      if (!a || r.noticeSent || !tryLock(a.id, r.id)) continue;
-      try { await notifyFailure(a, r, r.errorClass || "summarize_failed"); } finally { Q.unlock.run(a.id, r.id); }
+    // Owed failure notices (stored): sent when nothing stops them; a busy
+    // lock or an active stop leaves them for a later tick.
+    if (!stopped()) {
+      for (const row of Q.noticesDue.all()) {
+        const a = automationById(row.automation_id);
+        if (!a || !tryLock(a.id, row.id)) continue;
+        try { const r = rowToRun(row); await notifyFailure(a, r, r.errorClass || "summarize_failed"); } finally { Q.unlock.run(a.id, row.id); }
+      }
     }
     const t = now();
     const tz = loaded.config.tz;

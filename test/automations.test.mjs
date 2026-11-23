@@ -220,6 +220,7 @@ ptest("restart recovery: delivering becomes done with unknown delivery; collecti
   const s = setup();
   const ins = s.db.prepare(`INSERT INTO automation_runs (id, automation_id, kind, slot_date, slot_at, tz, state, attempts, delivery, created_at) VALUES (?, 'briefing', ?, ?, ?, ?, ?, 1, ?, ?)`);
   ins.run("r_a", "manual", null, null, TZ, "delivering", JSON.stringify({ telegram: "sent", push: "pending" }), 1);
+  s.db.prepare("UPDATE automation_runs SET delivery_started = 1 WHERE id = 'r_a'").run();
   ins.run("r_b", "manual", null, null, TZ, "collecting", JSON.stringify({ telegram: "pending", push: "pending" }), 2);
   s.db.prepare("INSERT INTO automation_locks VALUES ('briefing', 'r_b', 1)").run();
   s.auto.sweep();
@@ -429,7 +430,48 @@ ptest("review 3: a background child left by collect is ended with the command", 
 
 ptest("review 3: a failure notice cut off by a crash ends as unknown, not pending", () => {
   const s = setup();
-  s.db.prepare(`INSERT INTO automation_runs (id, automation_id, kind, slot_date, slot_at, tz, state, attempts, delivery, created_at) VALUES ('r_f', 'briefing', 'manual', NULL, NULL, ?, 'failed', 3, ?, 1)`).run(TZ, JSON.stringify({ telegram: "pending", push: "pending" }));
+  s.db.prepare(`INSERT INTO automation_runs (id, automation_id, kind, slot_date, slot_at, tz, state, attempts, delivery, created_at, delivery_started, notice_sent) VALUES ('r_f', 'briefing', 'manual', NULL, NULL, ?, 'failed', 3, ?, 1, 1, 1)`).run(TZ, JSON.stringify({ telegram: "pending", push: "pending" }));
   s.auto.sweep();
   assert.deepEqual(s.auto._get("r_f").delivery, { telegram: "unknown", push: "unknown" });
+});
+
+ptest("review 5: an owed notice survives a busy lock, a restart and an emergency stop", async () => {
+  const em = { active: false };
+  const s = setup({ emergency: em });
+  s.time.t += 8 * 3600000;
+  s.db.prepare(`INSERT INTO automation_runs (id, automation_id, kind, slot_date, slot_at, tz, state, attempts, delivery, created_at) VALUES ('r_o', 'briefing', 'manual', NULL, NULL, ?, 'summarizing', ?, ?, ?)`).run(TZ, MAX_ATTEMPTS, JSON.stringify({ telegram: "pending", push: "pending" }), s.time.t - 60_000);
+  s.auto.sweep();
+  // Lock busy on the next tick: kept.
+  s.db.prepare("INSERT INTO automation_locks VALUES ('briefing', 'r_other', 1)").run();
+  await s.auto.tick();
+  assert.equal(s.delivered().length, 0);
+  s.db.prepare("DELETE FROM automation_locks").run();
+  // Emergency stop, then a restart (fresh instance, new sweep): still owed.
+  em.active = true;
+  await s.auto.tick();
+  const again = s.make(); again.reload(); again.sweep();
+  assert.equal(again._get("r_o").delivery.telegram, "pending", "never sent, so not 'unknown'");
+  em.active = false;
+  await again.tick();
+  const r = again._get("r_o");
+  assert.equal(r.noticeSent, true);
+  assert.equal(r.delivery.telegram, "sent");
+  assert.equal(s.delivered().filter((d) => d.status === "failed").length, 1);
+});
+
+ptest("review 5: a window that ends during an emergency stop is told after the release", async () => {
+  let free = false;
+  const em = { active: false };
+  const s = setup({ capacity: () => free, emergency: em });
+  await s.auto.tick(); // claimed, deferred
+  em.active = true;
+  s.time.t += 7 * 3600000; // window over while stopped
+  await s.auto.tick();
+  assert.equal(s.auto.status().automations[0].lastRun.errorClass, "expired");
+  assert.equal(s.delivered().length, 0);
+  em.active = false;
+  await s.auto.tick();
+  const exp = s.delivered().filter((d) => d.errorClass === "expired");
+  assert.equal(exp.length, 1);
+  void free;
 });
