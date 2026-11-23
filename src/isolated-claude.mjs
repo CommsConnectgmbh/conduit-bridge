@@ -17,6 +17,8 @@ import { spawn } from "node:child_process";
 import { claudeScheduledArgs } from "./agent-policy.mjs";
 
 export const SUMMARIZE_DEADLINE_MS = 10 * 60 * 1000;
+/** The CLI reports what it loaded within seconds; no report, no run. */
+export const INIT_TIMEOUT_MS = 30_000;
 export const MAX_ANSWER_CHARS = 16_000;
 const MAX_LINE_BYTES = 4 * 1024 * 1024;
 const MODEL_RE = /^[A-Za-z0-9._:\[\]-]{1,80}$/;
@@ -34,12 +36,17 @@ export function scheduledEnv(env = process.env) {
   return out;
 }
 
-/** The init event must describe a process with nothing it could act with. */
+/**
+ * The init event must POSITIVELY describe a process with nothing it could act
+ * with: every field present and empty. A missing or malformed field is a
+ * problem, never "probably fine".
+ */
 export function checkInit(ev) {
   const problems = [];
+  if (!ev || typeof ev !== "object") return ["init_invalid"];
   if (!Array.isArray(ev.tools) || ev.tools.length) problems.push("tools");
   if (!Array.isArray(ev.mcp_servers) || ev.mcp_servers.length) problems.push("mcp");
-  if (Array.isArray(ev.slash_commands) && ev.slash_commands.length) problems.push("slash_commands");
+  if (!Array.isArray(ev.slash_commands) || ev.slash_commands.length) problems.push("slash_commands");
   if (ev.permissionMode !== "dontAsk") problems.push("permission_mode");
   return problems;
 }
@@ -53,7 +60,7 @@ export function checkInit(ev) {
  * `onText(delta)` streams the answer as it arrives (follow-up chats).
  */
 export function runIsolatedClaude({ bin = "claude", input, cwd, model = null, env = process.env,
-  deadlineMs = SUMMARIZE_DEADLINE_MS, maxChars = MAX_ANSWER_CHARS, onText = null, register = null, spawnFn = spawn, now = Date.now }) {
+  deadlineMs = SUMMARIZE_DEADLINE_MS, initTimeoutMs = INIT_TIMEOUT_MS, maxChars = MAX_ANSWER_CHARS, onText = null, register = null, spawnFn = spawn, now = Date.now }) {
   return new Promise((resolve) => {
     const started = now();
     const args = claudeScheduledArgs({ model: model && MODEL_RE.test(model) ? model : null });
@@ -71,6 +78,10 @@ export function runIsolatedClaude({ bin = "claude", input, cwd, model = null, en
     let problems = [];
     let usage = null;
     let resultSeen = false;
+    // Nothing the process says counts until its init event has confirmed the
+    // profile (fail closed): an answer before init, a missing, malformed or
+    // late init all stop the run as profile_mismatch and keep no text.
+    let initOk = false;
     let resultIsError = false;
     let buf = "";
 
@@ -88,10 +99,14 @@ export function runIsolatedClaude({ bin = "claude", input, cwd, model = null, en
     register?.(handle, true);
 
     const deadline = setTimeout(() => stop("summarize_timeout"), deadlineMs);
+    const initTimer = setTimeout(() => {
+      if (!initOk) { problems = ["init_missing"]; stop("profile_mismatch"); }
+    }, Math.min(initTimeoutMs, deadlineMs));
+    initTimer.unref?.();
     deadline.unref?.();
 
     const addText = (delta) => {
-      if (!delta || truncated) return;
+      if (!delta || truncated || !initOk || errorClass) return;
       const room = maxChars - text.length;
       if (delta.length > room) { delta = delta.slice(0, Math.max(0, room)); truncated = true; }
       text += delta;
@@ -99,9 +114,21 @@ export function runIsolatedClaude({ bin = "claude", input, cwd, model = null, en
     };
 
     const onEvent = (ev) => {
+      // Once stopped, nothing that still arrives (a late init included) can
+      // confirm the run again or change why it was stopped.
+      if (errorClass) return;
       if (ev.type === "system" && ev.subtype === "init") {
+        if (initOk) return; // a repeated init changes nothing already confirmed
         problems = checkInit(ev);
-        if (problems.length) stop("profile_mismatch");
+        if (problems.length) { stop("profile_mismatch"); return; }
+        initOk = true;
+        clearTimeout(initTimer);
+        return;
+      }
+      if (!initOk) {
+        // Anything else before a confirmed init: the run is not trusted.
+        if (!problems.length) problems = ["output_before_init"];
+        stop("profile_mismatch");
         return;
       }
       if (ev.type === "assistant" && ev.message && Array.isArray(ev.message.content)) {
@@ -138,6 +165,10 @@ export function runIsolatedClaude({ bin = "claude", input, cwd, model = null, en
     child.on("close", (code) => {
       finished = true;
       clearTimeout(deadline);
+      clearTimeout(initTimer);
+      if (!initOk && !errorClass) { errorClass = "profile_mismatch"; if (!problems.length) problems = ["init_missing"]; }
+      // A run that was stopped keeps no answer: it was never confirmed whole.
+      if (errorClass === "profile_mismatch") text = "";
       // Nothing of this run may outlive it (see automation-commands.mjs).
       try { process.kill(-child.pid, "SIGKILL"); } catch { /* group already empty */ }
       register?.(handle, false);
