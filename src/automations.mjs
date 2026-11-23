@@ -164,6 +164,7 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
     unlock: db.prepare(`DELETE FROM automation_locks WHERE automation_id = ? AND run_id = ?`),
     clearLocks: db.prepare(`DELETE FROM automation_locks`),
     finalPending: db.prepare(`SELECT * FROM automation_runs WHERE state IN ('done', 'failed') AND delivery_started = 1 AND delivery LIKE '%"pending"%'`),
+    undelivered: db.prepare(`SELECT * FROM automation_runs WHERE state = 'delivering' AND delivery_started = 0`),
     noticesDue: db.prepare(`SELECT * FROM automation_runs WHERE notice_due = 1 AND notice_sent = 0`),
     resumeHeld: db.prepare(`UPDATE automation_runs SET next_attempt_at = ? WHERE state = 'claimed' AND error_class = 'emergency'`),
     isLocked: db.prepare(`SELECT 1 FROM automation_locks WHERE automation_id = ?`),
@@ -217,6 +218,9 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
         } else { r.state = "claimed"; r.nextAttemptAt = now(); }
         save(r);
         log("warn", "automation_run_recovered", { id: r.id, automation: row.automation_id, from: row.state });
+      } else if (r.state === "delivering" && !r.deliveryStarted) {
+        // Written, but nothing was sent yet: the next tick delivers it.
+        log("warn", "automation_delivery_resumed", { id: r.id, automation: row.automation_id });
       } else if (r.state === "delivering") {
         for (const ch of ["telegram", "push"]) if (r.delivery[ch] === "pending") r.delivery[ch] = "unknown";
         r.state = "done";
@@ -325,6 +329,9 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
     }
     r.state = "failed";
     r.endedAt = now();
+    // Final state and "a notice is owed" in one write: a crash right after
+    // cannot leave a failed run that nobody is told about.
+    if (!r.noticeSent) r.noticeDue = true;
     save(r);
     log("warn", "automation_run_failed", { id: r.id, automation: a.id, cls, attempts: r.attempts });
     await notifyFailure(a, r, cls);
@@ -410,6 +417,18 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
 
   async function tickOnce() {
     if (!loaded.enabled) return;
+    // Deliveries a crash interrupted before anything was sent.
+    if (!stopped()) {
+      for (const row of Q.undelivered.all()) {
+        const a = automationById(row.automation_id);
+        if (!a || !tryLock(a.id, row.id)) continue;
+        try {
+          const r = rowToRun(row);
+          await deliver(a, r, { header: r.header ? renderHeader(r.header.sources) : "", summary: r.summary || "", fullText: null });
+          r.state = "done"; r.endedAt = r.endedAt ?? now(); save(r);
+        } finally { Q.unlock.run(a.id, row.id); }
+      }
+    }
     // Owed failure notices (stored): sent when nothing stops them; a busy
     // lock or an active stop leaves them for a later tick.
     if (!stopped()) {
@@ -440,7 +459,9 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
         if (row.automation_id !== a.id || t < windowEnd(a, o)) continue;
         if (!tryLock(a.id, o.id)) continue;
         try {
-          o.state = "failed"; o.errorClass = "expired"; o.endedAt = t; save(o);
+          o.state = "failed"; o.errorClass = "expired"; o.endedAt = t;
+          if (!o.noticeSent) o.noticeDue = true;
+          save(o);
           log("warn", "automation_run_expired", { id: o.id, automation: a.id });
           await notifyFailure(a, o, "expired");
         } finally { Q.unlock.run(a.id, o.id); }

@@ -501,3 +501,28 @@ ptest("review 6: taking a notice and starting its delivery is one write", async 
   assert.equal(row.delivery_started, 1, "delivery start stored together with taking the notice");
   s.emergency.active = true; s.auto.stopAll(); await p;
 });
+
+ptest("review 7: a crash right after the final failure still owes the notice", async () => {
+  const s = setup({ collectBody: "exit 3" });
+  for (let i = 0; i < MAX_ATTEMPTS; i++) { await s.auto.tick(); s.time.t += RETRY_MS + 1000; }
+  const row = s.db.prepare("SELECT state, notice_due, notice_sent FROM automation_runs WHERE state = 'failed'").get();
+  assert.ok(row, "run failed");
+  assert.equal(row.notice_sent, 1);
+  // The flag is written with the final state; checked directly on the write path:
+  const r2 = s.db.prepare("SELECT COUNT(*) AS n FROM automation_runs WHERE state = 'failed' AND notice_sent = 0 AND notice_due = 0").get().n;
+  assert.equal(r2, 0);
+});
+
+ptest("review 7: a delivery cut off before it began is sent after the restart", async () => {
+  const s = setup();
+  s.time.t += 8 * 3600000;
+  s.db.prepare(`INSERT INTO automation_runs (id, automation_id, kind, slot_date, slot_at, tz, state, attempts, delivery, created_at, summary, header) VALUES ('r_d', 'briefing', 'manual', NULL, NULL, ?, 'delivering', 1, ?, ?, 'Written summary.', ?)`)
+    .run(TZ, JSON.stringify({ telegram: "pending", push: "pending" }), s.time.t - 60_000, JSON.stringify({ sources: [] }));
+  s.auto.sweep();
+  assert.equal(s.auto._get("r_d").state, "delivering", "not marked done before anything was sent");
+  await s.auto.tick();
+  const r = s.auto._get("r_d");
+  assert.equal(r.state, "done");
+  assert.equal(r.delivery.telegram, "sent");
+  assert.equal(s.delivered()[0].summary, "Written summary.");
+});
