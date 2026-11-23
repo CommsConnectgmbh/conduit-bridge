@@ -1,8 +1,8 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { existsSync, appendFileSync, statSync, writeFileSync, realpathSync } from "node:fs";
+import { existsSync, appendFileSync, statSync, writeFileSync, realpathSync, mkdtempSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { randomUUID, createHash } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import { createWarmPool } from "./warm.mjs";
@@ -45,6 +45,16 @@ import { createEmergencyStop } from "./emergency.mjs";
 import { spokenPrompt } from "./spoken.mjs";
 import { createSpeaker, findIds } from "./speaker.mjs";
 import { PLAYER_ID } from "./sonos.mjs";
+import { createPhase4, takeVapidKeyFromEnv } from "./phase4.mjs";
+import { runIsolatedClaude } from "./isolated-claude.mjs";
+import { followUpPrompt } from "./automation-text.mjs";
+import { sessionOrigin, setTurnOrigin, setTurnEnd } from "./db.mjs";
+
+// The Web Push signing key must never reach a child process: every agent run
+// inherits this process's environment. Taken out before anything is spawned.
+const VAPID_ENV_KEY = takeVapidKeyFromEnv(process.env);
+// Automations, week view, Web Push; created just before listen (see below).
+let phase4 = null;
 
 /**
  * Integer from the environment, with bounds. A bare parseInt let a typo become
@@ -1044,6 +1054,11 @@ async function handleApi(req, res, u, auth) {
 
   // Everything below is reachable only inside an end-to-end session.
 
+  // Conduit 2.0 phase 4: automations, week, push (phase4.mjs).
+  if (phase4 && (path.startsWith("/api/automations") || path === "/api/week" || path.startsWith("/api/push/"))) {
+    if (await phase4.handle(req, res, u, auth, { json, readJson })) return;
+  }
+
   // Bridge state for the app (moved here from the public /healthz).
   if (path === "/api/status" && req.method === "GET") {
     const claudeOk = CLAUDE_ENGINE.isAvailable();
@@ -1079,7 +1094,7 @@ async function handleApi(req, res, u, auth) {
       // emergencyStop: POST /api/emergency-stop|release; readOnly: prompt
       // frames take `readOnly: true`; spokenReplies: prompt frames take
       // `spoken: true` (short answer first, details after a "---" line).
-      features: { turnStatus: 1, emergencyStop: 1, readOnly: 1, spokenReplies: 1 },
+      features: { turnStatus: 1, emergencyStop: 1, readOnly: 1, spokenReplies: 1, ...(phase4 ? phase4.features() : {}) },
       emergencyStop: emergency.status(),
     });
   }
@@ -1210,6 +1225,8 @@ async function handleApi(req, res, u, auth) {
         cwd: r.cwd || null,
         engine: r.engine || "claude",
         model: r.model || null,
+        origin: r.origin === "schedule" ? "schedule" : "live",
+        automationId: r.origin === "schedule" ? r.automation_id || null : null,
         usage: {
           tokens_in: r.tokens_in || 0,
           tokens_out: r.tokens_out || 0,
@@ -1454,6 +1471,10 @@ async function handleApi(req, res, u, auth) {
         const title = body.title.trim().slice(0, 120);
         if (!title) return json(res, 400, { ok: false, error: "title empty" });
         out.titleUpdated = updateTitle(sid, email, title).changes;
+      }
+      if ((typeof body.cwd === "string" || body.cwd === null) && sessionOrigin(sid).origin === "schedule") {
+        // A chat made by an automation runs without tools and has no folder.
+        return json(res, 409, { ok: false, error: "automation chats have no working folder" });
       }
       if (typeof body.cwd === "string" || body.cwd === null) {
         if (body.cwd === null || body.cwd === "") {
@@ -1951,6 +1972,11 @@ function recordTurnEnd(rt, inflight, state, { error = null, kind = null } = {}) 
   // A failed turn's open steps are over too. Not for 'ok': a clean finish has
   // delivered every tool result already.
   if (state !== "ok") closeRunningAuditFor(rt.sid, inflight.assistantId);
+  let steps = null;
+  try {
+    steps = auditForAssistant(rt.sid, inflight.assistantId);
+    setTurnEnd(rt.sid, inflight.assistantId, state === "ok" ? null : (kind || null), steps.length);
+  } catch {}
   if (!journal.enabled) return;
   scheduleOverview();
   // A checkpoint saved in the last step, before the end is journaled.
@@ -1963,8 +1989,10 @@ function recordTurnEnd(rt, inflight, state, { error = null, kind = null } = {}) 
     model: inflight.model || rt.model,
     startedAt: inflight.startedAt,
     chars: (inflight.content || "").length,
-    steps: auditForAssistant(rt.sid, inflight.assistantId),
+    steps: steps || auditForAssistant(rt.sid, inflight.assistantId),
     ts: Date.now(),
+    origin: inflight.origin || "live",
+    profile: inflight.profile || (inflight.readOnly ? "read_only" : "full"),
   });
 }
 
@@ -2097,12 +2125,15 @@ function engageEmergencyStop(by) {
   // next turn after the release resumes the conversation.
   try { warmPool?.killAll(); } catch {}
   try { alexaSession.stop?.("emergency"); } catch {}
+  // Scheduled runs: collect, model and deliver, as process groups.
+  try { stopped += phase4?.automations.stopAll() || 0; } catch {}
   log("warn", "emergency_stop_engaged", { by, stopped, dropped, already: st.already, persisted: st.persisted });
   return { stopped, dropped, persisted: st.persisted };
 }
 
 function activeTurnCount() {
-  let n = 0;
+  // A scheduled briefing being written holds a slot like any turn.
+  let n = phase4?.summarizingCount() || 0;
   for (const r of runtime.values()) {
     if (r.inflight && !r.inflight.done) n++;
   }
@@ -2111,6 +2142,7 @@ function activeTurnCount() {
 
 function spawnInflight(rt, sess, prompt, assistantId, userMessageId = null, engine = null, model = null, opts = {}) {
   const readOnly = opts.readOnly === true;
+  try { setTurnOrigin(rt.sid, assistantId, "live", readOnly ? "read_only" : "full"); } catch {}
   // Not-Aus first: nothing starts while it is on, not even a queued prompt.
   if (emergency.active) {
     log("warn", "turn_blocked_by_emergency_stop", { sid: rt.sid });
@@ -2593,6 +2625,7 @@ function runInflightTurn(engine, rt, sess, prompt, assistantId, userMessageId = 
     heartbeatTimer: null,
     engine: engine.id,
     model: targetModel || null,
+    readOnly,
   };
   // Einmal pro Turn gebaut, nicht pro gelesener Zeile: ein Agent-Lauf schickt
   // tausende Events durch diesen Pfad.
@@ -3026,6 +3059,14 @@ function handleSocket(ws) {
       // record wasn't cleaned up yet — then there is genuinely nothing to wait
       // for, and queueing would hang the user forever. We detect that from real
       // process liveness, never from elapsed silence.
+      // A chat created by an automation is never run with tools, whatever the
+      // frame asks for (engine, model, readOnly, spoken are ignored): its
+      // context holds other people's mail and calendar text.
+      if (sessionOrigin(sid).origin === "schedule") {
+        handleScheduleFollowUp(rt, sid, email, msg, send);
+        return;
+      }
+
       if (rt.inflight && !rt.inflight.done) {
         const warmDead  = rt.inflight.warm  && warmPool && !warmPool.has(rt.sid);
         // `child.killed` only reflects a signal *we* sent, so a crashed or
@@ -3282,6 +3323,70 @@ function retryOutcome(rt, sid, userMessageId) {
   return { kind: "unknown" };
 }
 
+/**
+ * A question in a chat that an automation created. Runs in the scheduled
+ * profile (isolated-claude.mjs): no tools, no MCP, no settings, no hooks, a
+ * fresh process with this chat's own history as data. No queue: one answer at
+ * a time in such a chat.
+ */
+const FOLLOW_UP_HISTORY_CHARS = 60_000;
+function handleScheduleFollowUp(rt, sid, email, msg, send) {
+  const reject = (message) => send({ type: "error", assistantMessageId: msg.assistantMessageId, userMessageId: msg.userMessageId, message, turnStatus: "not_started" });
+  if (emergency.active) return reject("Not started: the emergency stop is active. Release it in the app first.");
+  if (rt.inflight && !rt.inflight.done) return reject("An answer is still being written in this chat. Please wait for it.");
+  if (activeTurnCount() >= MAX_CONCURRENT_TURNS) return reject("The bridge is busy with other tasks. Please try again in a moment.");
+  const sess = getSession(sid, email);
+  if (!sess) return reject("Session conflict (belongs to a different account).");
+  const all = (listMessages(sid, email) || []).filter((m) => m.content && (m.role === "user" || m.role === "assistant"));
+  const history = [];
+  let size = 0;
+  for (let i = all.length - 1; i >= 0 && size < FOLLOW_UP_HISTORY_CHARS; i--) {
+    const content = all[i].content.slice(0, FOLLOW_UP_HISTORY_CHARS - size);
+    size += content.length;
+    history.unshift({ role: all[i].role, content });
+  }
+  const model = process.env.CLAUDE_MODEL || null;
+  const userMsgId = msg.userMessageId || cryptoRandom();
+  try { insertUserMessage(sid, userMsgId, msg.content); } catch { /* dup id ignored */ }
+  const assistantId = newAssistantId(sid, msg.assistantMessageId, userMsgId, model, "claude");
+  try { setTurnOrigin(sid, assistantId, "schedule", "scheduled"); } catch {}
+  broadcast(rt, { type: "started", userMessageId: userMsgId, assistantMessageId: assistantId, engine: "claude", turnStatus: "running" });
+  let handle = null;
+  let dead = false;
+  const inflight = {
+    assistantId, userMessageId: userMsgId, content: "", done: false, errorMsg: null, seq: 0,
+    startedAt: Date.now(), lastOutputAt: Date.now(), activeTools: new Map(), engine: "claude", model, warm: false,
+    origin: "schedule", profile: "scheduled",
+    proc: { stop: () => { handle?.stop(); }, isDead: () => dead },
+  };
+  rt.inflight = inflight;
+  rt.lastUsed = Date.now();
+  recordTurnAccepted(rt, { state: "running", assistantId, userMessageId: userMsgId, engine: "claude", model });
+  let tmp = null;
+  try { tmp = mkdtempSync(join(tmpdir(), "conduit-followup-")); } catch { /* falls back to the bridge dir below */ }
+  runIsolatedClaude({
+    bin: CLAUDE_BIN, input: followUpPrompt({ history, question: msg.content }), cwd: tmp || CWD, model,
+    register: (h, on) => { if (on) handle = h; },
+    onText: (d) => { inflight.lastOutputAt = Date.now(); emitChunk(rt, inflight, inflight.content + d); },
+  }).then((r) => {
+    dead = true;
+    if (tmp) { try { rmSync(tmp, { recursive: true, force: true }); } catch {} }
+    if (inflight.recordedEnd) return;
+    inflight.done = true;
+    if (r.ok) {
+      recordTurnEnd(rt, inflight, "ok");
+      broadcast(rt, { type: "done", assistantMessageId: assistantId, turnStatus: "ok" });
+    } else {
+      const stopped = r.errorClass === "stopped" || inflight.abortedByStop;
+      const message = stopped ? "Stopped." : r.errorClass === "summarize_timeout" ? "The answer took too long and was stopped." : "The answer could not be written.";
+      const state = stopped ? "interrupted" : "error";
+      recordTurnEnd(rt, inflight, state, { error: message, kind: stopped ? "stopped" : "agent_error" });
+      broadcast(rt, { type: "error", message, assistantMessageId: assistantId, turnStatus: state });
+    }
+    log("info", "schedule_follow_up_done", { sid, ok: r.ok, cls: r.errorClass || null });
+  });
+}
+
 function newAssistantId(sid, wanted, replyTo = null, model = null, engine = null) {
   const id = wanted || cryptoRandom();
   try {
@@ -3447,7 +3552,24 @@ function closeTurnsLeftByPreviousProcess() {
   }
 }
 
+try {
+  phase4 = createPhase4({
+    dbDir: process.env.DB_DIR || join(homedir(), "Library/conduit-bridge"),
+    db: historyDb, emergency, journal, log,
+    claudeBin: CLAUDE_BIN, claudeModel: process.env.CLAUDE_MODEL || null,
+    // The account automations may belong to: the configured pairing owner,
+    // or (without one) the account of this bridge's chats.
+    knownOwners: () => (PAIR_OWNER_EMAIL ? [PAIR_OWNER_EMAIL] : [latestSessionEmail()].filter(Boolean)),
+    activeTurns: () => { let n = 0; for (const r of runtime.values()) if (r.inflight && !r.inflight.done) n++; return n; },
+    maxTurns: MAX_CONCURRENT_TURNS,
+    vapidEnvKey: VAPID_ENV_KEY,
+  });
+} catch (e) {
+  log("error", "phase4_init_failed", { err: String(e?.message || e).slice(0, 200) });
+}
+
 server.listen(PORT, HOST, () => {
+  try { phase4?.start(); } catch (e) { log("error", "automations_start_failed", { err: String(e?.message || e).slice(0, 200) }); }
   log("info", "bridge_listening", { host: HOST, port: PORT, version: BRIDGE_VERSION, claude: CLAUDE_BIN, cwd: CWD, warm: USE_WARM, db: process.env.DB_DIR || "~/Library/conduit-bridge" });
   try { closeTurnsLeftByPreviousProcess(); } catch (e) { log("error", "turn_sweep_failed", { err: String(e?.message || e).slice(0, 120) }); }
   // The overview reflects the state after the sweep.

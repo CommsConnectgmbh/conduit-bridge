@@ -460,5 +460,6 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
     },
 
     _get: get,
+    _config: () => (loaded.enabled ? loaded.config : null),
   };
 }

@@ -139,9 +139,48 @@ for (const ddl of [
   // the chat's current choice and changes with the next switch, so it cannot
   // say what an earlier answer ran on. NULL: written before 3.3, not known.
   "ALTER TABLE messages ADD COLUMN engine TEXT",
+  // Conduit 2.0 phase 4. Where a chat came from: 'live' (the owner) or
+  // 'schedule' (created by an automation, always run without tools). Set by
+  // the bridge when it creates the row and never changed afterwards; no client
+  // route writes it. NULL on rows from before 3.6 means live.
+  "ALTER TABLE sessions ADD COLUMN origin TEXT",
+  "ALTER TABLE sessions ADD COLUMN automation_id TEXT",
+  // Per task, written when it is accepted / ends, so the week view and the
+  // proof "no scheduled run had rights" come from stored facts:
+  //   origin   live | schedule
+  //   profile  full | read_only | scheduled   (the rights it actually ran with)
+  //   end_kind the journal's fixed end category (stall, exit, …) or NULL on ok
+  //   tool_count tool steps it took
+  // NULL on rows from before 3.6: unknown, shown as such.
+  "ALTER TABLE messages ADD COLUMN origin TEXT",
+  "ALTER TABLE messages ADD COLUMN profile TEXT",
+  "ALTER TABLE messages ADD COLUMN end_kind TEXT",
+  "ALTER TABLE messages ADD COLUMN tool_count INTEGER",
 ]) {
   try { db.exec(ddl); } catch { /* column already present */ }
 }
+
+// Web Push subscriptions, one row per browser endpoint, bound to the paired
+// device that registered it: revoking the device deletes them (see
+// revokeE2eDevice). bridge_kv holds small bridge facts such as the VAPID key
+// fingerprint.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS push_subscriptions (
+    endpoint    TEXT PRIMARY KEY,
+    device_id   TEXT NOT NULL,
+    email       TEXT NOT NULL,
+    p256dh      TEXT NOT NULL,
+    auth        TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    last_result TEXT,
+    last_at     INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_push_device ON push_subscriptions(device_id);
+  CREATE TABLE IF NOT EXISTS bridge_kv (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
+`);
 
 const Q = {
   upsertSessionGuarded: db.prepare(`
@@ -164,10 +203,49 @@ const Q = {
   touchSession: db.prepare(`UPDATE sessions SET updated_at = ? WHERE id = ?`),
   getSession: db.prepare(`SELECT * FROM sessions WHERE id = ? AND user_email = ?`),
   getSessionRaw: db.prepare(`SELECT * FROM sessions WHERE id = ?`),
+  // Live chats and automation chats are listed separately: one briefing chat a
+  // day would otherwise push the owner's own chats out of the newest-100 list
+  // within a few months.
   listSessions: db.prepare(`
-    SELECT id, title, updated_at, cwd, tokens_in, tokens_out, cache_read, cache_create, cost_usd, turns, engine, model, claude_session_id, agy_conversation_id
-    FROM sessions WHERE user_email = ? ORDER BY updated_at DESC LIMIT 100
+    SELECT id, title, updated_at, cwd, tokens_in, tokens_out, cache_read, cache_create, cost_usd, turns, engine, model, claude_session_id, agy_conversation_id, origin, automation_id
+    FROM sessions WHERE user_email = ? AND (origin IS NULL OR origin <> 'schedule') ORDER BY updated_at DESC LIMIT 100
   `),
+  listScheduleSessions: db.prepare(`
+    SELECT id, title, updated_at, cwd, tokens_in, tokens_out, cache_read, cache_create, cost_usd, turns, engine, model, claude_session_id, agy_conversation_id, origin, automation_id
+    FROM sessions WHERE user_email = ? AND origin = 'schedule' ORDER BY updated_at DESC LIMIT 30
+  `),
+  insertScheduleSession: db.prepare(`
+    INSERT INTO sessions (id, user_email, title, created_at, updated_at, engine, origin, automation_id)
+    VALUES (?, ?, ?, ?, ?, 'claude', 'schedule', ?)
+  `),
+  sessionOrigin: db.prepare(`SELECT origin, automation_id FROM sessions WHERE id = ?`),
+  setTurnOrigin: db.prepare(`UPDATE messages SET origin = ?, profile = ? WHERE id = ? AND session_id = ?`),
+  setTurnEnd: db.prepare(`UPDATE messages SET end_kind = ?, tool_count = ? WHERE id = ? AND session_id = ?`),
+  turnsBetween: db.prepare(`
+    SELECT m.ts, m.turn_status, m.end_kind, m.tool_count, m.profile, m.origin
+    FROM messages m JOIN sessions s ON s.id = m.session_id
+    WHERE s.user_email = ? AND m.role = 'assistant' AND m.ts >= ? AND m.ts < ?
+  `),
+  firstTurnMeta: db.prepare(`SELECT MIN(ts) AS ts FROM messages WHERE role = 'assistant' AND profile IS NOT NULL`),
+  pushUpsert: db.prepare(`
+    INSERT INTO push_subscriptions (endpoint, device_id, email, p256dh, auth, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(endpoint) DO UPDATE SET device_id = excluded.device_id, email = excluded.email,
+      p256dh = excluded.p256dh, auth = excluded.auth, created_at = excluded.created_at, last_result = NULL, last_at = NULL
+  `),
+  pushCountForDevice: db.prepare(`SELECT COUNT(*) AS n FROM push_subscriptions WHERE device_id = ?`),
+  pushDelete: db.prepare(`DELETE FROM push_subscriptions WHERE endpoint = ? AND device_id = ?`),
+  pushDeleteEndpoint: db.prepare(`DELETE FROM push_subscriptions WHERE endpoint = ?`),
+  pushDeleteDevice: db.prepare(`DELETE FROM push_subscriptions WHERE device_id = ?`),
+  pushForDevice: db.prepare(`SELECT * FROM push_subscriptions WHERE device_id = ?`),
+  // Only subscriptions of devices that are still paired.
+  pushForOwner: db.prepare(`
+    SELECT p.* FROM push_subscriptions p JOIN e2e_devices d ON d.device_id = p.device_id
+    WHERE p.email = ? AND d.revoked_at IS NULL
+  `),
+  pushResult: db.prepare(`UPDATE push_subscriptions SET last_result = ?, last_at = ? WHERE endpoint = ?`),
+  kvGet: db.prepare(`SELECT value FROM bridge_kv WHERE key = ?`),
+  kvSet: db.prepare(`INSERT INTO bridge_kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`),
   deleteSession: db.prepare(`DELETE FROM sessions WHERE id = ? AND user_email = ?`),
   insertMessage: db.prepare(`INSERT INTO messages (id, session_id, role, content, ts) VALUES (?, ?, ?, ?, ?)`),
   insertAssistant: db.prepare(`INSERT INTO messages (id, session_id, role, content, ts, reply_to, model, turn_status, engine) VALUES (?, ?, 'assistant', '', ?, ?, ?, ?, ?)`),
@@ -340,7 +418,10 @@ export function listE2eDevices(email) {
 /** Revoke by device id; scoped to an email unless called from the loopback page. */
 export function revokeE2eDevice(deviceId, email) {
   const now = Date.now();
-  return (email ? EQ.revoke.run(now, deviceId, email) : EQ.revokeAny.run(now, deviceId)).changes;
+  const n = (email ? EQ.revoke.run(now, deviceId, email) : EQ.revokeAny.run(now, deviceId)).changes;
+  // A revoked device gets no more notifications.
+  if (n) Q.pushDeleteDevice.run(deviceId);
+  return n;
 }
 
 export function touchE2eDevice(pubkey) {
@@ -402,7 +483,80 @@ export function updateCwd(sid, email, cwd) {
 }
 
 export function listSessions(email) {
-  return Q.listSessions.all(email);
+  return [...Q.listSessions.all(email), ...Q.listScheduleSessions.all(email)];
+}
+
+// ── Conduit 2.0 phase 4: automation chats, task facts, push ────────────────
+
+/** A new chat for one scheduled run. origin is fixed here and never changes. */
+export function createScheduleSession(sid, email, title, automationId) {
+  const now = Date.now();
+  Q.insertScheduleSession.run(sid, email, title, now, now, automationId);
+}
+
+/** 'schedule' or 'live' for a session id (unknown ids: 'live'). */
+export function sessionOrigin(sid) {
+  const r = Q.sessionOrigin.get(sid);
+  return r && r.origin === "schedule" ? { origin: "schedule", automationId: r.automation_id } : { origin: "live", automationId: null };
+}
+
+const ORIGINS = new Set(["live", "schedule"]);
+const PROFILES = new Set(["full", "read_only", "scheduled"]);
+export function setTurnOrigin(sid, msgId, origin, profile) {
+  if (!ORIGINS.has(origin) || !PROFILES.has(profile)) throw new Error("bad turn origin/profile");
+  Q.setTurnOrigin.run(origin, profile, msgId, sid);
+}
+
+export function setTurnEnd(sid, msgId, endKind, toolCount) {
+  Q.setTurnEnd.run(endKind ?? null, Number.isInteger(toolCount) ? toolCount : null, msgId, sid);
+}
+
+export function turnsBetween(email, from, to) {
+  return Q.turnsBetween.all(email, from, to);
+}
+
+/** Since when turns carry origin/profile (first 3.6 turn), or null. */
+export function turnMetaSince() {
+  return Q.firstTurnMeta.get()?.ts ?? null;
+}
+
+export const MAX_PUSH_PER_DEVICE = 5;
+
+/** Store a validated subscription for a device. Returns false when the device has too many. */
+export function savePushSubscription(deviceId, email, sub) {
+  const existing = Q.pushForDevice.all(deviceId);
+  if (!existing.some((r) => r.endpoint === sub.endpoint) && existing.length >= MAX_PUSH_PER_DEVICE) return false;
+  // An endpoint belongs to one browser; if another device had it, it moves.
+  Q.pushUpsert.run(sub.endpoint, deviceId, email, sub.p256dh, sub.auth, Date.now());
+  return true;
+}
+
+export function deletePushSubscription(deviceId, endpoint) {
+  return Q.pushDelete.run(endpoint, deviceId).changes;
+}
+
+export function deletePushEndpoint(endpoint) {
+  return Q.pushDeleteEndpoint.run(endpoint).changes;
+}
+
+export function pushSubscriptionsForDevice(deviceId) {
+  return Q.pushForDevice.all(deviceId);
+}
+
+export function pushSubscriptionsForOwner(email) {
+  return Q.pushForOwner.all(email);
+}
+
+export function recordPushResult(endpoint, result) {
+  Q.pushResult.run(result, Date.now(), endpoint);
+}
+
+export function kvGet(key) {
+  return Q.kvGet.get(key)?.value ?? null;
+}
+
+export function kvSet(key, value) {
+  Q.kvSet.run(key, String(value));
 }
 
 export function getSession(sid, email) {

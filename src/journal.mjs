@@ -81,6 +81,10 @@ export function safeName(v) {
 }
 
 const pick = (set, v) => (set.has(v) ? v : "unknown");
+// Conduit 2.0 phase 4: who started a task and with which rights. Fixed sets.
+const ORIGINS = new Set(["live", "schedule"]);
+const PROFILES = new Set(["full", "read_only", "scheduled"]);
+const PROFILE_LABEL = { full: "volle Rechte", read_only: "Lesemodus", scheduled: "Zeitplan, keine Werkzeuge", unknown: "unbekannt" };
 const iso = (ts) => {
   const n = Number(ts);
   return Number.isFinite(n) && n > 0 ? new Date(n).toISOString().replace(/\.\d{3}Z$/, "Z") : "-";
@@ -554,6 +558,10 @@ export function createJournal({ dir, checkpointDir = null, log = () => {}, now =
       `- Nachricht: \`${safeId(t.userMessageId)}\` · Antwort: \`${safeId(t.assistantId)}\``,
     ];
     if (t.engine || t.model) lines.push(`- Engine/Modell: ${t.engine ? safeName(t.engine) : "-"} / ${t.model ? safeName(t.model) : "-"}`);
+    if (t.origin || t.profile) {
+      const prof = pick(PROFILES, t.profile);
+      lines.push(`- Herkunft: \`${pick(ORIGINS, t.origin)}\` · Rechte: \`${prof}\` (${PROFILE_LABEL[prof]})`);
+    }
     if (t.startedAt) lines.push(`- Gestartet: ${iso(t.startedAt)} · Dauer: ${duration((t.ts ?? now()) - t.startedAt)}`);
     lines.push(`- Antwortlänge: ${int(t.chars)} Zeichen`);
     if (steps.total) {
