@@ -132,6 +132,7 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
   let lastTick = now();
   let ticking = false;
   const lastResend = new Map(); // runId -> ms
+  const owedNotices = []; // runs the sweep failed: their failure notice is still due
 
   const Q = {
     bySlot: db.prepare(`SELECT * FROM automation_runs WHERE automation_id = ? AND slot_date = ? AND kind = 'schedule'`),
@@ -194,8 +195,12 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
       if (r.state === "collecting" || r.state === "summarizing") {
         // The interrupted attempt was counted when it started.
         r.errorClass = "bridge_restart";
-        if (r.attempts >= MAX_ATTEMPTS) { r.state = "failed"; r.endedAt = now(); }
-        else { r.state = "claimed"; r.nextAttemptAt = now(); }
+        if (r.attempts >= MAX_ATTEMPTS) {
+          // Out of attempts: final, and the owner is told on the next tick
+          // through the normal notice path (once, never during a stop).
+          r.state = "failed"; r.endedAt = now();
+          owedNotices.push(r.id);
+        } else { r.state = "claimed"; r.nextAttemptAt = now(); }
         save(r);
         log("warn", "automation_run_recovered", { id: r.id, automation: row.automation_id, from: row.state });
       } else if (r.state === "delivering") {
@@ -377,6 +382,13 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
 
   async function tickOnce() {
     if (!loaded.enabled) return;
+    while (owedNotices.length && !stopped()) {
+      const id = owedNotices.shift();
+      const r = get(id);
+      const a = r ? automationById(Q.byId.get(id).automation_id) : null;
+      if (!a || r.noticeSent || !tryLock(a.id, r.id)) continue;
+      try { await notifyFailure(a, r, r.errorClass || "summarize_failed"); } finally { Q.unlock.run(a.id, r.id); }
+    }
     const t = now();
     const tz = loaded.config.tz;
     for (const a of loaded.config.automations) {

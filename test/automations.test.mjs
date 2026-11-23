@@ -336,11 +336,19 @@ ptest("review fix: capacity is checked again right before the model starts", asy
   assert.equal(s.calls.summarize.length, 0);
 });
 
-ptest("review fix: recovery never allows a fourth attempt", () => {
+ptest("review fix: recovery never allows a fourth attempt, and the failure notice still goes out", async () => {
   const s = setup();
-  s.db.prepare(`INSERT INTO automation_runs (id, automation_id, kind, slot_date, slot_at, tz, state, attempts, delivery, created_at) VALUES ('r_x', 'briefing', 'manual', NULL, NULL, ?, 'summarizing', ?, '{}', 1)`).run(TZ, MAX_ATTEMPTS);
+  s.time.t += 8 * 3600000; // no scheduled slot in the way
+  s.db.prepare(`INSERT INTO automation_runs (id, automation_id, kind, slot_date, slot_at, tz, state, attempts, delivery, created_at) VALUES ('r_x', 'briefing', 'manual', NULL, NULL, ?, 'summarizing', ?, ?, ?)`).run(TZ, MAX_ATTEMPTS, JSON.stringify({ telegram: "pending", push: "pending" }), s.time.t - 60_000);
   s.auto.sweep();
   assert.equal(s.auto._get("r_x").state, "failed");
+  await s.auto.tick();
+  const r = s.auto._get("r_x");
+  assert.equal(r.attempts, MAX_ATTEMPTS, "no fourth attempt");
+  assert.equal(r.noticeSent, true);
+  assert.equal(r.delivery.telegram, "sent");
+  assert.equal(s.delivered().filter((d) => d.status === "failed").length, 1);
+  assert.equal(s.calls.summarize.length, 0);
 });
 
 ptest("review fix: a briefing finished after its window is kept but not delivered", async () => {
