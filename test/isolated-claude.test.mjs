@@ -36,6 +36,7 @@ process.stdin.on("end", () => {
   else if (sc === "result-only") { out({ type: "result", subtype: "success", is_error: false, result: "LEAKED ANSWER", usage: {} }); }
   else if (sc === "silent") { setInterval(() => {}, 1000); return; }
   else if (sc === "exit-empty") { process.exit(0); }
+  else if (sc === "second-init-tools") { out(init); out({ ...init, tools: ["Read"] }); say(); done(); }
   process.exit(0);
 });
 `);
@@ -62,6 +63,7 @@ for (const [sc, why] of [
   ["init-wrong-mode", "init with another permission mode"],
   ["result-only", "a result carrying text, no init"],
   ["exit-empty", "process ends without saying anything"],
+  ["second-init-tools", "a second init that reports a tool"],
 ]) {
   test(`fail closed: ${why}`, { skip: !POSIX }, async () => {
     const r = await run(sc);
@@ -74,6 +76,12 @@ for (const [sc, why] of [
 
 test("fail closed: an init that never comes stops the run", { skip: !POSIX, timeout: 10_000 }, async () => {
   const r = await run("silent", { initTimeoutMs: 300 });
+  assert.equal(r.errorClass, "profile_mismatch");
+  assert.deepEqual(r.problems, ["init_missing"]);
+});
+
+test("fail closed: the overall deadline before any init is a profile mismatch, not a timeout", { skip: !POSIX, timeout: 10_000 }, async () => {
+  const r = await run("silent", { deadlineMs: 200, initTimeoutMs: 5_000 });
   assert.equal(r.errorClass, "profile_mismatch");
   assert.deepEqual(r.problems, ["init_missing"]);
 });

@@ -98,7 +98,11 @@ export function runIsolatedClaude({ bin = "claude", input, cwd, model = null, en
     const handle = { stop: () => stop("stopped"), killNow: () => killGroup("SIGKILL"), pid: child.pid };
     register?.(handle, true);
 
-    const deadline = setTimeout(() => stop("summarize_timeout"), deadlineMs);
+    // Without a confirmed init the run never was this profile: that is the
+    // reason, whichever timer fires first.
+    const deadline = setTimeout(() => {
+      if (!initOk) { problems = ["init_missing"]; stop("profile_mismatch"); } else stop("summarize_timeout");
+    }, deadlineMs);
     const initTimer = setTimeout(() => {
       if (!initOk) { problems = ["init_missing"]; stop("profile_mismatch"); }
     }, Math.min(initTimeoutMs, deadlineMs));
@@ -118,7 +122,8 @@ export function runIsolatedClaude({ bin = "claude", input, cwd, model = null, en
       // confirm the run again or change why it was stopped.
       if (errorClass) return;
       if (ev.type === "system" && ev.subtype === "init") {
-        if (initOk) return; // a repeated init changes nothing already confirmed
+        // Every init is checked, a repeated one too: a later report that
+        // contradicts the first means the process is not what was confirmed.
         problems = checkInit(ev);
         if (problems.length) { stop("profile_mismatch"); return; }
         initOk = true;
