@@ -526,3 +526,30 @@ ptest("review 7: a delivery cut off before it began is sent after the restart", 
   assert.equal(r.delivery.telegram, "sent");
   assert.equal(s.delivered()[0].summary, "Written summary.");
 });
+
+ptest("review 8: a late warning's flag does not hide an unbegun briefing delivery", async () => {
+  const s = setup();
+  s.time.t += 8 * 3600000;
+  // As left by a crash: late warning sent earlier (delivery_started 1), then
+  // the run reached delivering. The fixed path resets the flag with the state.
+  s.db.prepare(`INSERT INTO automation_runs (id, automation_id, kind, slot_date, slot_at, tz, state, attempts, delivery, created_at, summary, header, late_sent, delivery_started) VALUES ('r_l', 'briefing', 'manual', NULL, NULL, ?, 'delivering', 1, ?, ?, 'S.', ?, 1, 0)`)
+    .run(TZ, JSON.stringify({ telegram: "pending", push: "pending" }), s.time.t - 60_000, JSON.stringify({ sources: [] }));
+  s.auto.sweep();
+  await s.auto.tick();
+  assert.equal(s.auto._get("r_l").delivery.telegram, "sent");
+  const src = readFileSync(new URL("../src/automations.mjs", import.meta.url), "utf8");
+  assert.match(src, /r\.state = "delivering";[\s\S]{0,200}r\.deliveryStarted = false;\s*save\(r\);/, "state and reset in one write");
+});
+
+ptest("review 8: a delivery resumed after its window is kept, not sent", async () => {
+  const s = setup();
+  s.time.t += 8 * 3600000;
+  s.db.prepare(`INSERT INTO automation_runs (id, automation_id, kind, slot_date, slot_at, tz, state, attempts, delivery, created_at, summary, header) VALUES ('r_w', 'briefing', 'manual', NULL, NULL, ?, 'delivering', 1, ?, ?, 'Old.', ?)`)
+    .run(TZ, JSON.stringify({ telegram: "pending", push: "pending" }), s.time.t - 7 * 3600000, JSON.stringify({ sources: [] }));
+  s.auto.sweep();
+  await s.auto.tick();
+  const r = s.auto._get("r_w");
+  assert.equal(r.state, "done");
+  assert.equal(r.errorClass, "expired");
+  assert.equal(s.delivered().length, 0);
+});

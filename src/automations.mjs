@@ -391,6 +391,9 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
         return "done";
       }
       r.state = "delivering";
+      // This delivery has not begun yet (a late warning may have set the flag
+      // earlier); same write as the state, so a crash here resumes it.
+      r.deliveryStarted = false;
       save(r);
       await deliver(a, r, { header: renderHeader(sources), summary: r.summary, fullText: s.text });
       r.state = "done";
@@ -424,8 +427,15 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
         if (!a || !tryLock(a.id, row.id)) continue;
         try {
           const r = rowToRun(row);
-          await deliver(a, r, { header: r.header ? renderHeader(r.header.sources) : "", summary: r.summary || "", fullText: null });
-          r.state = "done"; r.endedAt = r.endedAt ?? now(); save(r);
+          if (pastWindow(a, r)) {
+            // Same rule as a run that finishes late: kept, not sent.
+            r.state = "done"; r.errorClass = "expired"; r.endedAt = r.endedAt ?? now();
+            r.delivery = { telegram: "off", push: "off" };
+            save(r);
+          } else {
+            await deliver(a, r, { header: r.header ? renderHeader(r.header.sources) : "", summary: r.summary || "", fullText: null });
+            r.state = "done"; r.endedAt = r.endedAt ?? now(); save(r);
+          }
         } finally { Q.unlock.run(a.id, row.id); }
       }
     }
@@ -571,7 +581,7 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
         try {
           // As "delivering" while it runs, so a crash leaves it to the sweep
           // (channels still pending become "unknown") instead of "pending" forever.
-          r.state = "delivering"; save(r);
+          r.state = "delivering"; r.deliveryStarted = false; save(r);
           await deliver(a, r, { header: r.header ? renderHeader(r.header.sources) : "", summary: r.summary, fullText: null });
         } finally {
           r.state = "done"; save(r);
