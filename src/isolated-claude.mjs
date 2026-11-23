@@ -141,8 +141,13 @@ export function runIsolatedClaude({ bin = "claude", input, cwd, model = null, en
         return;
       }
       if (ev.type === "result") {
+        // Exactly one result, and it must say success explicitly. An error
+        // result is final at once; a second result of any kind is a protocol
+        // error. Missing fields count as failure, never as success.
+        if (resultSeen) { problems = ["second_result"]; stop("summarize_failed"); return; }
         resultSeen = true;
-        resultIsError = ev.is_error === true;
+        resultIsError = !(ev.subtype === "success" && ev.is_error === false);
+        if (resultIsError) { problems = ["result_not_success"]; stop("summarize_failed"); return; }
         // With stream-json the text came in assistant events already; the
         // result repeats it. Only fall back to it when nothing streamed.
         if (!text && typeof ev.result === "string") addText(ev.result);

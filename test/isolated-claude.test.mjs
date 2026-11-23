@@ -40,6 +40,8 @@ process.stdin.on("end", () => {
   else if (sc === "text-then-bad-init") { out(init); say(); out({ ...init, tools: ["Read"] }); done(); }
   else if (sc === "garbled-last-line") { out(init); say(); done(); process.stdout.write('{"type":"system","subtype":"init","tools":["Ba'); }
   else if (sc === "text-then-timeout") { out(init); say(); setInterval(() => {}, 1000); return; }
+  else if (sc === "bare-result") { out(init); say(); out({ type: "result" }); }
+  else if (sc === "error-then-success") { out(init); say(); out({ type: "result", subtype: "error_during_execution", is_error: true }); done(); }
   else if (sc === "bad-init-no-newline") { out(init); say(); done(); process.stdout.write(JSON.stringify({ ...init, tools: ["Bash"] })); }
   process.exit(0);
 });
@@ -72,6 +74,8 @@ for (const [sc, why, cls = "profile_mismatch"] of [
   ["text-then-bad-init", "an answer, then an init that contradicts the first (nothing streamed early)"],
   ["bad-init-no-newline", "a contradicting init as the last line without a newline"],
   ["garbled-last-line", "an unreadable last line", "summarize_failed"],
+  ["bare-result", "a result without success fields", "summarize_failed"],
+  ["error-then-success", "an error result followed by a success result", "summarize_failed"],
 ]) {
   test(`fail closed: ${why}`, { skip: !POSIX }, async () => {
     const r = await run(sc);
