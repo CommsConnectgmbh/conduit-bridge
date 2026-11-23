@@ -32,11 +32,11 @@ const SOURCES_ALL_FAIL = JSON.stringify({ version: 1, sources: [
   { id: "mail", title: "Unread mail", status: "error", count: null, fetchedAt: "2026-11-24T06:00:01+01:00", text: "" },
 ] });
 
-function setup({ pushImpl: pushFn = null, collectBody = `cat <<'EOF'\n${SOURCES_OK}\nEOF`, deliver = true, push = true, extra = {}, summarize, emergency = { active: false }, capacity = () => true, clock } = {}) {
+function setup({ deliverBody = null, pushImpl: pushFn = null, collectBody = `cat <<'EOF'\n${SOURCES_OK}\nEOF`, deliver = true, push = true, extra = {}, summarize, emergency = { active: false }, capacity = () => true, clock } = {}) {
   const dir = sandbox();
   const out = join(dir, "delivered.jsonl");
   const collect = script(dir, "collect", collectBody);
-  const deliverCmd = script(dir, "deliver", `cat >> "${out}"; echo >> "${out}"`);
+  const deliverCmd = script(dir, "deliver", deliverBody || `cat >> "${out}"; echo >> "${out}"`);
   const cfg = {
     version: 1, owner: OWNER, tz: TZ, push: { contact: "mailto:owner@example.com" },
     automations: [{ id: "briefing", title: "Morning briefing", schedule: { time: "07:00", days: [1, 2, 3, 4, 5, 6, 7] },
@@ -357,4 +357,45 @@ test("review fix: days the bridge was off are all marked skipped (up to a week)"
   await s.auto.tick();
   const n = s.db.prepare("SELECT COUNT(*) AS n FROM automation_runs WHERE state = 'skipped'").get().n;
   assert.equal(n, 6, "five earlier days and today");
+});
+
+test("review 2: a stop during the Telegram step ends the whole delivery, even after a quick release", async () => {
+  const s = setup({ deliverBody: "sleep 30" });
+  const p = s.auto.tick();
+  for (let i = 0; i < 200; i++) {
+    const r = s.db.prepare("SELECT state FROM automation_runs WHERE state = 'delivering'").get();
+    if (r && s.auto.activeCount() > 0) break;
+    await new Promise((x) => setTimeout(x, 20));
+  }
+  s.emergency.active = true;
+  s.auto.stopAll();
+  s.emergency.active = false; // released before the process has ended
+  await p;
+  const run = s.auto.status().automations[0].lastRun;
+  assert.equal(run.delivery.telegram, "unknown");
+  assert.equal(run.delivery.push, "held");
+  assert.equal(s.calls.push.length, 0);
+});
+
+test("review 2: a late notice holds the automation lock while it is sent", async () => {
+  let free = false;
+  const s = setup({ capacity: () => free, deliverBody: "sleep 1" });
+  await s.auto.tick();
+  s.time.t += LATE_AFTER_MS + 60_000;
+  const p = s.auto.tick();
+  for (let i = 0; i < 100 && s.auto.activeCount() === 0; i++) await new Promise((x) => setTimeout(x, 10));
+  s.time.t += 3 * 60_000;
+  assert.equal(s.auto.runNow("briefing").error, "busy");
+  await p;
+});
+
+test("review 2: a resend is recorded as delivering while it runs", async () => {
+  const s = setup();
+  await s.auto.tick();
+  const id = s.auto.status().automations[0].lastRun.id;
+  const slow = s.db.prepare("SELECT 1").get(); void slow;
+  assert.equal(s.auto.redeliver(id).ok, true);
+  assert.equal(s.auto._get(id).state, "delivering");
+  for (let i = 0; i < 100 && s.auto._get(id).state !== "done"; i++) await new Promise((x) => setTimeout(x, 20));
+  assert.equal(s.auto._get(id).state, "done");
 });

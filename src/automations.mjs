@@ -221,6 +221,7 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
     }
     r.delivery = { telegram: a.deliver ? "pending" : "off", push: a.push ? "pending" : "off" };
     save(r);
+    let haltedByStop = false;
     if (a.deliver) {
       let res = "failed";
       try {
@@ -229,12 +230,15 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
           env: commandEnv(process.env, loaded.config.tz), cwd: workDir, register });
         // Killed while sending: it may have gone out.
         res = out.stopped || out.timedOut ? "unknown" : out.code === 0 ? "sent" : "failed";
+        if (out.stopped) haltedByStop = true;
       } catch { res = "failed"; }
       r.delivery.telegram = res;
       save(r);
     }
     if (a.push) {
-      if (stopped()) r.delivery.push = "held";
+      // A stop during the Telegram step ends the whole delivery, even if the
+      // stop was released again before that process ended.
+      if (stopped() || haltedByStop) r.delivery.push = "held";
       else {
         let res = "failed";
         const ac = new AbortController();
@@ -382,12 +386,13 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
       // Open runs whose window is over: expired.
       for (const row of Q.open.all()) {
         const o = rowToRun(row);
-        if (row.automation_id !== a.id || Q.isLocked.get(a.id)) continue;
-        if (t >= windowEnd(a, o)) {
+        if (row.automation_id !== a.id || t < windowEnd(a, o)) continue;
+        if (!tryLock(a.id, o.id)) continue;
+        try {
           o.state = "failed"; o.errorClass = "expired"; o.endedAt = t; save(o);
           log("warn", "automation_run_expired", { id: o.id, automation: a.id });
           await notifyFailure(a, o, "expired");
-        }
+        } finally { Q.unlock.run(a.id, o.id); }
       }
       // Manual runs that were deferred (emergency stop, no free slot, restart).
       for (const row of Q.open.all()) {
@@ -398,8 +403,8 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
       r = get(r.id);
       if (FINAL.has(r.state)) continue;
       // Late notice once, never during an emergency stop.
-      if (t - r.slotAt > LATE_AFTER_MS && !r.noticeSent && !stopped() && !Q.isLocked.get(a.id)) {
-        await notifyFailure(a, r, "late");
+      if (t - r.slotAt > LATE_AFTER_MS && !r.noticeSent && !stopped() && tryLock(a.id, r.id)) {
+        try { await notifyFailure(a, r, "late"); } finally { Q.unlock.run(a.id, r.id); }
         r = get(r.id);
       }
       if (r.state === "claimed" && (r.nextAttemptAt ?? 0) <= now()) await execute(a, r);
@@ -492,8 +497,14 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
       lastResend.set(r.id, now());
       (async () => {
         try {
+          // As "delivering" while it runs, so a crash leaves it to the sweep
+          // (channels still pending become "unknown") instead of "pending" forever.
+          r.state = "delivering"; save(r);
           await deliver(a, r, { header: r.header ? renderHeader(r.header.sources) : "", summary: r.summary, fullText: null });
-        } finally { Q.unlock.run(a.id, r.id); }
+        } finally {
+          r.state = "done"; save(r);
+          Q.unlock.run(a.id, r.id);
+        }
       })().catch(() => {});
       return { ok: true };
     },

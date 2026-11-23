@@ -55,6 +55,7 @@ export function resolveVapid({ envKey, dbDir }) {
 
 export function createPhase4({ dbDir, db, emergency, journal = null, log, claudeBin, claudeModel, knownOwners, activeTurns, maxTurns, vapidEnvKey }) {
   let summarizing = 0;
+  const testPushes = new Set(); // AbortControllers of /api/push/test sends
   let vapid = { keys: null, reason: "not_configured" };
   const lastPushTest = new Map();
 
@@ -202,16 +203,21 @@ export function createPhase4({ dbDir, db, emergency, journal = null, log, claude
     if (path === "/api/push/status" && req.method === "GET") {
       const subs = pushSubscriptionsForDevice(auth.deviceId);
       const last = subs.map((s) => ({ r: s.last_result, at: s.last_at || 0 })).sort((a, b) => b.at - a.at)[0];
-      return json(res, 200, { subscribed: subs.length > 0, lastResult: last?.r || null }), true;
+      return json(res, 200, { subscribed: subs.length > 0, lastResult: last?.r || null, lastAt: last?.at || null }), true;
     }
     if (path === "/api/push/test" && req.method === "POST") {
       if (!isOwner(auth) || !vapid.keys) return json(res, 409, { error: "push not enabled" }), true;
+      if (emergency?.active) return json(res, 409, { error: "emergency" }), true;
       const prev = lastPushTest.get(auth.deviceId) || 0;
       if (Date.now() - prev < PUSH_TEST_THROTTLE_MS) return json(res, 429, { error: "throttled" }), true;
       lastPushTest.set(auth.deviceId, Date.now());
       const subs = pushSubscriptionsForDevice(auth.deviceId);
       if (!subs.length) return json(res, 409, { error: "not subscribed" }), true;
-      const results = await Promise.all(subs.map((s) => pushOne(s, { t: "test", title: "Conduit", body: "Test notification" })));
+      const ac = new AbortController();
+      testPushes.add(ac);
+      let results;
+      try { results = await Promise.all(subs.map((s) => pushOne(s, { t: "test", title: "Conduit", body: "Test notification" }, ac.signal))); }
+      finally { testPushes.delete(ac); }
       const result = results.includes("sent") ? "sent" : results.includes("vapid_rejected") ? "vapid_rejected" : "failed";
       return json(res, 200, { ok: true, result }), true;
     }
@@ -230,6 +236,15 @@ export function createPhase4({ dbDir, db, emergency, journal = null, log, claude
       }
     },
     summarizingCount: () => summarizing,
+    /** Emergency stop: every automation stage and every test push. */
+    stopAll() {
+      for (const ac of testPushes) ac.abort();
+      return automations.stopAll();
+    },
+    killAllNow() {
+      for (const ac of testPushes) ac.abort();
+      automations.killAllNow();
+    },
     features() { return { automations: 1, week: 1, push: 1 }; },
   };
 }

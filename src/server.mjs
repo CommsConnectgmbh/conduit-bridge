@@ -1369,8 +1369,13 @@ async function handleApi(req, res, u, auth) {
       // into the answer text, that would have meant history showing no sign a
       // turn had done anything at all. One request, no second race.
       const steps = listSessionAudit(sid, email) || [];
+      // Where the chat came from, so an app that opens it from anywhere (not
+      // only the session list) shows the automation notice and link guard.
+      const so = sessionOrigin(sid);
       return json(res, 200, {
         ok: true,
+        origin: so.origin,
+        automationId: so.automationId,
         // turnStatus/turnError: how each answer ended (see TURN_STATES in
         // db.mjs). null on user rows; "unknown" on answers an older bridge
         // stored without recording the end — those are not claimed as success.
@@ -2128,7 +2133,7 @@ function engageEmergencyStop(by) {
   try { warmPool?.killAll(); } catch {}
   try { alexaSession.stop?.("emergency"); } catch {}
   // Scheduled runs: collect, model and deliver, as process groups.
-  try { stopped += phase4?.automations.stopAll() || 0; } catch {}
+  try { stopped += phase4?.stopAll() || 0; } catch {}
   log("warn", "emergency_stop_engaged", { by, stopped, dropped, already: st.already, persisted: st.persisted });
   return { stopped, dropped, persisted: st.persisted };
 }
@@ -3359,7 +3364,7 @@ function handleScheduleFollowUp(rt, sid, email, msg, send) {
     assistantId, userMessageId: userMsgId, content: "", done: false, errorMsg: null, seq: 0,
     startedAt: Date.now(), lastOutputAt: Date.now(), activeTools: new Map(), engine: "claude", model, warm: false,
     origin: "schedule", profile: "scheduled",
-    proc: { stop: () => { handle?.stop(); }, isDead: () => dead },
+    proc: { stop: () => { handle?.stop(); }, killNow: () => { handle?.killNow?.(); }, isDead: () => dead },
   };
   rt.inflight = inflight;
   rt.lastUsed = Date.now();
@@ -3382,6 +3387,9 @@ function handleScheduleFollowUp(rt, sid, email, msg, send) {
       const stopped = r.errorClass === "stopped" || inflight.abortedByStop;
       const message = stopped ? "Stopped." : r.errorClass === "summarize_timeout" ? "The answer took too long and was stopped." : "The answer could not be written.";
       const state = stopped ? "interrupted" : "error";
+      // The attach replay reads errorMsg: without it a reconnecting app was
+      // told "done" for an answer that failed.
+      inflight.errorMsg = message;
       recordTurnEnd(rt, inflight, state, { error: message, kind: stopped ? "stopped" : "agent_error" });
       broadcast(rt, { type: "error", message, assistantMessageId: assistantId, turnStatus: state });
     }
@@ -3470,7 +3478,12 @@ function killAllInflightChildren() {
   // Ein offener HTTP-Turn hängt genauso in der Luft wie ein Kindprozess: der
   // Dienst rechnet weiter für eine Bridge, die die Antwort nicht mehr annimmt.
   for (const rt of runtime.values()) {
-    if (rt.inflight?.proc && !rt.inflight.done) { try { rt.inflight.proc.stop("shutdown"); } catch {} }
+    if (rt.inflight?.proc && !rt.inflight.done) {
+      try { rt.inflight.proc.stop("shutdown"); } catch {}
+      // A follow-up in an automation chat runs detached: no time left for the
+      // delayed SIGKILL once we exit, so end its group now.
+      try { rt.inflight.proc.killNow?.(); } catch {}
+    }
   }
 }
 
@@ -3510,7 +3523,7 @@ function shutdown(sig) {
   try { killAllInflightChildren(); } catch {}
   // Scheduled runs live in their own process groups; without this they would
   // keep running after the bridge, and the next start would collect again.
-  try { phase4?.automations.killAllNow(); } catch {}
+  try { phase4?.killAllNow(); } catch {}
   log("info", "bridge_shutdown", { sig });
   process.exit(0);
 }
@@ -3520,6 +3533,9 @@ process.on("exit", () => {
   try { closeRuntimeTurns("bridge_shutdown"); } catch {}
   try { warmPool?.killAll(); } catch {}
   try { killAllInflightChildren(); } catch {}
+  // Every exit path (watchdog, crash), not only SIGTERM: scheduled runs and
+  // follow-up answers run in detached groups and would outlive the bridge.
+  try { phase4?.killAllNow(); } catch {}
 });
 
 /**

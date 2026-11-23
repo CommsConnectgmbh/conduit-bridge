@@ -172,6 +172,7 @@ if (scheduled) {
     const mismatch = input.includes("MODE:mismatch");
     out({ type: "system", subtype: "init", tools: mismatch ? ["Bash"] : [], mcp_servers: [], slash_commands: [], permissionMode: "dontAsk" });
     if (mismatch) { setInterval(() => {}, 1000); return; }
+    if (input.includes("FAILQ")) { out({ type: "result", subtype: "error_during_execution", is_error: true, result: "" }); process.exit(1); }
     out({ type: "assistant", message: { content: [{ type: "text", text: input.includes("follow-up question") ? "Follow-up answer." : "Two appointments today.\\n---\\nDetails: 09:00 Dentist." }] } });
     out({ type: "result", subtype: "success", is_error: false, result: "", usage: { input_tokens: 900, output_tokens: 70 } });
   });
@@ -272,7 +273,15 @@ test("scheduled briefing end to end, follow-up, profile check, emergency stop, s
   assert.ok(!follow.argv.includes("exec"), "not codex, whatever the frame said");
   assert.ok(follow.stdin.includes("Two appointments today."), "history of this chat as data");
   assert.ok(follow.stdin.includes("What time is the dentist?"));
+  // A failed follow-up must be reported as failed to an app that reconnects.
+  await f.send({ type: "prompt", content: "FAILQ please", userMessageId: "u-f2", assistantMessageId: "a-f2" });
+  assert.equal((await f.waitFor(isTerminal("a-f2"), "failed follow-up")).type, "error");
   await f.close();
+  const f2 = await client({ sid: run.sessionId });
+  await f2.send({ type: "attach" });
+  const replay = await f2.waitFor((x) => (x.type === "error" || x.type === "done") && x.assistantMessageId === "a-f2", "attach replay");
+  assert.equal(replay.type, "error", "reconnect must not report a failed answer as done");
+  await f2.close();
 
   // 3. A normal live turn: full rights as before, but no VAPID key in reach.
   const l = await client({ sid: SID_LIVE });
@@ -296,6 +305,8 @@ test("scheduled briefing end to end, follow-up, profile check, emergency stop, s
   const mm = await waitRun(c, "check", (r) => r.state === "failed", "profile mismatch");
   assert.equal(mm.errorClass, "profile_mismatch");
   const msgs = await c.call("GET", `/api/sessions/${mm.sessionId}/messages`);
+  assert.equal(msgs.body.origin, "schedule", "origin also on the messages route");
+  assert.equal(msgs.body.automationId, "check");
   const a = msgs.body.messages.find((m) => m.role === "assistant");
   assert.equal(a.turnStatus ?? a.turn_status, "error");
 
@@ -313,6 +324,9 @@ test("scheduled briefing end to end, follow-up, profile check, emergency stop, s
   assert.equal(em.attempts, 0);
   assert.equal(lines(deliverLog).length, before, "nothing delivered");
   assert.equal((await c.call("POST", "/api/automations/briefing/run")).head.status, 409, "manual run refused while stopped");
+  const tp = await c.call("POST", "/api/push/test");
+  assert.equal(tp.head.status, 409);
+  assert.equal(tp.body.error, "emergency", "no test push while stopped");
   await c.call("POST", "/api/emergency-release");
 
   // 7. Week view and journal carry the facts.
