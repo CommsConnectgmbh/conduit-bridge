@@ -470,6 +470,14 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
         if (row.automation_id !== a.id || t < windowEnd(a, o)) continue;
         if (!tryLock(a.id, o.id)) continue;
         try {
+          if (o.state === "delivering" && !o.deliveryStarted) {
+            // The briefing was written; only its delivery is too late. It is a
+            // result (kept, viewable), not a failure, whatever stops sending.
+            o.state = "done"; o.errorClass = "expired"; o.endedAt = o.endedAt ?? t;
+            o.delivery = { telegram: "off", push: "off" };
+            save(o);
+            continue;
+          }
           o.state = "failed"; o.errorClass = "expired"; o.endedAt = t;
           if (!o.noticeSent) o.noticeDue = true;
           save(o);

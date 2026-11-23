@@ -570,3 +570,20 @@ ptest("review 9: a resumed delivery with deliverFull loads the stored full text"
   await withFull.tick();
   assert.equal(s.delivered()[0].full, "S.\n---\nFull details.");
 });
+
+ptest("review 10: a written briefing past its window stays done during an emergency stop", async () => {
+  const s = setup();
+  s.time.t += 8 * 3600000;
+  s.db.prepare(`INSERT INTO automation_runs (id, automation_id, kind, slot_date, slot_at, tz, state, attempts, delivery, created_at, summary, header) VALUES ('r_e', 'briefing', 'manual', NULL, NULL, ?, 'delivering', 1, ?, ?, 'S.', ?)`)
+    .run(TZ, JSON.stringify({ telegram: "pending", push: "pending" }), s.time.t - 7 * 3600000, JSON.stringify({ sources: [] }));
+  s.auto.sweep();
+  s.emergency.active = true;
+  await s.auto.tick();
+  s.emergency.active = false;
+  await s.auto.tick();
+  const r = s.auto._get("r_e");
+  assert.equal(r.state, "done");
+  assert.equal(r.errorClass, "expired");
+  assert.equal(r.noticeDue, false);
+  assert.equal(s.delivered().length, 0, "no false failure notice");
+});
