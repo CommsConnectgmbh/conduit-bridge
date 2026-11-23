@@ -12,7 +12,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import {
-  appendAssistant, createScheduleSession, insertAssistantPlaceholder, insertUserMessage, kvGet, kvSet, setMessageStatus,
+  appendAssistant, createScheduleSession, listMessages, insertAssistantPlaceholder, insertUserMessage, kvGet, kvSet, setMessageStatus,
   setTurnEnd, setTurnOrigin, savePushSubscription, deletePushSubscription, deletePushEndpoint, pushSubscriptionsForDevice,
   pushSubscriptionsForOwner, recordPushResult, turnsBetween, turnMetaSince,
 } from "./db.mjs";
@@ -68,6 +68,13 @@ export function createPhase4({ dbDir, db, emergency, journal = null, log, claude
       capacity: () => activeTurns() + summarizing < maxTurns,
       summarize,
       push: pushToOwner,
+      // The stored answer of a run, for a delivery resumed after a restart.
+      fullText: async (run) => {
+        const cfg = config();
+        if (!cfg || !run.sessionId || !run.messageId) return null;
+        const m = (listMessages(run.sessionId, cfg.owner) || []).find((x) => x.id === run.messageId);
+        return m?.content || null;
+      },
     },
   });
 

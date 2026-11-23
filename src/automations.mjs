@@ -433,7 +433,8 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
             r.delivery = { telegram: "off", push: "off" };
             save(r);
           } else {
-            await deliver(a, r, { header: r.header ? renderHeader(r.header.sources) : "", summary: r.summary || "", fullText: null });
+            const fullText = a.deliverFull && deps.fullText ? await deps.fullText(r) : null;
+            await deliver(a, r, { header: r.header ? renderHeader(r.header.sources) : "", summary: r.summary || "", fullText });
             r.state = "done"; r.endedAt = r.endedAt ?? now(); save(r);
           }
         } finally { Q.unlock.run(a.id, row.id); }
@@ -579,12 +580,12 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
       lastResend.set(r.id, now());
       (async () => {
         try {
-          // As "delivering" while it runs, so a crash leaves it to the sweep
-          // (channels still pending become "unknown") instead of "pending" forever.
-          r.state = "delivering"; r.deliveryStarted = false; save(r);
-          await deliver(a, r, { header: r.header ? renderHeader(r.header.sources) : "", summary: r.summary, fullText: null });
+          // The run stays "done": a resend is not a new result. deliver()
+          // stores the pending channels and the delivery start in one write,
+          // so a crash leaves them to the sweep ("unknown"); the owner can
+          // simply resend again.
+          await deliver(a, r, { header: r.header ? renderHeader(r.header.sources) : "", summary: r.summary, fullText: a.deliverFull && deps.fullText ? await deps.fullText(r) : null });
         } finally {
-          r.state = "done"; save(r);
           Q.unlock.run(a.id, r.id);
         }
       })().catch(() => {});

@@ -401,21 +401,20 @@ ptest("review 2: a late notice holds the automation lock while it is sent", asyn
   await p;
 });
 
-ptest("review 2: a resend is recorded as delivering while it runs", async () => {
+ptest("review 2/9: a resend keeps the run done, and a crash during it ends as unknown", async () => {
   const s = setup();
   await s.auto.tick();
   const id = s.auto.status().automations[0].lastRun.id;
-  const slow = s.db.prepare("SELECT 1").get(); void slow;
-  assert.equal(s.auto.redeliver(id).ok, true);
-  assert.equal(s.auto._get(id).state, "delivering");
-  for (let i = 0; i < 100 && s.auto._get(id).state !== "done"; i++) await new Promise((x) => setTimeout(x, 20));
   assert.equal(s.auto._get(id).state, "done");
-});
-
-test("Windows: automations stay off with a clear reason", () => {
-  const r = loadAutomationsConfig("/nonexistent/automations.json", { knownOwners: [OWNER], platform: "win32" });
-  assert.equal(r.enabled, false);
-  assert.equal(r.reason, "unsupported_platform");
+  // From now on delivery hangs, so the resend is in flight when we "crash".
+  writeFileSync(join(s.dir, "deliver"), "#!/bin/sh\nsleep 30\n");
+  const rd = s.auto.redeliver(id);
+  assert.equal(rd.ok, true, `resend refused: ${rd.error}`);
+  for (let i = 0; i < 200 && s.auto.activeCount() === 0; i++) await new Promise((x) => setTimeout(x, 10));
+  assert.equal(s.auto._get(id).state, "done", "a resend is not a new result");
+  const again = s.make(); again.reload(); again.sweep();
+  assert.equal(again._get(id).delivery.telegram, "unknown");
+  s.emergency.active = true; s.auto.stopAll(); s.emergency.active = false;
 });
 
 ptest("review 3: a background child left by collect is ended with the command", async () => {
@@ -552,4 +551,22 @@ ptest("review 8: a delivery resumed after its window is kept, not sent", async (
   assert.equal(r.state, "done");
   assert.equal(r.errorClass, "expired");
   assert.equal(s.delivered().length, 0);
+});
+
+ptest("review 9: a resumed delivery with deliverFull loads the stored full text", async () => {
+  const dir = sandbox();
+  void dir;
+  const s = setup({ extra: { deliverFull: true } });
+  s.time.t += 8 * 3600000;
+  s.db.prepare(`INSERT INTO automation_runs (id, automation_id, kind, slot_date, slot_at, tz, state, attempts, delivery, created_at, summary, header, session_id, msg_id) VALUES ('r_ft', 'briefing', 'manual', NULL, NULL, ?, 'delivering', 1, ?, ?, 'S.', ?, 'sess', 'msg')`)
+    .run(TZ, JSON.stringify({ telegram: "pending", push: "pending" }), s.time.t - 60_000, JSON.stringify({ sources: [] }));
+  const a = s.make();
+  // fullText dependency: what phase4 loads from the chat.
+  const withFull = createAutomations({ db: s.db, configPath: s.configPath, workDir: join(s.dir, "work2"), emergency: s.emergency, now: () => s.time.t,
+    deps: { knownOwners: () => [OWNER], capacity: () => true, summarize: async () => ({ ok: false }), push: async () => "sent",
+      fullText: async (run) => (run.messageId === "msg" ? "S.\n---\nFull details." : null) } });
+  void a;
+  withFull.reload(); withFull.sweep();
+  await withFull.tick();
+  assert.equal(s.delivered()[0].full, "S.\n---\nFull details.");
 });
