@@ -98,7 +98,7 @@ export function createPhase4({ dbDir, db, emergency, journal = null, log, claude
     try {
       r = await runIsolatedClaude({ bin: claudeBin, input: prompt, cwd, model: claudeModel, register, ...(deadlineMs ? { deadlineMs } : {}) });
     } finally { summarizing--; }
-    if (r.text) appendAssistant(assistantId, r.text + (r.truncated ? "\n\n[answer cut at the length limit]" : ""), sid);
+    if (r.ok && r.text) appendAssistant(assistantId, r.text + (r.truncated ? "\n\n[answer cut at the length limit]" : ""), sid);
     const ok = r.ok;
     setMessageStatus(sid, assistantId, ok ? "ok" : "error", ok ? null : (FAILURE_SUMMARY[r.errorClass] || FAILURE_SUMMARY.summarize_failed));
     setTurnEnd(sid, assistantId, ok ? null : "agent_error", 0);

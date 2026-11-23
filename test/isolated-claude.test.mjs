@@ -1,0 +1,115 @@
+// The scheduled profile is trusted only after the CLI's init event has
+// positively confirmed it (fail closed). A stand-in CLI plays every way that
+// confirmation can be missing, wrong or late; none may yield an answer.
+// POSIX only: the stand-in is a shebang script.
+import { test, before, after } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync, chmodSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { runIsolatedClaude, checkInit } from "../src/isolated-claude.mjs";
+
+const POSIX = process.platform !== "win32";
+let dir, bin;
+const GOOD_INIT = { type: "system", subtype: "init", tools: [], mcp_servers: [], slash_commands: [], permissionMode: "dontAsk" };
+
+before(() => {
+  if (!POSIX) return;
+  dir = mkdtempSync(join(tmpdir(), "conduit-iso-"));
+  bin = join(dir, "fake-claude.mjs");
+  writeFileSync(bin, `#!${process.execPath}
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (d) => { input += d; });
+process.stdin.on("end", () => {
+  const sc = (/SC:([a-z-]+)/.exec(input) || [])[1];
+  const out = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+  const init = ${JSON.stringify(GOOD_INIT)};
+  const say = () => out({ type: "assistant", message: { content: [{ type: "text", text: "LEAKED ANSWER" }] } });
+  const done = () => out({ type: "result", subtype: "success", is_error: false, result: "", usage: { input_tokens: 5, output_tokens: 2 } });
+  if (sc === "ok") { out(init); out({ type: "assistant", message: { content: [{ type: "text", text: "fine" }] } }); done(); }
+  else if (sc === "no-init") { say(); done(); }
+  else if (sc === "late-init") { say(); out(init); done(); }
+  else if (sc === "init-no-tools-field") { const i = { ...init }; delete i.tools; out(i); say(); done(); }
+  else if (sc === "init-no-slash-field") { const i = { ...init }; delete i.slash_commands; out(i); say(); done(); }
+  else if (sc === "init-wrong-mode") { out({ ...init, permissionMode: "bypassPermissions" }); say(); done(); }
+  else if (sc === "result-only") { out({ type: "result", subtype: "success", is_error: false, result: "LEAKED ANSWER", usage: {} }); }
+  else if (sc === "silent") { setInterval(() => {}, 1000); return; }
+  else if (sc === "exit-empty") { process.exit(0); }
+  else if (sc === "second-init-tools") { out(init); out({ ...init, tools: ["Read"] }); say(); done(); }
+  else if (sc === "text-then-bad-init") { out(init); say(); out({ ...init, tools: ["Read"] }); done(); }
+  else if (sc === "garbled-last-line") { out(init); say(); done(); process.stdout.write('{"type":"system","subtype":"init","tools":["Ba'); }
+  else if (sc === "text-then-timeout") { out(init); say(); setInterval(() => {}, 1000); return; }
+  else if (sc === "bare-result") { out(init); say(); out({ type: "result" }); }
+  else if (sc === "error-then-success") { out(init); say(); out({ type: "result", subtype: "error_during_execution", is_error: true }); done(); }
+  else if (sc === "text-after-result") { out(init); done(); out({ type: "assistant", message: { content: [{ type: "text", text: "LEAKED ANSWER" }] } }); }
+  else if (sc === "bad-init-no-newline") { out(init); say(); done(); process.stdout.write(JSON.stringify({ ...init, tools: ["Bash"] })); }
+  process.exit(0);
+});
+`);
+  chmodSync(bin, 0o755);
+});
+after(() => { if (dir) rmSync(dir, { recursive: true, force: true }); });
+
+const run = (sc, extra = {}) => {
+  const seen = [];
+  return runIsolatedClaude({ bin, input: `SC:${sc}`, cwd: dir, onText: (d) => seen.push(d), ...extra }).then((r) => ({ ...r, seen }));
+};
+
+test("a confirmed profile yields the answer", { skip: !POSIX }, async () => {
+  const r = await run("ok");
+  assert.equal(r.errorClass, null);
+  assert.equal(r.text, "fine");
+  assert.deepEqual(r.seen, ["fine"], "published once, after the check");
+});
+
+for (const [sc, why, cls = "profile_mismatch"] of [
+  ["no-init", "answer without any init"],
+  ["late-init", "answer before the init"],
+  ["init-no-tools-field", "init without a tools field"],
+  ["init-no-slash-field", "init without a slash_commands field"],
+  ["init-wrong-mode", "init with another permission mode"],
+  ["result-only", "a result carrying text, no init"],
+  ["exit-empty", "process ends without saying anything"],
+  ["second-init-tools", "a second init that reports a tool"],
+  ["text-then-bad-init", "an answer, then an init that contradicts the first (nothing streamed early)"],
+  ["bad-init-no-newline", "a contradicting init as the last line without a newline", "summarize_failed"],
+  ["garbled-last-line", "an unreadable last line", "summarize_failed"],
+  ["bare-result", "a result without success fields", "summarize_failed"],
+  ["error-then-success", "an error result followed by a success result", "summarize_failed"],
+  ["text-after-result", "text after the success result", "summarize_failed"],
+]) {
+  test(`fail closed: ${why}`, { skip: !POSIX }, async () => {
+    const r = await run(sc);
+    assert.equal(r.errorClass, cls, JSON.stringify(r.problems));
+    assert.equal(r.text, "", "no text may be kept");
+    assert.equal(r.seen.join("").includes("LEAKED"), false, "no text may be streamed");
+    assert.ok(r.problems.length > 0);
+  });
+}
+
+test("fail closed: an init that never comes stops the run", { skip: !POSIX, timeout: 10_000 }, async () => {
+  const r = await run("silent", { initTimeoutMs: 300 });
+  assert.equal(r.errorClass, "profile_mismatch");
+  assert.deepEqual(r.problems, ["init_missing"]);
+});
+
+test("fail closed: the overall deadline before any init is a profile mismatch, not a timeout", { skip: !POSIX, timeout: 10_000 }, async () => {
+  const r = await run("silent", { deadlineMs: 200, initTimeoutMs: 5_000 });
+  assert.equal(r.errorClass, "profile_mismatch");
+  assert.deepEqual(r.problems, ["init_missing"]);
+});
+
+test("a run that times out after some text keeps none of it", { skip: !POSIX, timeout: 10_000 }, async () => {
+  const r = await run("text-then-timeout", { deadlineMs: 400 });
+  assert.equal(r.errorClass, "summarize_timeout");
+  assert.equal(r.text, "");
+  assert.deepEqual(r.seen, []);
+});
+
+test("checkInit wants every field present and empty", () => {
+  assert.deepEqual(checkInit({ tools: [], mcp_servers: [], slash_commands: [], permissionMode: "dontAsk" }), []);
+  assert.ok(checkInit({}).length >= 3);
+  assert.deepEqual(checkInit(null), ["init_invalid"]);
+  assert.ok(checkInit({ tools: ["Read"], mcp_servers: [], slash_commands: [], permissionMode: "dontAsk" }).includes("tools"));
+});
