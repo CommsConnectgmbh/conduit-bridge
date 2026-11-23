@@ -121,6 +121,9 @@ export function runIsolatedClaude({ bin = "claude", input, cwd, model = null, en
       // Once stopped, nothing that still arrives (a late init included) can
       // confirm the run again or change why it was stopped.
       if (errorClass) return;
+      // The success result is the end: anything after it was not covered by
+      // it (protocol error, all text dropped).
+      if (resultSeen) { problems = ["output_after_result"]; stop("summarize_failed"); return; }
       if (ev.type === "system" && ev.subtype === "init") {
         // Every init is checked, a repeated one too: a later report that
         // contradicts the first means the process is not what was confirmed.
@@ -144,7 +147,6 @@ export function runIsolatedClaude({ bin = "claude", input, cwd, model = null, en
         // Exactly one result, and it must say success explicitly. An error
         // result is final at once; a second result of any kind is a protocol
         // error. Missing fields count as failure, never as success.
-        if (resultSeen) { problems = ["second_result"]; stop("summarize_failed"); return; }
         resultSeen = true;
         resultIsError = !(ev.subtype === "success" && ev.is_error === false);
         if (resultIsError) { problems = ["result_not_success"]; stop("summarize_failed"); return; }

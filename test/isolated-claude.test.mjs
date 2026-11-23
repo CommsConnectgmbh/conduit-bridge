@@ -42,6 +42,7 @@ process.stdin.on("end", () => {
   else if (sc === "text-then-timeout") { out(init); say(); setInterval(() => {}, 1000); return; }
   else if (sc === "bare-result") { out(init); say(); out({ type: "result" }); }
   else if (sc === "error-then-success") { out(init); say(); out({ type: "result", subtype: "error_during_execution", is_error: true }); done(); }
+  else if (sc === "text-after-result") { out(init); done(); out({ type: "assistant", message: { content: [{ type: "text", text: "LEAKED ANSWER" }] } }); }
   else if (sc === "bad-init-no-newline") { out(init); say(); done(); process.stdout.write(JSON.stringify({ ...init, tools: ["Bash"] })); }
   process.exit(0);
 });
@@ -72,10 +73,11 @@ for (const [sc, why, cls = "profile_mismatch"] of [
   ["exit-empty", "process ends without saying anything"],
   ["second-init-tools", "a second init that reports a tool"],
   ["text-then-bad-init", "an answer, then an init that contradicts the first (nothing streamed early)"],
-  ["bad-init-no-newline", "a contradicting init as the last line without a newline"],
+  ["bad-init-no-newline", "a contradicting init as the last line without a newline", "summarize_failed"],
   ["garbled-last-line", "an unreadable last line", "summarize_failed"],
   ["bare-result", "a result without success fields", "summarize_failed"],
   ["error-then-success", "an error result followed by a success result", "summarize_failed"],
+  ["text-after-result", "text after the success result", "summarize_failed"],
 ]) {
   test(`fail closed: ${why}`, { skip: !POSIX }, async () => {
     const r = await run(sc);
