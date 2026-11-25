@@ -62,7 +62,9 @@ test("warm: init and hook events but no model activity end the turn after firstR
 });
 
 test("warm: an api_retry notice keeps a slow turn alive", skipWin, async () => {
-  const r = await runOne({ firstReplyMs: 600, env: { FAKE_CLAUDE_INIT_THEN_DELAY_MS: "1500", FAKE_CLAUDE_PRE_EVENTS: "retry" } });
+  // Generous limit: under a loaded test run the fake can take a while to
+  // start; the retry notice must still come first, the answer only later.
+  const r = await runOne({ firstReplyMs: 2500, env: { FAKE_CLAUDE_INIT_THEN_DELAY_MS: "4000", FAKE_CLAUDE_PRE_EVENTS: "retry" } });
   assert.equal(r.error, undefined, r.error);
   assert.equal(r.done, true);
   assert.equal(r.chunks.join(""), "late but here");
@@ -81,7 +83,7 @@ test("warm: firstReplyMs 0 switches the check off", skipWin, async () => {
 });
 
 test("warm: a hook that runs longer than firstReplyMs pauses the clock", skipWin, async () => {
-  const r = await runOne({ firstReplyMs: 600, env: { FAKE_CLAUDE_INIT_THEN_DELAY_MS: "1", FAKE_CLAUDE_PRE_EVENTS: "slowhook", FAKE_CLAUDE_HOOK_MS: "1500" } });
+  const r = await runOne({ firstReplyMs: 1500, env: { FAKE_CLAUDE_INIT_THEN_DELAY_MS: "1", FAKE_CLAUDE_PRE_EVENTS: "slowhook", FAKE_CLAUDE_HOOK_MS: "3500" } });
   assert.equal(r.done, true, r.error);
   assert.equal(r.chunks.join(""), "after the hook");
   assert.equal(r.noReply.length, 0);

@@ -10,6 +10,12 @@ const { createClaudeLogin, parseAuthStatus, judge, storedLoginEnv, AUTH_ERROR_RE
 const skipWin = { skip: process.platform === "win32" };
 const FAKE = fileURLToPath(new URL("./fixtures/fake-claude-auth.mjs", import.meta.url));
 const NOW = Date.parse("2026-11-25T12:00:00Z");
+// Polls instead of fixed sleeps: under a loaded test run a spawn can take long.
+async function until(pred, ms = 8000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) { if (pred()) return true; await new Promise((r) => setTimeout(r, 25)); }
+  return false;
+}
 
 function make({ status, env = {}, notifyRes = "sent" } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "claude-login-"));
@@ -94,7 +100,7 @@ test("turn failures: no_reply with a good login points at the Mac, auth with an 
   try {
     assert.equal(t.cl.noteTurnFailure({ kind: "stopped", error: "Stopped." }), false, "a stop is not a sign-in problem");
     assert.equal(t.cl.noteTurnFailure({ kind: "startup", error: "x" }), true);
-    await new Promise((r) => setTimeout(r, 400));
+    await until(() => t.alerts.length >= 1);
     assert.equal(t.alerts.length, 1);
     assert.match(t.alerts[0].title, /did not answer/);
     t.cl.noteTurnSuccess();
@@ -103,7 +109,7 @@ test("turn failures: no_reply with a good login points at the Mac, auth with an 
   const u = make({ status: { loggedIn: true, loginExpiresAt: "2026-12-25T00:00:00Z" }, env: { CLAUDE_CODE_OAUTH_TOKEN: "tok" } });
   try {
     u.cl.noteTurnFailure({ kind: "agent_error", error: "Invalid API key · Please run /login" });
-    await new Promise((r) => setTimeout(r, 400));
+    await until(() => u.alerts.length >= 1);
     assert.equal(u.alerts.length, 1);
     assert.match(u.alerts[0].text, /setup-token/);
     assert.equal(readFileSync(u.envFile, "utf8").trim().split("\n")[0], "clean+nobrowser");
@@ -224,7 +230,7 @@ test("alerts: a turn that never started is told even after the expiry warning we
     await t.cl.check("a");
     assert.equal(t.alerts.length, 1);
     t.cl.noteTurnFailure({ kind: "startup", error: "x" });
-    await new Promise((r) => setTimeout(r, 400));
+    await until(() => t.alerts.length >= 2);
     assert.equal(t.alerts.length, 2);
     assert.match(t.alerts[1].title, /did not answer/);
   } finally { t.done(); }
@@ -250,4 +256,14 @@ test("check: a fresh check never answers with one that started earlier", async (
   releases[1]();
   assert.equal((await fresh).state, "ok", "the fresh check ran after the old one");
   cl.stop();
+});
+
+test("alerts: a chat rejected for its sign-in is told even after the expiry warning went out", skipWin, async () => {
+  const t = make({ status: { loggedIn: true, loginExpiresAt: "2026-11-27T06:59:00Z" }, env: { CLAUDE_CODE_OAUTH_TOKEN: "" } });
+  try {
+    await t.cl.check("a");
+    t.cl.noteTurnFailure({ kind: "agent_error", error: "OAuth token has expired. Please run /login" });
+    await until(() => t.alerts.length >= 2);
+    assert.deepEqual(t.alerts.map((a) => a.title), ["Claude sign-in expires soon", "Claude rejected the sign-in"]);
+  } finally { t.done(); }
 });

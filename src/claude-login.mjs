@@ -130,7 +130,9 @@ export function createClaudeLogin({
   /** The bridge's turns run on their own token, not on the stored login. */
   const ownToken = () => !!(env.CLAUDE_CODE_OAUTH_TOKEN || env.ANTHROPIC_API_KEY);
 
-  /** Tell the owner once per distinct problem; forget it after a recovery. */
+  /** Tell the owner once per distinct problem; forget it after a recovery.
+   *  Order: what blocks work now (token, expired login, a failed chat) comes
+   *  before the advance warning, so a sent warning never hides a failure. */
   async function maybeAlert(reason) {
     const prev = alerted();
     if (state === "ok" && !lastTurn) {
@@ -148,6 +150,10 @@ export function createClaudeLogin({
       text = ownToken()
         ? "The Claude sign-in on the Mac has expired. Conduit chats keep running on the bridge's token, but terminal sessions, Remote Control and connectors need a new sign-in. Open Conduit, Today, and tap \"Sign in again\"."
         : "The Claude sign-in on the Mac has expired, so chats cannot run. Open Conduit, Today, and tap \"Sign in again\".";
+    } else if (lastTurn?.kind === "auth") {
+      key = `turn:auth:${Math.floor(lastTurn.at / 3600_000)}`;
+      title = "Claude rejected the sign-in";
+      text = "A Conduit chat failed on the Claude sign-in. Open Conduit, Today, and tap \"Sign in again\".";
     } else if (lastTurn?.kind === "no_reply") {
       key = `turn:no_reply:${Math.floor(lastTurn.at / 3600_000)}`;
       title = "Claude did not answer";
@@ -156,10 +162,6 @@ export function createClaudeLogin({
       key = `stored:expiring:${new Date(stored.expiresAt).toISOString().slice(0, 10)}`;
       title = "Claude sign-in expires soon";
       text = `The Claude sign-in on the Mac expires on ${dayLabel(stored.expiresAt)}. Open Conduit, Today, and tap "Sign in again" to renew it.`;
-    } else if (lastTurn?.kind === "auth") {
-      key = `turn:auth:${Math.floor(lastTurn.at / 3600_000)}`;
-      title = "Claude rejected the sign-in";
-      text = "A Conduit chat failed on the Claude sign-in. Open Conduit, Today, and tap \"Sign in again\".";
     }
     if (!key || prev?.key === key || pending.has(key)) return;
     let res = "failed";
