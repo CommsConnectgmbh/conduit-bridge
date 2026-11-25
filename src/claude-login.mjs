@@ -304,7 +304,9 @@ export function createClaudeLogin({
     const said = l.out.split("\n").map((s) => s.trim()).filter(Boolean).pop() || "";
     endLogin(l, ok ? "done" : "failed");
     log(ok ? "info" : "warn", "claude_login_finished", { ok });
-    if (ok) lastTurn = null;
+    // The new stored login fixes what it is about. A rejected bridge token is
+    // not renewed by it, so that problem (and its alert) stays.
+    if (ok && !(lastTurn?.kind === "auth" && ownToken())) lastTurn = null;
     const st = await check("after_login", { fresh: true });
     return ok
       ? { ok: true, status: st }

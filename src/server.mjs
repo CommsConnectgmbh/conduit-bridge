@@ -1101,7 +1101,7 @@ async function handleApi(req, res, u, auth) {
       // emergencyStop: POST /api/emergency-stop|release; readOnly: prompt
       // frames take `readOnly: true`; spokenReplies: prompt frames take
       // `spoken: true` (short answer first, details after a "---" line).
-      features: { turnStatus: 1, emergencyStop: 1, readOnly: 1, spokenReplies: 1, ...(phase4 ? phase4.features() : {}), ...(claudeLogin ? { claudeLogin: 1 } : {}) },
+      features: { turnStatus: 1, emergencyStop: 1, readOnly: 1, spokenReplies: 1, ...(phase4 ? phase4.features() : {}), ...(claudeLogin && isLoginOwner(email) ? { claudeLogin: 1 } : {}) },
       emergencyStop: emergency.status(),
       claudeLogin: claudeLogin && isLoginOwner(email) ? publicLoginStatus() : null,
     });
@@ -3638,11 +3638,12 @@ try {
   log("error", "phase4_init_failed", { err: String(e?.message || e).slice(0, 200) });
 }
 
-function loginOwners() {
-  return (PAIR_OWNER_EMAIL ? [PAIR_OWNER_EMAIL] : [latestSessionEmail()].filter(Boolean)).map((e) => String(e).toLowerCase());
-}
+// Signing the Mac's Claude account in again is the owner's business only, and
+// "owner" must be stated, never guessed: without an explicit PAIR_OWNER_EMAIL
+// (no fallback to the account of the latest chat, which any paired account
+// could become) the whole feature is off.
 function isLoginOwner(email) {
-  return !!email && loginOwners().includes(String(email).toLowerCase());
+  return !!PAIR_OWNER_EMAIL && !!email && String(email).toLowerCase() === PAIR_OWNER_EMAIL.toLowerCase();
 }
 /** What the app sees: the stored login, and whether the bridge's own turns can run. */
 function publicLoginStatus() {
@@ -3650,7 +3651,9 @@ function publicLoginStatus() {
   return { ...st, bridgeReady: claudeReady };
 }
 
-if (CLAUDE_ENGINE.isAvailable() && process.env.CONDUIT_CLAUDE_LOGIN_WATCH !== "0") {
+if (!PAIR_OWNER_EMAIL) {
+  log("info", "claude_login_off", { reason: "no PAIR_OWNER_EMAIL" });
+} else if (CLAUDE_ENGINE.isAvailable() && process.env.CONDUIT_CLAUDE_LOGIN_WATCH !== "0") {
   try {
     claudeLogin = createClaudeLogin({
       claudeBin: CLAUDE_BIN, env: process.env, log, kvGet, kvSet,

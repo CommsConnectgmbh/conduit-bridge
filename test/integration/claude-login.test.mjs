@@ -269,3 +269,37 @@ test("sign-in watch: no-reply turn, expired login, phone sign-in", { skip: !POSI
   assert.ok(!bridge.logs.text.includes("good-code"), "the code is never logged");
   a.close();
 });
+
+test("owner boundary: only the account in PAIR_OWNER_EMAIL, and nothing without it", { skip: !POSIX, timeout: 120_000 }, async () => {
+  // Same database and the device paired above (account owner@example.com).
+  const checkDenied = async (what) => {
+    const c = await client({ sid: SID_A });
+    const st = await c.call("GET", "/api/status");
+    assert.equal(st.body.claudeLogin, null, what + ": no sign-in state in the status");
+    assert.equal(st.body.features.claudeLogin, undefined, what + ": feature not announced");
+    for (const [m, p, body] of [["GET", "/api/claude-login"], ["POST", "/api/claude-login/check"], ["POST", "/api/claude-login/start"],
+      ["POST", "/api/claude-login/code", { id: "x", code: "good-code#s1" }], ["POST", "/api/claude-login/cancel"]]) {
+      const r = await c.call(m, p, body);
+      assert.equal(r.head.status, 404, `${what}: ${m} ${p} -> ${r.head.status}`);
+      assert.equal(r.body.ok, false);
+    }
+    c.close();
+  };
+  const loginRunsBefore = fakeRuns().filter((r) => r.auth === "login").length;
+
+  // 1. Another account is the owner: this device's account is refused.
+  await stopBridge("SIGTERM");
+  bridge = await startBridge({ warm: true, env: { CLAUDE_CODE_OAUTH_TOKEN: "bridge-token", PAIR_OWNER_EMAIL: "someone-else@example.com" } });
+  await checkDenied("other owner");
+
+  // 2. No owner configured: the feature is off altogether (no fallback).
+  await stopBridge("SIGTERM");
+  bridge = await startBridge({ warm: true, env: { CLAUDE_CODE_OAUTH_TOKEN: "bridge-token", PAIR_OWNER_EMAIL: "" } });
+  assert.ok(bridge.logs.text.includes('"claude_login_off"'));
+  await checkDenied("no owner");
+  await sleep(6000); // past the boot check delay: no check runs either
+  assert.ok(!bridge.logs.text.includes('"claude_login_checked"'), "no sign-in check without an owner");
+
+  // Not one sign-in was started by any refused call.
+  assert.equal(fakeRuns().filter((r) => r.auth === "login").length, loginRunsBefore);
+});
