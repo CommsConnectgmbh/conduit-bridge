@@ -248,7 +248,7 @@ Paths set in `.env.local` (`DB_DIR`, `LOG_DIR`, `PASTE_DIR`, `CONDUIT_MODELS_DIR
 | `CONDUIT_MAX_RUNTIME_SESSIONS` | Chats held in memory | 200 |
 | `CONDUIT_TURN_STALL_MS` | End a turn after this long without output | 900000 |
 | `CONDUIT_TURN_STARTUP_MS` | End a Claude turn whose process printed nothing this long after launch (0 = off) | 90000 |
-| `CONDUIT_TURN_FIRST_REPLY_MS` | End a warm Claude turn that took the prompt but showed no model activity (stream event, message, result or API retry notice; hook and status events do not count) this long (0 = off) | 180000 |
+| `CONDUIT_TURN_FIRST_REPLY_MS` | End a warm Claude turn that took the prompt but showed no model activity (stream event, message, result or API retry notice; status events do not count, a running hook allows up to 10 minutes) this long (0 = off) | 180000 |
 | `CONDUIT_CLAUDE_LOGIN_WATCH` | `0` turns the sign-in watch and phone sign-in off | on |
 | `CONDUIT_MAX_TURN_MS` | Hard limit per turn | `0`: none |
 | `CONDUIT_ORPHAN_GRACE_MS` | Optional safety limit: stop a running turn once no app has been connected to the bridge (any chat) for this long; values below 60000 are raised to 60000 (recorded as an error, never as finished) | 0 (off) |

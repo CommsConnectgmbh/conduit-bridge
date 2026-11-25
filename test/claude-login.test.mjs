@@ -146,3 +146,74 @@ test("phone sign-in: cancel ends the waiting CLI", skipWin, async () => {
     assert.deepEqual(await t.cl.submitCode(r.id, "good-code#state1"), { ok: false, error: "no_login" });
   } finally { t.done(); }
 });
+
+import { EventEmitter } from "node:events";
+import { PassThrough, Writable } from "node:stream";
+
+function fakeSpawn({ stdinError = false } = {}) {
+  const made = [];
+  const fn = (bin, args) => {
+    const c = new EventEmitter();
+    c.stdout = new PassThrough(); c.stderr = new PassThrough();
+    if (args?.[1] === "status") {
+      c.stdin = null; c.kill = () => {};
+      setImmediate(() => { c.stdout.end('{"loggedIn":true}\\n'); setImmediate(() => c.emit("close", 0)); });
+      return c;
+    }
+    c.stdin = new Writable({ write(b, e, cb) { if (stdinError) { const x = new Error("broken pipe"); x.code = "EPIPE"; cb(x); } else cb(); } });
+    c.kill = () => { setImmediate(() => c.emit("close", null)); };
+    made.push(c);
+    return c;
+  };
+  return { fn, made };
+}
+
+test("phone sign-in: a link split over chunks is taken whole", async () => {
+  const sp = fakeSpawn();
+  const cl = createClaudeLogin({ claudeBin: "fake", spawnFn: sp.fn, now: () => NOW });
+  const ready = cl.startLogin();
+  const c = sp.made[0];
+  c.stdout.write("visit: https://claude.com/cai/oauth/authorize?code=true&client_id=");
+  await new Promise((r) => setImmediate(r));
+  c.stdout.write("abc&state=complete\nPaste code here > ");
+  const r = await ready;
+  assert.equal(r.url, "https://claude.com/cai/oauth/authorize?code=true&client_id=abc&state=complete");
+  cl.stop();
+});
+
+test("phone sign-in: an EPIPE on the code does not crash", async () => {
+  const sp = fakeSpawn({ stdinError: true });
+  const cl = createClaudeLogin({ claudeBin: "fake", spawnFn: sp.fn, now: () => NOW });
+  const ready = cl.startLogin();
+  sp.made[0].stdout.write("https://claude.com/cai/oauth/authorize?state=complete\n");
+  const r = await ready;
+  const done = cl.submitCode(r.id, "code#state1");
+  await new Promise((res) => setTimeout(res, 50));
+  sp.made[0].emit("close", 1);
+  const out = await done;
+  assert.equal(out.ok, false);
+  cl.stop();
+});
+
+test("alerts: a failed send is tried again on the next check", skipWin, async () => {
+  const t = make({ status: { loggedIn: false }, notifyRes: "failed" });
+  try {
+    await t.cl.check("a");
+    await t.cl.check("b");
+    assert.equal(t.alerts.length, 2, "not swallowed after a failed send");
+    assert.ok(!t.kv.get("claude_login_alert"));
+  } finally { t.done(); }
+});
+
+test("stop ends a waiting sign-in", async () => {
+  const sp = fakeSpawn();
+  let killed = 0;
+  const cl = createClaudeLogin({ claudeBin: "fake", spawnFn: (...a) => { const c = sp.fn(...a); const k = c.kill; c.kill = () => { killed++; k(); }; return c; }, now: () => NOW });
+  // (only the sign-in process is spawned here; no status check runs)
+  const ready = cl.startLogin();
+  sp.made[0].stdout.write("https://claude.com/cai/oauth/authorize?state=x1234567\n");
+  await ready;
+  cl.stop();
+  assert.equal(killed, 1);
+  assert.equal(cl.status().login, null);
+});

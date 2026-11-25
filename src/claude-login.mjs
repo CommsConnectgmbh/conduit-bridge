@@ -35,7 +35,9 @@ const KV_KEY = "claude_login_alert";
 export const AUTH_ERROR_RE = /(\/login\b|please run .{0,20}login|not (signed|logged) in|oauth token (has )?expired|token (has )?expired|invalid api key|authentication_error|invalid bearer|\b401\b|unauthori[sz]ed)/i;
 
 /** The only sign-in pages the link may point at. */
-const LOGIN_URL_RE = /https:\/\/(?:claude\.com|claude\.ai|platform\.claude\.com|console\.anthropic\.com)\/[^\s"'<>]{10,2000}/;
+// Taken only once whitespace follows it: the link can arrive split over
+// several chunks, and an early match would cut off its OAuth parameters.
+const LOGIN_URL_RE = /(https:\/\/(?:claude\.com|claude\.ai|platform\.claude\.com|console\.anthropic\.com)\/[^\s"'<>]{10,2000})\s/;
 /** What a pasted code may look like (code#state, URL-safe characters). */
 const CODE_RE = /^[A-Za-z0-9._~#-]{8,1024}$/;
 
@@ -89,6 +91,7 @@ export function createClaudeLogin({
   let lastTurn = null;        // { kind: "auth" | "no_reply", at }
   let login = null;           // the running `claude auth login`
   let timer = null;
+  const pending = new Set();  // alert keys being sent right now
 
   function runCli(args, { stdin = null, timeoutMs }) {
     return new Promise((resolve) => {
@@ -104,6 +107,9 @@ export function createClaudeLogin({
       to.unref?.();
       child.on("error", (e) => { clearTimeout(to); resolve({ code: -1, out, err: String(e?.message || e) }); });
       child.on("close", (code) => { clearTimeout(to); resolve({ code, out, err }); });
+      // A CLI that closes its input early reports EPIPE as a stream event;
+      // unhandled, that would take the whole bridge down.
+      child.stdin?.on?.("error", () => {});
       if (stdin != null) { try { child.stdin.end(stdin); } catch {} }
     });
   }
@@ -155,10 +161,13 @@ export function createClaudeLogin({
       title = "Claude did not answer";
       text = "A Conduit chat was accepted, but Claude never started to answer. The sign-in checks out, so the Mac is most likely waiting for a confirmation window. Look at the Mac, confirm it, then send the message again.";
     }
-    if (!key || prev?.key === key) return;
-    remember({ key, at: now() });
+    if (!key || prev?.key === key || pending.has(key)) return;
     let res = "failed";
-    try { res = await notify({ kind: "claude_login", title, text }); } catch { res = "failed"; }
+    pending.add(key);
+    try { res = await notify({ kind: "claude_login", title, text }); } catch { res = "failed"; } finally { pending.delete(key); }
+    // Remembered only once a channel took it: a failed send is tried again
+    // on the next check instead of being swallowed for good.
+    if (res === "sent") remember({ key, at: now() });
     log(res === "failed" ? "warn" : "info", "claude_login_alert", { key: key.split(":").slice(0, 2).join(":"), reason, delivered: res });
   }
 
@@ -241,7 +250,7 @@ export function createClaudeLogin({
       if (!l.url) {
         const m = l.out.match(LOGIN_URL_RE);
         if (m) {
-          l.url = m[0];
+          l.url = m[1];
           l.state = "waiting_code";
           log("info", "claude_login_link", { host: new URL(l.url).host });
           resolveReady({ ok: true, id: l.id, url: l.url });
@@ -251,6 +260,8 @@ export function createClaudeLogin({
     child.stdout.on("data", (d) => onData(dec.write(d)));
     child.stderr.on("data", (d) => onData(dec2.write(d)));
     child.on("error", () => {});
+    // See runCli: an asynchronous EPIPE on the code must not crash the bridge.
+    child.stdin.on("error", () => {});
     child.on("close", (code) => {
       l.exit = code;
       l.markExit(code);

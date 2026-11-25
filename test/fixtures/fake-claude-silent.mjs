@@ -19,6 +19,15 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     out({ type: "system", subtype: "hook_started", hook_name: "UserPromptSubmit" });
     out({ type: "system", subtype: "hook_response", hook_name: "UserPromptSubmit" });
     out({ type: "system", subtype: "status", status: "requesting" });
+  } else if (pre === "slowhook") {
+    // A hook that takes FAKE_CLAUDE_HOOK_MS, then the answer comes at once.
+    out({ type: "system", subtype: "hook_started", hook_name: "UserPromptSubmit" });
+    setTimeout(() => {
+      out({ type: "system", subtype: "hook_response", hook_name: "UserPromptSubmit" });
+      out({ type: "assistant", message: { content: [{ type: "text", text: "after the hook" }] } });
+      out({ type: "result", subtype: "success", is_error: false, session_id: sid, usage: { input_tokens: 1, output_tokens: 1 } });
+    }, Number(process.env.FAKE_CLAUDE_HOOK_MS || 0));
+    return;
   } else if (pre === "retry") {
     out({ type: "system", subtype: "api_retry", attempt: 1, retry_delay_ms: 500 });
   }

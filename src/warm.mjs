@@ -65,6 +65,9 @@ export function createWarmPool({
   // first stream event within seconds, a retry notice while the API is busy.
   // 0 disables the check. Overridable via CONDUIT_TURN_FIRST_REPLY_MS.
   firstReplyMs = 180_000,
+  // While a hook runs, the clock allows this long instead (the CLI's own hook
+  // timeout applies first); a hook that never answers still ends the turn.
+  hookMaxMs = 600_000,
   // Told when a turn is given up this way (sid, seconds, stderr tail).
   onNoReply = null,
 }) {
@@ -148,13 +151,22 @@ export function createWarmPool({
     killProc(p, "startup_stall");
   }
 
+  function armReply(p, t, ms = firstReplyMs) {
+    if (firstReplyMs <= 0) return;
+    if (t.replyTimer) clearTimeout(t.replyTimer);
+    t.replyArmed = true;
+    t.replyLimitMs = ms;
+    t.replyTimer = setTimeout(() => onReplyTimeout(p, t), ms);
+    t.replyTimer.unref?.();
+  }
+
   function onReplyTimeout(p, t) {
     t.replyTimer = null;
     if (t.finished || p.turn !== t || !p.alive) return;
-    const secs = Math.round(firstReplyMs / 1000);
+    const secs = Math.round((t.replyLimitMs || firstReplyMs) / 1000);
     // The CLI's last words, for the log only (private file), without home paths.
     const stderr = p.stderrBuf.trim().slice(-300).replace(/\/(Users|home)\/[^/\s]+/g, "~");
-    log("warn", "warm_no_reply", { sid: p.sid, secs, sawInit: !!p.claudeSessionId, stderr: stderr || null });
+    log("warn", "warm_no_reply", { sid: p.sid, secs, sawInit: !!p.claudeSessionId, hooksRunning: t.hooksRunning || 0, stderr: stderr || null });
     t.finished = true;
     t.handlers.onError?.(getEngine("claude").messages.noReply(secs), { stall: true, startup: true, noReply: true });
     killProc(p, "no_reply");
@@ -217,7 +229,17 @@ export function createWarmPool({
     // Only the model side counts: a stream event, a message, a result, or the
     // CLI's notice that it is retrying the API. Hook and status events come
     // before any request and say nothing about whether one will ever be sent.
-    if (t.replyTimer && isModelActivity(ev)) { clearTimeout(t.replyTimer); t.replyTimer = null; }
+    if (t.replyArmed && isModelActivity(ev)) { if (t.replyTimer) clearTimeout(t.replyTimer); t.replyTimer = null; t.replyArmed = false; }
+    // A hook that runs is the CLI at work (its own timeout applies): while it
+    // runs the clock allows hookMaxMs, and it starts over once every hook has
+    // answered.
+    else if (t.replyArmed && ev.type === "system" && ev.subtype === "hook_started") {
+      t.hooksRunning = (t.hooksRunning || 0) + 1;
+      armReply(p, t, Math.max(firstReplyMs, hookMaxMs));
+    } else if (t.replyArmed && ev.type === "system" && ev.subtype === "hook_response") {
+      t.hooksRunning = Math.max(0, (t.hooksRunning || 0) - 1);
+      if (!t.hooksRunning) armReply(p, t);
+    }
 
     // A new text block (after a tool call, or a second one in the same
     // message) is its own paragraph. The separator goes in front of its first
@@ -425,16 +447,13 @@ export function createWarmPool({
     p.busy = true;
     p.lastUsed = Date.now();
     p.lastOutAt = Date.now();
-    const turn = { handlers, sawDelta: false, finished: false, replyTimer: null };
+    const turn = { handlers, sawDelta: false, finished: false, replyTimer: null, replyArmed: false, hooksRunning: 0 };
     p.turn = turn;
     try {
       p.child.stdin.write(
         JSON.stringify({ type: "user", message: { role: "user", content: prompt } }) + "\n",
       );
-      if (firstReplyMs > 0) {
-        turn.replyTimer = setTimeout(() => onReplyTimeout(p, turn), firstReplyMs);
-        turn.replyTimer.unref?.();
-      }
+      armReply(p, turn);
     } catch (e) {
       p.turn.finished = true;
       p.busy = false;

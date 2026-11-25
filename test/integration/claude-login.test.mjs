@@ -169,6 +169,7 @@ if (process.argv[2] === "auth") {
     if (sc === "silent") {
       // What the CLI prints before any request, then nothing (25.11.2026).
       out({ type: "system", subtype: "hook_started", hook_name: "UserPromptSubmit" });
+      out({ type: "system", subtype: "hook_response", hook_name: "UserPromptSubmit" });
       out({ type: "system", subtype: "status", status: "requesting" });
       return;
     }

@@ -13,14 +13,14 @@ const { createWarmPool, isModelActivity } = await import("../src/warm.mjs");
 const skipWin = { skip: process.platform === "win32" };
 const FAKE = fileURLToPath(new URL("./fixtures/fake-claude-silent.mjs", import.meta.url));
 
-function runOne({ env = {}, firstReplyMs, startupMs = 5000 }) {
+function runOne({ env = {}, firstReplyMs, startupMs = 5000, hookMaxMs }) {
   const dir = mkdtempSync(join(tmpdir(), "warm-first-reply-"));
   const logs = [];
   const noReply = [];
   const pool = createWarmPool({
     claudeBin: FAKE, model: "opus", defaultCwd: dir, env: { ...process.env, ...env },
     log: (lvl, msg, meta) => logs.push({ lvl, msg, meta }), isUuid: () => false,
-    startupMs, stallMs: 60_000, firstReplyMs, onNoReply: (x) => noReply.push(x),
+    startupMs, stallMs: 60_000, firstReplyMs, onNoReply: (x) => noReply.push(x), ...(hookMaxMs ? { hookMaxMs } : {}),
   });
   const started = Date.now();
   return new Promise((resolve) => {
@@ -78,4 +78,18 @@ test("warm: an answer within firstReplyMs is untouched", skipWin, async () => {
 test("warm: firstReplyMs 0 switches the check off", skipWin, async () => {
   const r = await runOne({ firstReplyMs: 0, env: { FAKE_CLAUDE_INIT_THEN_DELAY_MS: "1200", FAKE_CLAUDE_PRE_EVENTS: "hooks" } });
   assert.equal(r.done, true, r.error);
+});
+
+test("warm: a hook that runs longer than firstReplyMs pauses the clock", skipWin, async () => {
+  const r = await runOne({ firstReplyMs: 600, env: { FAKE_CLAUDE_INIT_THEN_DELAY_MS: "1", FAKE_CLAUDE_PRE_EVENTS: "slowhook", FAKE_CLAUDE_HOOK_MS: "1500" } });
+  assert.equal(r.done, true, r.error);
+  assert.equal(r.chunks.join(""), "after the hook");
+  assert.equal(r.noReply.length, 0);
+});
+
+test("warm: a hook that never answers still ends the turn after hookMaxMs", skipWin, async () => {
+  const r = await runOne({ firstReplyMs: 300, hookMaxMs: 900, env: { FAKE_CLAUDE_INIT_THEN_DELAY_MS: "1", FAKE_CLAUDE_PRE_EVENTS: "slowhook", FAKE_CLAUDE_HOOK_MS: "60000" } });
+  assert.match(r.error, /did not start to answer within 1s/);
+  assert.ok(r.ms >= 850 && r.ms < 5000, `ended after ${r.ms} ms`);
+  assert.ok(r.logs.some((l) => l.msg === "warm_no_reply" && l.meta?.hooksRunning === 1));
 });

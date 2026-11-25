@@ -3568,6 +3568,8 @@ function shutdown(sig) {
   // Scheduled runs live in their own process groups; without this they would
   // keep running after the bridge, and the next start would collect again.
   try { phase4?.killAllNow(); } catch {}
+  // A sign-in waiting for its code must not outlive the bridge.
+  try { claudeLogin?.stop(); } catch {}
   log("info", "bridge_shutdown", { sig });
   process.exit(0);
 }
@@ -3580,6 +3582,7 @@ process.on("exit", () => {
   // Every exit path (watchdog, crash), not only SIGTERM: scheduled runs and
   // follow-up answers run in detached groups and would outlive the bridge.
   try { phase4?.killAllNow(); } catch {}
+  try { claudeLogin?.stop(); } catch {}
 });
 
 /**
