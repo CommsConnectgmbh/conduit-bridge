@@ -29,7 +29,8 @@
 //     "collect": ["/Users/me/.local/bin/briefing-collect"],
 //     "deliver": ["/Users/me/.local/bin/briefing-deliver"],
 //     "push": true
-//   }]
+//   }],
+//   "alerts": { "deliver": ["/Users/me/.local/bin/briefing-deliver"], "push": true }
 // }
 
 import { readFileSync, statSync } from "node:fs";
@@ -43,7 +44,11 @@ export const DEFAULT_WINDOW_HOURS = 6;
 const ID_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,190}$/;
 
-const TOP_KEYS = new Set(["version", "owner", "tz", "push", "automations"]);
+const TOP_KEYS = new Set(["version", "owner", "tz", "push", "alerts", "automations"]);
+// Bridge alerts (3.7.0): sign-in problems and turns that never started. The
+// same deliver contract as a briefing (JSON on stdin, kind "alert"), so the
+// owner's existing Telegram script can carry them.
+const ALERT_KEYS = new Set(["deliver", "push"]);
 const AUTO_KEYS = new Set(["id", "title", "schedule", "prompt", "collect", "deliver", "deliverFull", "push", "windowHours"]);
 const SCHED_KEYS = new Set(["time", "days"]);
 const PUSH_KEYS = new Set(["contact"]);
@@ -128,6 +133,17 @@ export function validateConfig(raw, { knownOwners = [] } = {}) {
     push = { contact: raw.push.contact };
   }
 
+  let alerts = null;
+  if (raw.alerts !== undefined) {
+    onlyKeys(raw.alerts, ALERT_KEYS, "alerts");
+    if (raw.alerts.push !== undefined && typeof raw.alerts.push !== "boolean") throw new ConfigError("invalid_config", "alerts.push must be true or false");
+    if (raw.alerts.push === true && !push) throw new ConfigError("invalid_config", "alerts.push needs push.contact at the top level");
+    alerts = {
+      deliver: raw.alerts.deliver === undefined ? null : argv(raw.alerts.deliver, "alerts.deliver"),
+      push: raw.alerts.push === true,
+    };
+  }
+
   if (!Array.isArray(raw.automations) || !raw.automations.length || raw.automations.length > MAX_AUTOMATIONS) {
     throw new ConfigError("invalid_config", `automations must list 1 to ${MAX_AUTOMATIONS} entries`);
   }
@@ -162,7 +178,7 @@ export function validateConfig(raw, { knownOwners = [] } = {}) {
       windowMs: windowHours * 3600000,
     };
   });
-  return { owner, tz, push, automations };
+  return { owner, tz, push, alerts, automations };
 }
 
 /**

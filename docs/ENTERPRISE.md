@@ -158,7 +158,15 @@ Your `deliver` command must send plain text without link previews. The briefing 
 
 Each automation runs at most once per local date (the IANA `tz`; a time that does not exist on a DST day runs at the first valid minute). It is retried up to 3 times, 10 minutes apart, inside its window (`windowHours`, default 6). It is marked late after 2 hours, with one notice. The emergency stop kills every stage and nothing is delivered. After a restart, a run that was delivering is marked `unknown` instead of being sent again. The bridge does not wake a sleeping Mac. If you need that, use `pmset repeat wakeorpoweron`. The app shows late runs.
 
+Alerts (optional `alerts` block, same file): `{"deliver": [...], "push": true}`. The bridge tells the owner about Claude sign-in trouble (see below) through the deliver command (JSON on stdin with `kind: "alert"`, `title`, `summary`) and, with `push`, a Web Push that opens Today. Each problem is told once until it is resolved. The deliver command is held while the emergency stop is on.
+
 Web Push: VAPID keys come from `CONDUIT_VAPID_PRIVATE_KEY` (read once at start, then removed from the environment so no agent run can see it) or from a private file the bridge creates on first use. If the key changes, push stays off (`vapid_mismatch`) instead of silently invalidating every subscription. Endpoints must be https on port 443 at a known push service, resolve to a public address, and redirects are refused. The native app shells cannot receive Web Push; use your deliver command there.
+
+## Claude sign-in
+
+Two sign-ins can matter on a bridge machine: whatever the bridge's turns run with (`CLAUDE_CODE_OAUTH_TOKEN`, an API key, or the stored login), and the stored claude.ai login that `/login` renews, which terminal sessions, Remote Control and connectors use. Every 30 minutes the bridge runs `claude auth status --json` without its own token and reads the stored login's state and end date (`/api/status` → `claudeLogin`, owner only). Three days before it runs out, when it has run out, when a turn fails on its sign-in, and when a turn never starts (see `CONDUIT_TURN_FIRST_REPLY_MS`), the owner is told once through `alerts` in `automations.json`.
+
+The owner can sign in again from the app: `POST /api/claude-login/start` runs `claude auth login --claudeai` (without the bridge's token, with `BROWSER` set so no browser opens on the machine) and returns the sign-in link; the code the browser shows goes back with `POST /api/claude-login/code` to the waiting CLI's stdin. One attempt at a time, ended after 10 minutes. Neither the link nor the code is logged. A token the bridge runs with is not renewed this way; the alert then names `claude setup-token`. Turn the watch off with `CONDUIT_CLAUDE_LOGIN_WATCH=0`.
 
 ## Updates
 
@@ -240,6 +248,8 @@ Paths set in `.env.local` (`DB_DIR`, `LOG_DIR`, `PASTE_DIR`, `CONDUIT_MODELS_DIR
 | `CONDUIT_MAX_RUNTIME_SESSIONS` | Chats held in memory | 200 |
 | `CONDUIT_TURN_STALL_MS` | End a turn after this long without output | 900000 |
 | `CONDUIT_TURN_STARTUP_MS` | End a Claude turn whose process printed nothing this long after launch (0 = off) | 90000 |
+| `CONDUIT_TURN_FIRST_REPLY_MS` | End a warm Claude turn that took the prompt but showed no model activity (stream event, message, result or API retry notice; status events do not count, a running hook allows up to 10 minutes) this long (0 = off) | 180000 |
+| `CONDUIT_CLAUDE_LOGIN_WATCH` | `0` turns the sign-in watch and phone sign-in off | on |
 | `CONDUIT_MAX_TURN_MS` | Hard limit per turn | `0`: none |
 | `CONDUIT_ORPHAN_GRACE_MS` | Optional safety limit: stop a running turn once no app has been connected to the bridge (any chat) for this long; values below 60000 are raised to 60000 (recorded as an error, never as finished) | 0 (off) |
 | `CONDUIT_JOURNAL_DIR` | Folder for the automatic Markdown journal, one file per chat (created 0700 if missing; an existing folder keeps its mode; files 0600) | `<DB_DIR>/journal` |

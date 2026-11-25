@@ -21,6 +21,8 @@ import { runIsolatedClaude } from "./isolated-claude.mjs";
 import { b64u, generateVapidPrivateKey, sendPush, validateSubscription, vapidKeys } from "./webpush.mjs";
 import { addDays, dayBounds, localDate, systemZone } from "./schedule-time.mjs";
 import { FAILURE_SUMMARY } from "./automation-text.mjs";
+import { DELIVER_TIMEOUT_MS, commandEnv, runCommand } from "./automation-commands.mjs";
+import { checkExecutable } from "./automations-config.mjs";
 
 export { VAPID_ENV, takeVapidKeyFromEnv } from "./vapid-env.mjs";
 const VAPID_FILE = "vapid-private.key";
@@ -56,6 +58,7 @@ export function resolveVapid({ envKey, dbDir }) {
 export function createPhase4({ dbDir, db, emergency, journal = null, log, claudeBin, claudeModel, knownOwners, activeTurns, maxTurns, vapidEnvKey }) {
   let summarizing = 0;
   const testPushes = new Set(); // AbortControllers of /api/push/test sends
+  const alertRuns = new Set();  // runCommand handles of alert deliveries
   let vapid = { keys: null, reason: "not_configured" };
   const lastPushTest = new Map();
 
@@ -133,6 +136,43 @@ export function createPhase4({ dbDir, db, emergency, journal = null, log, claude
     if (!subs.length) return "off";
     const results = await Promise.all(subs.map((s) => pushOne(s, payload, signal)));
     return results.includes("sent") ? "sent" : "failed";
+  }
+
+  /**
+   * A bridge alert (sign-in trouble, a turn that never started) to the owner:
+   * the alerts.deliver command (same JSON contract as a briefing, kind
+   * "alert") and Web Push. Off without an `alerts` block in automations.json.
+   * The command is held while the emergency stop is on (it runs nothing
+   * unattended then); the push, which runs no command, still goes.
+   * Returns "sent" if any channel took it, "off" if none is set, else "failed".
+   */
+  async function alert({ kind, title, text }) {
+    const cfg = config();
+    if (!cfg?.alerts) return "off";
+    const res = [];
+    if (cfg.alerts.deliver) {
+      if (emergency?.active) res.push("held");
+      else {
+        let r = "failed";
+        try {
+          checkExecutable(cfg.alerts.deliver[0]);
+          const payload = { version: 1, kind: "alert", alert: String(kind).slice(0, 40), title: String(title).slice(0, 80), status: "alert", summary: String(text).slice(0, 2000), appHint: "Details in Conduit" };
+          const out = await runCommand({ argv: cfg.alerts.deliver, stdin: JSON.stringify(payload), timeoutMs: DELIVER_TIMEOUT_MS,
+            env: commandEnv(process.env, cfg.tz), cwd: join(dbDir, "automations-work"),
+            // Reachable for the emergency stop and shutdown, like every other command.
+            register: (h, on) => { if (on) alertRuns.add(h); else alertRuns.delete(h); } });
+          r = out.code === 0 && !out.timedOut && !out.stopped ? "sent" : "failed";
+        } catch { r = "failed"; }
+        res.push(r);
+      }
+    }
+    if (cfg.alerts.push) {
+      let r = "failed";
+      try { r = await pushToOwner({ payload: { t: "alert", a: String(kind).slice(0, 40), title: String(title).slice(0, 80), body: String(text).slice(0, 220) } }); } catch { r = "failed"; }
+      res.push(r);
+    }
+    if (!res.length) return "off";
+    return res.includes("sent") ? "sent" : res.every((x) => x === "off") ? "off" : "failed";
   }
 
   function isOwner(auth) {
@@ -242,14 +282,19 @@ export function createPhase4({ dbDir, db, emergency, journal = null, log, claude
         if (!vapid.keys) log("warn", "push_disabled", { reason: vapid.reason });
       }
     },
+    alert,
+    isOwner,
+    tz: () => config()?.tz || null,
     summarizingCount: () => summarizing,
     /** Emergency stop: every automation stage and every test push. */
     stopAll() {
       for (const ac of testPushes) ac.abort();
+      for (const h of alertRuns) { try { h.stop(); } catch {} }
       return automations.stopAll();
     },
     killAllNow() {
       for (const ac of testPushes) ac.abort();
+      for (const h of alertRuns) { try { h.killNow(); } catch {} }
       automations.killAllNow();
     },
     features() { return { automations: 1, week: 1, push: 1 }; },

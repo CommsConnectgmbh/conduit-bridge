@@ -51,10 +51,13 @@ import { PLAYER_ID } from "./sonos.mjs";
 import { createPhase4 } from "./phase4.mjs";
 import { runIsolatedClaude } from "./isolated-claude.mjs";
 import { followUpPrompt } from "./automation-text.mjs";
-import { sessionOrigin, setTurnOrigin, setTurnEnd } from "./db.mjs";
+import { sessionOrigin, setTurnOrigin, setTurnEnd, kvGet, kvSet } from "./db.mjs";
+import { createClaudeLogin } from "./claude-login.mjs";
 
 // Automations, week view, Web Push; created just before listen (see below).
 let phase4 = null;
+// Claude sign-in watch and phone sign-in (claude-login.mjs); created with phase4.
+let claudeLogin = null;
 
 /**
  * Integer from the environment, with bounds. A bare parseInt let a typo become
@@ -218,6 +221,9 @@ const CHILD_STALL_MS = intEnv("CONDUIT_TURN_STALL_MS", 900_000, 1000, 24 * 3600_
 // A warm claude that has not printed one byte this long after launch never
 // started (see warm.mjs startupMs). 0 = off.
 const CHILD_STARTUP_MS = intEnv("CONDUIT_TURN_STARTUP_MS", 90_000, 0, 24 * 3600_000);
+// A warm turn whose prompt was taken but which shows no model activity this
+// long never started (see warm.mjs firstReplyMs). 0 = off.
+const CHILD_FIRST_REPLY_MS = intEnv("CONDUIT_TURN_FIRST_REPLY_MS", 180_000, 0, 24 * 3600_000);
 const CHILD_HEARTBEAT_MS = 10_000;       // tick interval for the "still working" heartbeat
 const CHILD_HEARTBEAT_MIN_SILENCE_MS = 3_000; // only emit once silence exceeds this, so lively chunks aren't drowned in beats
 const MAX_PROMPT_QUEUE = 10;             // max prompts queued while a turn is running (further ones are rejected)
@@ -475,6 +481,7 @@ const warmPool = USE_WARM
       claudeBin: CLAUDE_BIN, model: MODEL, defaultCwd: CWD,
       env: process.env, envFor: (sid) => agentEnvFor(sid), systemPromptFor: (sid) => agentContextFor(sid), log, isUuid,
       maxWarm: WARM_MAX, idleMs: WARM_IDLE_MS, stallMs: CHILD_STALL_MS, startupMs: CHILD_STARTUP_MS,
+      firstReplyMs: CHILD_FIRST_REPLY_MS,
     })
   : null;
 
@@ -1094,9 +1101,38 @@ async function handleApi(req, res, u, auth) {
       // emergencyStop: POST /api/emergency-stop|release; readOnly: prompt
       // frames take `readOnly: true`; spokenReplies: prompt frames take
       // `spoken: true` (short answer first, details after a "---" line).
-      features: { turnStatus: 1, emergencyStop: 1, readOnly: 1, spokenReplies: 1, ...(phase4 ? phase4.features() : {}) },
+      features: { turnStatus: 1, emergencyStop: 1, readOnly: 1, spokenReplies: 1, ...(phase4 ? phase4.features() : {}), ...(claudeLogin ? { claudeLogin: 1 } : {}) },
       emergencyStop: emergency.status(),
+      claudeLogin: claudeLogin && isLoginOwner(email) ? publicLoginStatus() : null,
     });
+  }
+
+  // Claude sign-in (claude-login.mjs): state, a fresh check, and signing in
+  // again from the phone. Only the bridge owner's account.
+  if (path.startsWith("/api/claude-login")) {
+    if (!claudeLogin || !isLoginOwner(email)) return json(res, 404, { ok: false, error: "not available" });
+    if (path === "/api/claude-login" && req.method === "GET") return json(res, 200, { ok: true, ...publicLoginStatus() });
+    if (path === "/api/claude-login/check" && req.method === "POST") {
+      await claudeLogin.check("manual");
+      return json(res, 200, { ok: true, ...publicLoginStatus() });
+    }
+    if (path === "/api/claude-login/start" && req.method === "POST") {
+      const r = await claudeLogin.startLogin();
+      log("info", "claude_login_start_requested", { by: auth.deviceId, ok: r.ok, error: r.error || null });
+      return json(res, r.ok ? 200 : 502, r.ok ? { ok: true, id: r.id, url: r.url } : { ok: false, error: r.error });
+    }
+    if (path === "/api/claude-login/code" && req.method === "POST") {
+      const body = await readJson(req) || {};
+      const r = await claudeLogin.submitCode(String(body.id || ""), String(body.code || ""));
+      return json(res, r.ok ? 200 : r.error === "bad_code" || r.error === "no_login" || r.error === "not_ready" ? 409 : 502, r.ok
+        ? { ok: true, ...publicLoginStatus() }
+        : { ok: false, error: r.error, message: r.message || null, ...publicLoginStatus() });
+    }
+    if (path === "/api/claude-login/cancel" && req.method === "POST") {
+      claudeLogin.cancelLogin();
+      return json(res, 200, { ok: true, ...publicLoginStatus() });
+    }
+    return json(res, 404, { ok: false, error: "not found" });
   }
 
   // Not-Aus: stops every run of every chat and blocks new ones until released.
@@ -1975,6 +2011,14 @@ function recordTurnEnd(rt, inflight, state, { error = null, kind = null } = {}) 
   if (inflight.recordedEnd) return;
   inflight.recordedEnd = true;
   inflight.finalState = state;
+  // Sign-in watch: a Claude turn that failed on its sign-in or never started
+  // triggers a fresh check and, if needed, an alert; an answer clears it.
+  if ((inflight.engine || rt.engine || "claude") === "claude" && inflight.origin !== "schedule") {
+    try {
+      if (state === "ok") claudeLogin?.noteTurnSuccess();
+      else if (state === "error") claudeLogin?.noteTurnFailure({ kind, error: error || inflight.errorMsg || null });
+    } catch {}
+  }
   try { setMessageStatus(rt.sid, inflight.assistantId, state, state === "ok" ? null : (error || inflight.errorMsg || null)); } catch {}
   // A failed turn's open steps are over too. Not for 'ok': a clean finish has
   // delivered every tool result already.
@@ -3524,6 +3568,8 @@ function shutdown(sig) {
   // Scheduled runs live in their own process groups; without this they would
   // keep running after the bridge, and the next start would collect again.
   try { phase4?.killAllNow(); } catch {}
+  // A sign-in waiting for its code must not outlive the bridge.
+  try { claudeLogin?.stop(); } catch {}
   log("info", "bridge_shutdown", { sig });
   process.exit(0);
 }
@@ -3536,6 +3582,7 @@ process.on("exit", () => {
   // Every exit path (watchdog, crash), not only SIGTERM: scheduled runs and
   // follow-up answers run in detached groups and would outlive the bridge.
   try { phase4?.killAllNow(); } catch {}
+  try { claudeLogin?.stop(); } catch {}
 });
 
 /**
@@ -3591,8 +3638,33 @@ try {
   log("error", "phase4_init_failed", { err: String(e?.message || e).slice(0, 200) });
 }
 
+function loginOwners() {
+  return (PAIR_OWNER_EMAIL ? [PAIR_OWNER_EMAIL] : [latestSessionEmail()].filter(Boolean)).map((e) => String(e).toLowerCase());
+}
+function isLoginOwner(email) {
+  return !!email && loginOwners().includes(String(email).toLowerCase());
+}
+/** What the app sees: the stored login, and whether the bridge's own turns can run. */
+function publicLoginStatus() {
+  const st = claudeLogin.status();
+  return { ...st, bridgeReady: claudeReady };
+}
+
+if (CLAUDE_ENGINE.isAvailable() && process.env.CONDUIT_CLAUDE_LOGIN_WATCH !== "0") {
+  try {
+    claudeLogin = createClaudeLogin({
+      claudeBin: CLAUDE_BIN, env: process.env, log, kvGet, kvSet,
+      notify: (a) => (phase4 ? phase4.alert(a) : Promise.resolve("off")),
+      tz: () => phase4?.tz() || null,
+    });
+  } catch (e) {
+    log("error", "claude_login_init_failed", { err: String(e?.message || e).slice(0, 200) });
+  }
+}
+
 server.listen(PORT, HOST, () => {
   try { phase4?.start(); } catch (e) { log("error", "automations_start_failed", { err: String(e?.message || e).slice(0, 200) }); }
+  try { claudeLogin?.start(); } catch (e) { log("error", "claude_login_start_failed", { err: String(e?.message || e).slice(0, 200) }); }
   log("info", "bridge_listening", { host: HOST, port: PORT, version: BRIDGE_VERSION, claude: CLAUDE_BIN, cwd: CWD, warm: USE_WARM, db: process.env.DB_DIR || "~/Library/conduit-bridge" });
   try { closeTurnsLeftByPreviousProcess(); } catch (e) { log("error", "turn_sweep_failed", { err: String(e?.message || e).slice(0, 120) }); }
   // The overview reflects the state after the sweep.
