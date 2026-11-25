@@ -140,7 +140,9 @@ export function createClaudeLogin({
       return;
     }
     let key = null, title = null, text = null;
-    if (lastTurn?.kind === "auth" && ownToken() && (state === "ok" || state === "expiring")) {
+    // The bridge's chats run on its own token: a chat rejected for its
+    // sign-in is that token's fault, whatever the stored login says.
+    if (lastTurn?.kind === "auth" && ownToken()) {
       key = `turn:token:${Math.floor(lastTurn.at / 3600_000)}`;
       title = "Claude rejected the bridge's token";
       text = "A Conduit chat failed because Claude rejected the sign-in token the bridge runs with (CLAUDE_CODE_OAUTH_TOKEN). Create a new one on the Mac with `claude setup-token`, store it where the bridge reads it, and restart the bridge.";

@@ -267,3 +267,14 @@ test("alerts: a chat rejected for its sign-in is told even after the expiry warn
     assert.deepEqual(t.alerts.map((a) => a.title), ["Claude sign-in expires soon", "Claude rejected the sign-in"]);
   } finally { t.done(); }
 });
+
+test("alerts: a rejected bridge token is told even while the stored login is expired", skipWin, async () => {
+  const t = make({ status: { loggedIn: true, loginExpiresAt: "2026-11-01T00:00:00Z" }, env: { CLAUDE_CODE_OAUTH_TOKEN: "tok" } });
+  try {
+    await t.cl.check("a");
+    assert.match(t.alerts[0].title, /expired/);
+    t.cl.noteTurnFailure({ kind: "agent_error", error: "Invalid API key · Please run /login" });
+    await until(() => t.alerts.length >= 2);
+    assert.match(t.alerts[1].text, /setup-token/);
+  } finally { t.done(); }
+});
