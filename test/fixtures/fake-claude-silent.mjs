@@ -28,6 +28,10 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       out({ type: "result", subtype: "success", is_error: false, session_id: sid, usage: { input_tokens: 1, output_tokens: 1 } });
     }, Number(process.env.FAKE_CLAUDE_HOOK_MS || 0));
     return;
+  } else if (pre === "queued") {
+    // A background notice turn ends first (origin not human), then nothing.
+    out({ type: "result", subtype: "success", is_error: false, session_id: sid, origin: { kind: "task-notification" }, usage: { input_tokens: 1, output_tokens: 1 } });
+    return;
   } else if (pre === "retry") {
     out({ type: "system", subtype: "api_retry", attempt: 1, retry_delay_ms: 500 });
   }

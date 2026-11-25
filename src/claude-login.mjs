@@ -148,6 +148,10 @@ export function createClaudeLogin({
       text = ownToken()
         ? "The Claude sign-in on the Mac has expired. Conduit chats keep running on the bridge's token, but terminal sessions, Remote Control and connectors need a new sign-in. Open Conduit, Today, and tap \"Sign in again\"."
         : "The Claude sign-in on the Mac has expired, so chats cannot run. Open Conduit, Today, and tap \"Sign in again\".";
+    } else if (lastTurn?.kind === "no_reply") {
+      key = `turn:no_reply:${Math.floor(lastTurn.at / 3600_000)}`;
+      title = "Claude did not answer";
+      text = "A Conduit chat was accepted, but Claude never started to answer. The sign-in checks out, so the Mac is most likely waiting for a confirmation window. Look at the Mac, confirm it, then send the message again.";
     } else if (state === "expiring" && stored?.expiresAt) {
       key = `stored:expiring:${new Date(stored.expiresAt).toISOString().slice(0, 10)}`;
       title = "Claude sign-in expires soon";
@@ -156,10 +160,6 @@ export function createClaudeLogin({
       key = `turn:auth:${Math.floor(lastTurn.at / 3600_000)}`;
       title = "Claude rejected the sign-in";
       text = "A Conduit chat failed on the Claude sign-in. Open Conduit, Today, and tap \"Sign in again\".";
-    } else if (lastTurn?.kind === "no_reply") {
-      key = `turn:no_reply:${Math.floor(lastTurn.at / 3600_000)}`;
-      title = "Claude did not answer";
-      text = "A Conduit chat was accepted, but Claude never started to answer. The sign-in checks out, so the Mac is most likely waiting for a confirmation window. Look at the Mac, confirm it, then send the message again.";
     }
     if (!key || prev?.key === key || pending.has(key)) return;
     let res = "failed";
@@ -182,10 +182,14 @@ export function createClaudeLogin({
     return status();
   }
 
-  function check(reason = "timer") {
-    if (checking) return checking;
-    checking = doCheck(reason).finally(() => { checking = null; });
-    return checking;
+  /** fresh: never answer with a check that started before this call. */
+  function check(reason = "timer", { fresh = false } = {}) {
+    if (checking && !fresh) return checking;
+    const prev = checking || Promise.resolve();
+    const run = prev.catch(() => {}).then(() => doCheck(reason));
+    checking = run.finally(() => { if (checking === tracked) checking = null; });
+    const tracked = checking;
+    return run;
   }
 
   /** A Claude turn ended with an error. kind/error as stored for the turn. */
@@ -297,7 +301,7 @@ export function createClaudeLogin({
     endLogin(l, ok ? "done" : "failed");
     log(ok ? "info" : "warn", "claude_login_finished", { ok });
     if (ok) lastTurn = null;
-    const st = await check("after_login");
+    const st = await check("after_login", { fresh: true });
     return ok
       ? { ok: true, status: st }
       : { ok: false, error: "rejected", message: said.replace(/https?:\/\/\S+/g, "").slice(0, 200), status: st };

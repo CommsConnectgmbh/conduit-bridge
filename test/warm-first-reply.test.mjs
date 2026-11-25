@@ -93,3 +93,9 @@ test("warm: a hook that never answers still ends the turn after hookMaxMs", skip
   assert.ok(r.ms >= 850 && r.ms < 5000, `ended after ${r.ms} ms`);
   assert.ok(r.logs.some((l) => l.msg === "warm_no_reply" && l.meta?.hooksRunning === 1));
 });
+
+test("warm: a queued background result is not this prompt's activity", skipWin, async () => {
+  const r = await runOne({ firstReplyMs: 600, env: { FAKE_CLAUDE_INIT_THEN_DELAY_MS: "8000", FAKE_CLAUDE_PRE_EVENTS: "queued" } });
+  assert.match(r.error || "", /did not start to answer/);
+  assert.equal(r.noReply.length, 1);
+});

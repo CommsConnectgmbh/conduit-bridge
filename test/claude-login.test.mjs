@@ -157,7 +157,7 @@ function fakeSpawn({ stdinError = false } = {}) {
     c.stdout = new PassThrough(); c.stderr = new PassThrough();
     if (args?.[1] === "status") {
       c.stdin = null; c.kill = () => {};
-      setImmediate(() => { c.stdout.end('{"loggedIn":true}\\n'); setImmediate(() => c.emit("close", 0)); });
+      setImmediate(() => { c.stdout.end('{"loggedIn":true}\n'); setImmediate(() => c.emit("close", 0)); });
       return c;
     }
     c.stdin = new Writable({ write(b, e, cb) { if (stdinError) { const x = new Error("broken pipe"); x.code = "EPIPE"; cb(x); } else cb(); } });
@@ -216,4 +216,38 @@ test("stop ends a waiting sign-in", async () => {
   cl.stop();
   assert.equal(killed, 1);
   assert.equal(cl.status().login, null);
+});
+
+test("alerts: a turn that never started is told even after the expiry warning went out", skipWin, async () => {
+  const t = make({ status: { loggedIn: true, loginExpiresAt: "2026-11-27T06:59:00Z" } });
+  try {
+    await t.cl.check("a");
+    assert.equal(t.alerts.length, 1);
+    t.cl.noteTurnFailure({ kind: "startup", error: "x" });
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal(t.alerts.length, 2);
+    assert.match(t.alerts[1].title, /did not answer/);
+  } finally { t.done(); }
+});
+
+test("check: a fresh check never answers with one that started earlier", async () => {
+  let n = 0;
+  const releases = [];
+  const spawnFn = () => {
+    const c = new EventEmitter();
+    c.stdout = new PassThrough(); c.stderr = new PassThrough(); c.stdin = null; c.kill = () => {};
+    const mine = ++n;
+    releases.push(() => { c.stdout.end(JSON.stringify(mine === 1 ? { loggedIn: false } : { loggedIn: true }) + "\n"); setImmediate(() => c.emit("close", 0)); });
+    return c;
+  };
+  const cl = createClaudeLogin({ claudeBin: "fake", spawnFn, now: () => NOW });
+  const old = cl.check("old");
+  const fresh = cl.check("after", { fresh: true });
+  await new Promise((r) => setImmediate(r));
+  releases[0]();
+  assert.equal((await old).state, "signed_out");
+  await new Promise((r) => setTimeout(r, 20));
+  releases[1]();
+  assert.equal((await fresh).state, "ok", "the fresh check ran after the old one");
+  cl.stop();
 });

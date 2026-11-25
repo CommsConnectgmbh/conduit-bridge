@@ -229,7 +229,9 @@ export function createWarmPool({
     // Only the model side counts: a stream event, a message, a result, or the
     // CLI's notice that it is retrying the API. Hook and status events come
     // before any request and say nothing about whether one will ever be sent.
-    if (t.replyArmed && isModelActivity(ev)) { if (t.replyTimer) clearTimeout(t.replyTimer); t.replyTimer = null; t.replyArmed = false; }
+    // A result of a turn the CLI queued by itself (background notices on
+    // --resume) is not this prompt's activity; it is dropped further down.
+    if (t.replyArmed && isModelActivity(ev) && !(ev.type === "result" && isQueuedTurnResult(ev))) { if (t.replyTimer) clearTimeout(t.replyTimer); t.replyTimer = null; t.replyArmed = false; }
     // A hook that runs is the CLI at work (its own timeout applies): while it
     // runs the clock allows hookMaxMs, and it starts over once every hook has
     // answered.

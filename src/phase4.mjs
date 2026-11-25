@@ -58,6 +58,7 @@ export function resolveVapid({ envKey, dbDir }) {
 export function createPhase4({ dbDir, db, emergency, journal = null, log, claudeBin, claudeModel, knownOwners, activeTurns, maxTurns, vapidEnvKey }) {
   let summarizing = 0;
   const testPushes = new Set(); // AbortControllers of /api/push/test sends
+  const alertRuns = new Set();  // runCommand handles of alert deliveries
   let vapid = { keys: null, reason: "not_configured" };
   const lastPushTest = new Map();
 
@@ -157,7 +158,9 @@ export function createPhase4({ dbDir, db, emergency, journal = null, log, claude
           checkExecutable(cfg.alerts.deliver[0]);
           const payload = { version: 1, kind: "alert", alert: String(kind).slice(0, 40), title: String(title).slice(0, 80), status: "alert", summary: String(text).slice(0, 2000), appHint: "Details in Conduit" };
           const out = await runCommand({ argv: cfg.alerts.deliver, stdin: JSON.stringify(payload), timeoutMs: DELIVER_TIMEOUT_MS,
-            env: commandEnv(process.env, cfg.tz), cwd: join(dbDir, "automations-work") });
+            env: commandEnv(process.env, cfg.tz), cwd: join(dbDir, "automations-work"),
+            // Reachable for the emergency stop and shutdown, like every other command.
+            register: (h, on) => { if (on) alertRuns.add(h); else alertRuns.delete(h); } });
           r = out.code === 0 && !out.timedOut && !out.stopped ? "sent" : "failed";
         } catch { r = "failed"; }
         res.push(r);
@@ -286,10 +289,12 @@ export function createPhase4({ dbDir, db, emergency, journal = null, log, claude
     /** Emergency stop: every automation stage and every test push. */
     stopAll() {
       for (const ac of testPushes) ac.abort();
+      for (const h of alertRuns) { try { h.stop(); } catch {} }
       return automations.stopAll();
     },
     killAllNow() {
       for (const ac of testPushes) ac.abort();
+      for (const h of alertRuns) { try { h.killNow(); } catch {} }
       automations.killAllNow();
     },
     features() { return { automations: 1, week: 1, push: 1 }; },
