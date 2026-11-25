@@ -1,0 +1,148 @@
+// Sign-in watch and phone sign-in (claude-login.mjs) against a fake CLI.
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const { createClaudeLogin, parseAuthStatus, judge, storedLoginEnv, AUTH_ERROR_RE, EXPIRY_WARN_MS } = await import("../src/claude-login.mjs");
+const skipWin = { skip: process.platform === "win32" };
+const FAKE = fileURLToPath(new URL("./fixtures/fake-claude-auth.mjs", import.meta.url));
+const NOW = Date.parse("2026-11-25T12:00:00Z");
+
+function make({ status, env = {}, notifyRes = "sent" } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "claude-login-"));
+  const kv = new Map();
+  const alerts = [];
+  const logs = [];
+  const envFile = join(dir, "env.txt");
+  const cl = createClaudeLogin({
+    claudeBin: FAKE,
+    env: { ...process.env, FAKE_AUTH_STATUS: JSON.stringify(status ?? { loggedIn: true }), FAKE_AUTH_ENV_FILE: envFile, FAKE_GOOD_CODE: "good-code#state1", ...env },
+    log: (lvl, msg, meta) => logs.push({ lvl, msg, meta }),
+    notify: async (a) => { alerts.push(a); return notifyRes; },
+    kvGet: (k) => kv.get(k) ?? null, kvSet: (k, v) => kv.set(k, v), now: () => NOW,
+  });
+  return { cl, kv, alerts, logs, envFile, dir, done: () => { cl.stop(); rmSync(dir, { recursive: true, force: true }); } };
+}
+
+test("parseAuthStatus and judge", () => {
+  assert.equal(parseAuthStatus("nope"), null);
+  assert.equal(parseAuthStatus('{"x":1}'), null);
+  const st = parseAuthStatus('{"loggedIn":true,"authMethod":"claude.ai","loginExpiresAt":"2026-12-25T06:59:10.647Z"}');
+  assert.deepEqual(st, { loggedIn: true, method: "claude.ai", expiresAt: Date.parse("2026-12-25T06:59:10.647Z") });
+  assert.equal(judge(st, NOW), "ok");
+  assert.equal(judge({ ...st, expiresAt: NOW + EXPIRY_WARN_MS - 1 }, NOW), "expiring");
+  assert.equal(judge({ ...st, expiresAt: NOW - 1 }, NOW), "expired");
+  assert.equal(judge({ loggedIn: false }, NOW), "signed_out");
+  assert.equal(judge({ loggedIn: true, expiresAt: null }, NOW), "ok", "a token without end date");
+  assert.equal(judge(null, NOW), "unknown");
+});
+
+test("storedLoginEnv drops the variables that override the stored login and blocks the browser", () => {
+  const e = storedLoginEnv({ CLAUDE_CODE_OAUTH_TOKEN: "t", ANTHROPIC_API_KEY: "k", ANTHROPIC_AUTH_TOKEN: "a", HOME: "/h" });
+  assert.equal(e.CLAUDE_CODE_OAUTH_TOKEN, undefined);
+  assert.equal(e.ANTHROPIC_API_KEY, undefined);
+  assert.equal(e.ANTHROPIC_AUTH_TOKEN, undefined);
+  assert.equal(e.HOME, "/h");
+  assert.equal(e.BROWSER, "/usr/bin/true");
+});
+
+test("AUTH_ERROR_RE matches the CLI's sign-in failures, not ordinary errors", () => {
+  for (const s of ["Invalid API key · Please run /login", "OAuth token has expired. Please obtain a new token", "API Error: 401 {\"type\":\"authentication_error\"}", "Not logged in"]) {
+    assert.ok(AUTH_ERROR_RE.test(s), s);
+  }
+  for (const s of ["Stopped. The answer is incomplete.", "API Error: 529 overloaded", "Claude did not start: no output 90s after launch.", "file 4012.txt not found"]) {
+    assert.ok(!AUTH_ERROR_RE.test(s), s);
+  }
+});
+
+test("check: an expired stored login alerts once, a repeat check stays quiet, a recovery clears it", skipWin, async () => {
+  const t = make({ status: { loggedIn: true, authMethod: "claude.ai", loginExpiresAt: "2026-11-24T00:00:00Z" } });
+  try {
+    const st = await t.cl.check("test");
+    assert.equal(st.state, "expired");
+    assert.equal(t.alerts.length, 1);
+    assert.match(t.alerts[0].title, /expired/);
+    await t.cl.check("test");
+    assert.equal(t.alerts.length, 1, "told once");
+    assert.equal(readFileSync(t.envFile, "utf8").trim().split("\n")[0], "clean+nobrowser", "the bridge token never reaches the stored-login check");
+  } finally { t.done(); }
+  // A recovered login: the next problem is told again.
+  const u = make({ status: { loggedIn: true, loginExpiresAt: "2026-12-25T00:00:00Z" } });
+  try {
+    u.kv.set("claude_login_alert", JSON.stringify({ key: "stored:expired", at: NOW - 1000 }));
+    assert.equal((await u.cl.check("test")).state, "ok");
+    assert.equal(u.kv.get("claude_login_alert"), "", "cleared");
+    assert.equal(u.alerts.length, 0);
+  } finally { u.done(); }
+});
+
+test("check: a login that expires within three days warns with the date", skipWin, async () => {
+  const t = make({ status: { loggedIn: true, loginExpiresAt: "2026-11-27T06:59:00Z" } });
+  try {
+    assert.equal((await t.cl.check("test")).state, "expiring");
+    assert.equal(t.alerts.length, 1);
+    assert.match(t.alerts[0].title, /expires soon/);
+    assert.match(t.alerts[0].text, /27 Nov/);
+  } finally { t.done(); }
+});
+
+test("turn failures: no_reply with a good login points at the Mac, auth with an own token points at setup-token", skipWin, async () => {
+  const t = make({ status: { loggedIn: true, loginExpiresAt: "2026-12-25T00:00:00Z" }, env: { CLAUDE_CODE_OAUTH_TOKEN: "" } });
+  try {
+    assert.equal(t.cl.noteTurnFailure({ kind: "stopped", error: "Stopped." }), false, "a stop is not a sign-in problem");
+    assert.equal(t.cl.noteTurnFailure({ kind: "startup", error: "x" }), true);
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal(t.alerts.length, 1);
+    assert.match(t.alerts[0].title, /did not answer/);
+    t.cl.noteTurnSuccess();
+    assert.equal(t.cl.status().lastTurnProblem, null);
+  } finally { t.done(); }
+  const u = make({ status: { loggedIn: true, loginExpiresAt: "2026-12-25T00:00:00Z" }, env: { CLAUDE_CODE_OAUTH_TOKEN: "tok" } });
+  try {
+    u.cl.noteTurnFailure({ kind: "agent_error", error: "Invalid API key · Please run /login" });
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal(u.alerts.length, 1);
+    assert.match(u.alerts[0].text, /setup-token/);
+    assert.equal(readFileSync(u.envFile, "utf8").trim().split("\n")[0], "clean+nobrowser");
+  } finally { u.done(); }
+});
+
+test("phone sign-in: link, wrong code, then a new attempt with the right code", skipWin, async () => {
+  const t = make({ status: { loggedIn: true, loginExpiresAt: "2026-12-25T00:00:00Z" } });
+  try {
+    const r = await t.cl.startLogin();
+    assert.equal(r.ok, true);
+    assert.match(r.url, /^https:\/\/claude\.com\/cai\/oauth\/authorize\?/);
+    const again = await t.cl.startLogin();
+    assert.equal(again.id, r.id, "one sign-in at a time");
+    assert.deepEqual(await t.cl.submitCode("other", "good-code#state1"), { ok: false, error: "no_login" });
+    assert.deepEqual(await t.cl.submitCode(r.id, "bad code with spaces"), { ok: false, error: "bad_code" });
+    const wrong = await t.cl.submitCode(r.id, "wrong-code#state1");
+    assert.equal(wrong.ok, false);
+    assert.equal(wrong.error, "rejected");
+    assert.match(wrong.message, /wasn't accepted/);
+    assert.equal(t.cl.status().login, null, "a rejected code ends the attempt");
+    const r2 = await t.cl.startLogin();
+    assert.notEqual(r2.id, r.id);
+    const ok = await t.cl.submitCode(r2.id, "good-code#state1");
+    assert.equal(ok.ok, true);
+    assert.equal(ok.status.state, "ok");
+    assert.ok(t.logs.some((l) => l.msg === "claude_login_finished" && l.meta.ok === true));
+    for (const l of t.logs) assert.ok(!JSON.stringify(l).includes("good-code"), "the code is never logged");
+    assert.ok(readFileSync(t.envFile, "utf8").split("\n").filter(Boolean).every((x) => x === "clean+nobrowser"));
+  } finally { t.done(); }
+});
+
+test("phone sign-in: cancel ends the waiting CLI", skipWin, async () => {
+  const t = make();
+  try {
+    const r = await t.cl.startLogin();
+    assert.equal(r.ok, true);
+    assert.equal(t.cl.cancelLogin(), true);
+    assert.equal(t.cl.status().login, null);
+    assert.deepEqual(await t.cl.submitCode(r.id, "good-code#state1"), { ok: false, error: "no_login" });
+  } finally { t.done(); }
+});

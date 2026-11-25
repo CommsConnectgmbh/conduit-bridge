@@ -22,6 +22,13 @@ import { StringDecoder } from "node:string_decoder";
 // One NDJSON event may not exceed this; see onStdout.
 const MAX_LINE_BYTES = 8 * 1024 * 1024;
 
+/** An event that shows the CLI talks to the model (see firstReplyMs). */
+export function isModelActivity(ev) {
+  if (!ev || typeof ev !== "object") return false;
+  if (ev.type === "stream_event" || ev.type === "assistant" || ev.type === "user" || ev.type === "result") return true;
+  return ev.type === "system" && ev.subtype === "api_retry";
+}
+
 export function createWarmPool({
   claudeBin,
   model,
@@ -49,6 +56,17 @@ export function createWarmPool({
   // start is still the stall watchdog's business. 0 disables the check.
   // Overridable via CONDUIT_TURN_STARTUP_MS.
   startupMs = 90_000,
+  // A turn whose prompt the CLI accepted but which produced no event of the
+  // model at all (no stream event, no message, no retry notice, no result)
+  // after this long never started. On 25.11.2026 a resumed process printed
+  // its init, took the prompt, and then sat for 14 minutes without sending a
+  // single request, so the startup check above (first byte only) never fired
+  // and the user saw nothing until the stall window. A healthy turn emits its
+  // first stream event within seconds, a retry notice while the API is busy.
+  // 0 disables the check. Overridable via CONDUIT_TURN_FIRST_REPLY_MS.
+  firstReplyMs = 180_000,
+  // Told when a turn is given up this way (sid, seconds, stderr tail).
+  onNoReply = null,
 }) {
   /** sid -> proc */
   const procs = new Map();
@@ -130,8 +148,22 @@ export function createWarmPool({
     killProc(p, "startup_stall");
   }
 
+  function onReplyTimeout(p, t) {
+    t.replyTimer = null;
+    if (t.finished || p.turn !== t || !p.alive) return;
+    const secs = Math.round(firstReplyMs / 1000);
+    // The CLI's last words, for the log only (private file), without home paths.
+    const stderr = p.stderrBuf.trim().slice(-300).replace(/\/(Users|home)\/[^/\s]+/g, "~");
+    log("warn", "warm_no_reply", { sid: p.sid, secs, sawInit: !!p.claudeSessionId, stderr: stderr || null });
+    t.finished = true;
+    t.handlers.onError?.(getEngine("claude").messages.noReply(secs), { stall: true, startup: true, noReply: true });
+    killProc(p, "no_reply");
+    try { onNoReply?.({ sid: p.sid, secs, stderr }); } catch {}
+  }
+
   function onExit(p, code, signal) {
     if (p.startupTimer) { clearTimeout(p.startupTimer); p.startupTimer = null; }
+    if (p.turn?.replyTimer) { clearTimeout(p.turn.replyTimer); p.turn.replyTimer = null; }
     // Drain the decoder and any final line the process did not newline-terminate,
     // so a last complete record is not lost on exit.
     try {
@@ -182,6 +214,10 @@ export function createWarmPool({
       return;
     }
     if (!t || t.finished) return;
+    // Only the model side counts: a stream event, a message, a result, or the
+    // CLI's notice that it is retrying the API. Hook and status events come
+    // before any request and say nothing about whether one will ever be sent.
+    if (t.replyTimer && isModelActivity(ev)) { clearTimeout(t.replyTimer); t.replyTimer = null; }
 
     // A new text block (after a tool call, or a second one in the same
     // message) is its own paragraph. The separator goes in front of its first
@@ -389,11 +425,16 @@ export function createWarmPool({
     p.busy = true;
     p.lastUsed = Date.now();
     p.lastOutAt = Date.now();
-    p.turn = { handlers, sawDelta: false, finished: false };
+    const turn = { handlers, sawDelta: false, finished: false, replyTimer: null };
+    p.turn = turn;
     try {
       p.child.stdin.write(
         JSON.stringify({ type: "user", message: { role: "user", content: prompt } }) + "\n",
       );
+      if (firstReplyMs > 0) {
+        turn.replyTimer = setTimeout(() => onReplyTimeout(p, turn), firstReplyMs);
+        turn.replyTimer.unref?.();
+      }
     } catch (e) {
       p.turn.finished = true;
       p.busy = false;

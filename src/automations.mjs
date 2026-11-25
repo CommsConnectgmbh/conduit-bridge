@@ -240,7 +240,12 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
     });
     if (out.stopped) return { ok: false, errorClass: "emergency" };
     if (out.tooLarge) return { ok: false, errorClass: "collect_too_large" };
-    if (out.timedOut || out.spawnError || out.code !== 0) return { ok: false, errorClass: "collect_failed" };
+    if (out.timedOut || out.spawnError || out.code !== 0) {
+      // Why, for the log: on 25.11.2026 three attempts failed and nothing said
+      // whether the command timed out, could not start or exited with an error.
+      log("warn", "automation_collect_failed", { automation: a.id, code: out.code ?? null, signal: out.signal || null, timedOut: !!out.timedOut, spawnError: !!out.spawnError });
+      return { ok: false, errorClass: "collect_failed" };
+    }
     return parseCollectOutput(out.stdout);
   }
 

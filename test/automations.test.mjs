@@ -84,6 +84,14 @@ ptest("config: owner-only file, no unknown fields, argv only, known owner", () =
   assert.equal(write({ ...base, automations: [{ ...base.automations[0], schedule: { time: "7:00", days: [1] } }] }).reason, "invalid_config");
   assert.equal(write({ ...base, automations: [{ ...base.automations[0], schedule: { time: "07:00", days: [0] } }] }).reason, "invalid_config");
   assert.equal(write({ ...base, automations: [{ ...base.automations[0], push: true }] }).reason, "invalid_config", "push needs a contact");
+  // alerts (3.7.0): optional, argv only, push needs a contact, no unknown fields.
+  assert.deepEqual(write({ ...base, alerts: { deliver: [prog] } }).config.alerts, { deliver: [prog], push: false });
+  assert.equal(write(base).config.alerts, null, "no block, no alerts");
+  assert.equal(write({ ...base, alerts: { deliver: `${prog} --x` } }).reason, "invalid_config", "alerts: shell string refused");
+  assert.equal(write({ ...base, alerts: { deliver: [prog], extra: 1 } }).reason, "invalid_config", "alerts: unknown field");
+  assert.equal(write({ ...base, alerts: { push: true } }).reason, "invalid_config", "alerts.push needs a contact");
+  assert.equal(write({ ...base, alerts: { push: "yes" } }).reason, "invalid_config");
+  assert.equal(write({ ...base, push: { contact: "mailto:a@b.test" }, alerts: { push: true } }).config.alerts.push, true);
   chmodSync(prog, 0o722);
   assert.equal(write(base).reason, "invalid_config", "group-writable command refused");
   assert.equal(loadAutomationsConfig(join(dir, "missing.json"), { knownOwners: [OWNER] }).reason, "not_configured");
