@@ -278,3 +278,23 @@ test("alerts: a rejected bridge token is told even while the stored login is exp
     assert.match(t.alerts[1].text, /setup-token/);
   } finally { t.done(); }
 });
+
+test("phone sign-in: renewing the stored login keeps a rejected bridge token on record", skipWin, async () => {
+  const t = make({ status: { loggedIn: true, loginExpiresAt: "2026-11-01T00:00:00Z" }, env: { CLAUDE_CODE_OAUTH_TOKEN: "tok" } });
+  try {
+    t.cl.noteTurnFailure({ kind: "agent_error", error: "Invalid API key · Please run /login" });
+    await until(() => t.alerts.some((a) => /setup-token/.test(a.text)));
+    const r = await t.cl.startLogin();
+    const ok = await t.cl.submitCode(r.id, "good-code#state1");
+    assert.equal(ok.ok, true);
+    assert.equal(t.cl.status().lastTurnProblem?.kind, "auth", "the token problem is not fixed by the new login");
+  } finally { t.done(); }
+  // Without a token of its own, a new login does fix a rejected chat.
+  const u = make({ status: { loggedIn: true, loginExpiresAt: "2026-12-25T00:00:00Z" }, env: { CLAUDE_CODE_OAUTH_TOKEN: "" } });
+  try {
+    u.cl.noteTurnFailure({ kind: "agent_error", error: "Invalid API key · Please run /login" });
+    const r = await u.cl.startLogin();
+    assert.equal((await u.cl.submitCode(r.id, "good-code#state1")).ok, true);
+    assert.equal(u.cl.status().lastTurnProblem, null);
+  } finally { u.done(); }
+});
