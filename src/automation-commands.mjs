@@ -8,6 +8,7 @@
 
 import { spawn } from "node:child_process";
 import { SAFE_SOURCE_ID } from "./automation-text.mjs";
+import { parseSourceTasks } from "./todos.mjs";
 
 export const COLLECT_TIMEOUT_MS = 120_000;
 export const DELIVER_TIMEOUT_MS = 60_000;
@@ -104,7 +105,11 @@ export function parseCollectOutput(stdout) {
     let text = typeof s.text === "string" ? s.text.replace(CTRL_RE, "") : "";
     let status = s.status;
     if (text.length > MAX_SOURCE_TEXT) { text = text.slice(0, MAX_SOURCE_TEXT); status = "truncated"; }
-    sources.push({ id, title, status, count: s.count ?? null, newCount: s.newCount ?? null, fetchedAt: s.fetchedAt, text });
+    // Optional (3.8.0): to-dos this source stands for, each with a stable ref.
+    const tasks = parseSourceTasks(s.tasks);
+    if (tasks === null) return { ok: false, errorClass: "collect_invalid", sources: [] };
+    sources.push({ id, title, status, count: s.count ?? null, newCount: s.newCount ?? null, fetchedAt: s.fetchedAt, text,
+      ...(tasks ? { tasks: tasks.tasks, tasksCut: tasks.cut } : {}) });
   }
   return { ok: true, errorClass: null, sources };
 }

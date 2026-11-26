@@ -249,8 +249,26 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
     return parseCollectOutput(out.stdout);
   }
 
+  /** Source to-dos of this run; a failure here never stops the briefing. */
+  function syncSourceTodos(a, r, sources) {
+    if (!deps.todos) return;
+    for (const src of sources) {
+      // No `tasks` field: the source says nothing about to-dos, so nothing
+      // is added or closed. An empty list does close (everything was settled).
+      if (!Array.isArray(src.tasks)) continue;
+      try {
+        deps.todos.syncSource(loaded.config.owner, { automationId: a.id, sourceId: src.id, sourceTitle: src.title, status: src.status, tasks: src.tasks, cut: !!src.tasksCut, runId: r.id });
+      } catch (e) { log("error", "todos_sync_failed", { automation: a.id, source: src.id, err: String(e?.message || e).slice(0, 120) }); }
+    }
+  }
+
+  function todoCounts() {
+    if (!deps.todos || !loaded.config) return null;
+    try { return { open: deps.todos.openCount(loaded.config.owner) }; } catch { return null; }
+  }
+
   async function deliver(a, r, { header, summary, fullText }) {
-    const payload = deliveryPayload({ automation: a, run: r, header, summary, fullText, appHint: "Details in Conduit" });
+    const payload = deliveryPayload({ automation: a, run: r, header, summary, fullText, appHint: "Details in Conduit", todos: todoCounts() });
     if (stopped()) {
       r.delivery = { telegram: a.deliver ? "held" : "off", push: a.push ? "held" : "off" };
       save(r);
@@ -367,6 +385,7 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
       const sources = c.sources;
       r.header = headerFacts(sources);
       save(r);
+      syncSourceTodos(a, r, sources);
       if (sources.length && sources.every((s) => s.status === "error")) { await fail(a, r, "all_sources_failed"); return "failed"; }
 
       if (pastWindow(a, r)) { await fail(a, r, "expired"); return "failed"; }
@@ -387,6 +406,10 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
       if (s.errorClass === "stopped" || stopped()) { r.attempts -= 1; defer(r, "emergency"); return "emergency"; }
       if (!s.ok) { await fail(a, r, s.errorClass || "summarize_failed"); return "failed"; }
       r.summary = summaryOf(s.text);
+      if (Array.isArray(s.todos) && deps.todos) {
+        try { deps.todos.replaceBriefing(loaded.config.owner, { automationId: a.id, runId: r.id, todos: s.todos }); }
+        catch (e) { log("error", "todos_briefing_failed", { automation: a.id, err: String(e?.message || e).slice(0, 120) }); }
+      }
       // Written, but the window is over (e.g. the Mac slept meanwhile): keep
       // it in the app, do not send a morning briefing in the afternoon.
       if (pastWindow(a, r)) {

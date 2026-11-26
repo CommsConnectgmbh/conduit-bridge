@@ -21,6 +21,7 @@ import { runIsolatedClaude } from "./isolated-claude.mjs";
 import { b64u, generateVapidPrivateKey, sendPush, validateSubscription, vapidKeys } from "./webpush.mjs";
 import { addDays, dayBounds, localDate, systemZone } from "./schedule-time.mjs";
 import { FAILURE_SUMMARY } from "./automation-text.mjs";
+import { splitTodos } from "./todos.mjs";
 import { DELIVER_TIMEOUT_MS, commandEnv, runCommand } from "./automation-commands.mjs";
 import { checkExecutable } from "./automations-config.mjs";
 
@@ -55,7 +56,7 @@ export function resolveVapid({ envKey, dbDir }) {
   return { keys, reason: null };
 }
 
-export function createPhase4({ dbDir, db, emergency, journal = null, log, claudeBin, claudeModel, knownOwners, activeTurns, maxTurns, vapidEnvKey }) {
+export function createPhase4({ dbDir, db, emergency, journal = null, log, claudeBin, claudeModel, knownOwners, activeTurns, maxTurns, vapidEnvKey, todos = null }) {
   let summarizing = 0;
   const testPushes = new Set(); // AbortControllers of /api/push/test sends
   const alertRuns = new Set();  // runCommand handles of alert deliveries
@@ -70,6 +71,7 @@ export function createPhase4({ dbDir, db, emergency, journal = null, log, claude
       knownOwners,
       capacity: () => activeTurns() + summarizing < maxTurns,
       summarize,
+      todos,
       push: pushToOwner,
       // The stored answer of a run, for a delivery resumed after a restart.
       fullText: async (run) => {
@@ -101,7 +103,10 @@ export function createPhase4({ dbDir, db, emergency, journal = null, log, claude
     try {
       r = await runIsolatedClaude({ bin: claudeBin, input: prompt, cwd, model: claudeModel, register, ...(deadlineMs ? { deadlineMs } : {}) });
     } finally { summarizing--; }
-    if (r.ok && r.text) appendAssistant(assistantId, r.text + (r.truncated ? "\n\n[answer cut at the length limit]" : ""), sid);
+    // The to-do block goes to the list, not into the chat (3.8.0).
+    const split = splitTodos(r.text || "");
+    const text = split.text;
+    if (r.ok && text) appendAssistant(assistantId, text + (r.truncated ? "\n\n[answer cut at the length limit]" : ""), sid);
     const ok = r.ok;
     setMessageStatus(sid, assistantId, ok ? "ok" : "error", ok ? null : (FAILURE_SUMMARY[r.errorClass] || FAILURE_SUMMARY.summarize_failed));
     setTurnEnd(sid, assistantId, ok ? null : "agent_error", 0);
@@ -110,7 +115,8 @@ export function createPhase4({ dbDir, db, emergency, journal = null, log, claude
       state: ok ? "ok" : "error", kind: ok ? null : "agent_error", assistantId, userMessageId: userId, engine: "claude",
       model: claudeModel || null, startedAt, chars: (r.text || "").length, steps: [], ts: Date.now(), origin: "schedule", profile: "scheduled",
     });
-    return { ok, errorClass: r.errorClass, sessionId: sid, messageId: assistantId, text: r.text, usage: r.usage, durationMs: r.durationMs };
+    // A cut answer may have lost part of the list: then keep the previous suggestions.
+    return { ok, errorClass: r.errorClass, sessionId: sid, messageId: assistantId, text, todos: ok && !r.truncated && split.found ? split.todos : null, usage: r.usage, durationMs: r.durationMs };
   }
 
   async function pushOne(sub, payload, signal) {

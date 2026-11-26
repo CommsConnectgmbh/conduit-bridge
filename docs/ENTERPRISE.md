@@ -144,7 +144,7 @@ The app's conversation mode sends `spoken: true` with the prompt. The bridge the
 
 macOS and Linux only (on Windows the feature reports `unsupported_platform`). Off unless `automations.json` exists in the bridge's data folder (`DB_DIR`, by default `~/Library/conduit-bridge`). An automation runs at a local time on chosen weekdays and has three stages:
 
-1. **collect**: your command fetches data. No model is involved. It prints JSON in format version 1: `{"version":1,"sources":[{"id","title","status":"ok|error|truncated","count","newCount","fetchedAt","text"}]}`. The bridge builds the fact header from this itself, so an unreachable source is reported as unavailable and never as "nothing new".
+1. **collect**: your command fetches data. No model is involved. It prints JSON in format version 1: `{"version":1,"sources":[{"id","title","status":"ok|error|truncated","count","newCount","fetchedAt","text"}]}`. The bridge builds the fact header from this itself, so an unreachable source is reported as unavailable and never as "nothing new". A source may also list to-dos: `"tasks":[{"ref","text","url"}]` (at most 50 are taken; `ref` is a stable key, `url` must be https). See "To-dos" below.
 2. **summarize**: Claude writes the briefing in the *scheduled profile*. That means no tool at all (not even Read), no MCP server, no user or project settings and therefore no hooks or plugins from them, no slash commands, and no session to resume. The prompt arrives on stdin. If the CLI's first event shows anything it could act with, the run is stopped (`profile_mismatch`). Every message in a chat created this way runs in the same profile, whatever engine or mode the client asks for.
 3. **deliver**: your command gets JSON on stdin (`title`, `date`, `status`, `header`, `summary`, and `full` only with `deliverFull`). Optionally the bridge also sends a Web Push to the owner's installed PWA. The push carries no briefing text.
 
@@ -161,6 +161,15 @@ Each automation runs at most once per local date (the IANA `tz`; a time that doe
 Alerts (optional `alerts` block, same file): `{"deliver": [...], "push": true}`. The bridge tells the owner about Claude sign-in trouble (see below) through the deliver command (JSON on stdin with `kind: "alert"`, `title`, `summary`) and, with `push`, a Web Push that opens Today. Each problem is told once until it is resolved. The deliver command is held while the emergency stop is on.
 
 Web Push: VAPID keys come from `CONDUIT_VAPID_PRIVATE_KEY` (read once at start, then removed from the environment so no agent run can see it) or from a private file the bridge creates on first use. If the key changes, push stays off (`vapid_mismatch`) instead of silently invalidating every subscription. Endpoints must be https on port 443 at a known push service, resolve to a public address, and redirects are refused. The native app shells cannot receive Web Push; use your deliver command there.
+
+## To-dos
+
+Today shows one to-do list per account, kept in the bridge's database (`/api/todos`, `features.todos`). It needs no setup: every paired account has its own list and can add, tick, edit and delete its own to-dos. Automations add two more kinds to the owner's list:
+
+- **From a source:** a collect source with `tasks` (see above). The bridge matches each `ref`: a new one becomes a to-do, a ticked or deleted one stays so while the source lists it, and one that a complete source (status `ok`, at most 50 tasks) no longer lists is closed as settled. A source without a `tasks` field changes nothing; one that failed or was cut short closes nothing.
+- **From the briefing:** the model ends the briefing with a block that starts with the line `[[todos]]` and lists at most 12 things to do. The bridge removes the block from the stored briefing and from what `deliver` gets. Each successful run replaces the previous run's open suggestions; ticked ones stay, and a suggestion that was ticked or deleted in the last 14 days is not added again with the same text. The model read other people's mail, so these to-dos are plain text: no link is taken from them, and nothing runs from a to-do.
+
+`deliver` gets `todos: {"open": n}` so it can send a short hint instead of the whole briefing. Done to-dos are shown for 7 days. Closed and done rows are deleted after 14 days, except a ticked or deleted source to-do, which stays (hidden) as long as its source still lists it, so it does not come back as new. To-dos can contain text from mail; they are kept only on this machine.
 
 ## Claude sign-in
 
