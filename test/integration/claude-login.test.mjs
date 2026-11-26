@@ -303,3 +303,34 @@ test("owner boundary: only the account in PAIR_OWNER_EMAIL, and nothing without 
   // Not one sign-in was started by any refused call.
   assert.equal(fakeRuns().filter((r) => r.auth === "login").length, loginRunsBefore);
 });
+
+// To-dos (3.8.0) need no setup at all: no owner, no automations.json entry for
+// the account. Runs after the boundary test, on the bridge without an owner.
+test("to-dos: any paired account, through the E2E session, kept across a restart", { skip: !POSIX, timeout: 60_000 }, async () => {
+  if (!bridge) bridge = await startBridge({ warm: false, env: { PAIR_OWNER_EMAIL: "" } });
+  let c = await client({ sid: SID_A });
+  const st = await c.call("GET", "/api/status");
+  assert.equal(st.body.features.todos, 1);
+  const empty = await c.call("GET", "/api/todos");
+  assert.deepEqual(empty.body.todos, []);
+  const a = await c.call("POST", "/api/todos", { text: "Call the tax office", clientId: "c_0000000001" });
+  assert.equal(a.head.status, 200);
+  const again = await c.call("POST", "/api/todos", { text: "Call the tax office", clientId: "c_0000000001" });
+  assert.equal(again.body.todo.id, a.body.todo.id, "a retried add is one to-do");
+  assert.equal((await c.call("POST", "/api/todos", { text: "  " })).head.status, 400);
+  const b = await c.call("POST", "/api/todos", { text: "Book the train" });
+  const tick = await c.call("POST", `/api/todos/${a.body.todo.id}`, { done: true });
+  assert.equal(tick.body.todo.done, true);
+  assert.equal((await c.call("POST", `/api/todos/${b.body.todo.id}/delete`)).head.status, 200);
+  assert.equal((await c.call("POST", "/api/todos/t_00000000-0000-4000-8000-000000000000", { done: true })).head.status, 404);
+  assert.equal((await c.call("POST", "/api/todos/nope")).head.status, 404);
+  c.close();
+
+  await stopBridge("SIGTERM");
+  bridge = await startBridge({ warm: false, env: { PAIR_OWNER_EMAIL: "" } });
+  c = await client({ sid: SID_A });
+  const l = await c.call("GET", "/api/todos");
+  assert.deepEqual(l.body.todos.map((t) => [t.text, t.done]), [["Call the tax office", true]]);
+  assert.ok(l.body.version >= 3);
+  c.close();
+});

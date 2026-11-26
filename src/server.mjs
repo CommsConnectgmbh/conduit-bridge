@@ -53,6 +53,7 @@ import { runIsolatedClaude } from "./isolated-claude.mjs";
 import { followUpPrompt } from "./automation-text.mjs";
 import { sessionOrigin, setTurnOrigin, setTurnEnd, kvGet, kvSet } from "./db.mjs";
 import { createClaudeLogin } from "./claude-login.mjs";
+import { createTodos } from "./todos.mjs";
 
 // Automations, week view, Web Push; created just before listen (see below).
 let phase4 = null;
@@ -1061,6 +1062,11 @@ async function handleApi(req, res, u, auth) {
 
   // Everything below is reachable only inside an end-to-end session.
 
+  // To-dos on Today (todos.mjs): one list per account, no setup needed.
+  if (todos && (path === "/api/todos" || path.startsWith("/api/todos/"))) {
+    return handleTodos(req, res, path, auth);
+  }
+
   // Conduit 2.0 phase 4: automations, week, push (phase4.mjs).
   if (phase4 && (path.startsWith("/api/automations") || path === "/api/week" || path.startsWith("/api/push/"))) {
     if (await phase4.handle(req, res, u, auth, { json, readJson })) return;
@@ -1101,7 +1107,7 @@ async function handleApi(req, res, u, auth) {
       // emergencyStop: POST /api/emergency-stop|release; readOnly: prompt
       // frames take `readOnly: true`; spokenReplies: prompt frames take
       // `spoken: true` (short answer first, details after a "---" line).
-      features: { turnStatus: 1, emergencyStop: 1, readOnly: 1, spokenReplies: 1, ...(phase4 ? phase4.features() : {}), ...(claudeLogin && isLoginOwner(email) ? { claudeLogin: 1 } : {}) },
+      features: { turnStatus: 1, emergencyStop: 1, readOnly: 1, spokenReplies: 1, ...(phase4 ? phase4.features() : {}), ...(todos ? { todos: 1 } : {}), ...(claudeLogin && isLoginOwner(email) ? { claudeLogin: 1 } : {}) },
       emergencyStop: emergency.status(),
       claudeLogin: claudeLogin && isLoginOwner(email) ? publicLoginStatus() : null,
     });
@@ -3503,6 +3509,7 @@ function runHousekeeping() {
     const purged = purgeExpiredHistory(historyDb, { chatDays: HOUSEKEEPING.chatDays, auditDays: HOUSEKEEPING.auditDays, keep });
     if (purged.sessions || purged.audit) log("info", "retention_purged", purged);
   } catch (e) { log("error", "retention_failed", { err: String(e?.message || e) }); }
+  try { todos?.purge(); } catch (e) { log("error", "todos_purge_failed", { err: String(e?.message || e).slice(0, 120) }); }
   try {
     const n = gcPasteDir();
     if (n) log("info", "paste_retention_purged", { files: n });
@@ -3622,8 +3629,32 @@ function closeTurnsLeftByPreviousProcess() {
   }
 }
 
+// To-dos (3.8.0). Created before phase 4, which adds briefing and source
+// to-dos to the owner's list. A failure leaves the rest of the bridge running.
+let todos = null;
+try { todos = createTodos({ db: historyDb, log }); }
+catch (e) { log("error", "todos_init_failed", { err: String(e?.message || e).slice(0, 200) }); }
+
+async function handleTodos(req, res, path, auth) {
+  const out = (r) => json(res, r.ok ? 200 : (r.error === "not_found" ? 404 : r.error === "full" ? 409 : 400), r.ok ? r : { error: r.error });
+  if (path === "/api/todos" && req.method === "GET") return json(res, 200, todos.list(auth.email));
+  if (path === "/api/todos" && req.method === "POST") {
+    const b = await readJson(req) || {};
+    return out(todos.add(auth.email, b.text, { clientId: b.clientId }));
+  }
+  let m = path.match(/^\/api\/todos\/(t_[0-9a-f-]{36})$/);
+  if (m && req.method === "POST") {
+    const b = await readJson(req) || {};
+    return out(todos.update(auth.email, m[1], { done: b.done, text: b.text }));
+  }
+  m = path.match(/^\/api\/todos\/(t_[0-9a-f-]{36})\/delete$/);
+  if (m && req.method === "POST") return out(todos.remove(auth.email, m[1]));
+  return json(res, 404, { error: "not_found" });
+}
+
 try {
   phase4 = createPhase4({
+    todos,
     dbDir: process.env.DB_DIR || join(homedir(), "Library/conduit-bridge"),
     db: historyDb, emergency, journal, log,
     claudeBin: CLAUDE_BIN, claudeModel: process.env.CLAUDE_MODEL || null,
