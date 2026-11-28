@@ -88,7 +88,7 @@ ptest("github: fixed queries; review requests and issues as to-dos with stable r
   const gh = script(dir, "gh", `#!${process.execPath}
 require("fs").appendFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2)) + "\\n");
 const kind = process.argv[3];
-const n = process.env.FAKE_GH_MANY ? 30 : 1;
+const n = require("fs").existsSync(${JSON.stringify(join(dir, "many"))}) ? 30 : 1;
 const rows = kind === "prs" ? Array.from({ length: n }, (_, i) => (${pr.toString()})(i + 1)) : [{ url: "https://github.com/acme/app/issues/9", title: "Bug [x](https://evil.test)", repository: { nameWithOwner: "acme/app" }, updatedAt: "2026-11-20T00:00:00Z", number: 9 }];
 process.stdout.write(JSON.stringify(rows));
 `);
@@ -99,7 +99,8 @@ process.stdout.write(JSON.stringify(rows));
   assert.equal(s.tasks[0].url, "https://github.com/acme/app/pull/1");
   const args = readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l));
   assert.deepEqual(args[0], ["search", "prs", "--review-requested=@me", "--state=open", "--limit", "30", "--json", "url,title,repository,updatedAt,number"]);
-  const many = await githubSource({ sourceId: "c-gh", title: "GitHub" }, { ghBin: gh, env: { PATH: process.env.PATH, FAKE_GH_MANY: "1" }, now: NOW });
+  writeFileSync(join(dir, "many"), "1");
+  const many = await githubSource({ sourceId: "c-gh", title: "GitHub" }, { ghBin: gh, env: { PATH: process.env.PATH }, now: NOW });
   assert.equal(many.status, "truncated", "30 = the limit: nothing may be closed by it");
   assert.equal((await githubSource({ sourceId: "c-gh", title: "GitHub" }, { ghBin: null })).status, "error");
   const broken = script(dir, "gh-broken", "#!/bin/sh\nexit 4\n");
@@ -274,7 +275,7 @@ ptest("automations: the connections are added to a file briefing's sources", asy
   chmodSync(path, 0o600);
   const seen = [];
   const a = createAutomations({ db, configPath: path, workDir: join(dir, "w"), emergency: { active: false }, now: () => NOW,
-    deps: { knownOwners: () => [OWNER], capacity: () => true, push: async () => "off",
+    deps: { knownOwners: () => [OWNER], capacity: () => true, push: async () => "off", connectionsOwner: () => OWNER,
       extraSources: async () => [{ id: "c-abc", title: "Calendar", status: "ok", count: 1, newCount: null, fetchedAt: "2026-11-28T06:00:00Z", text: "09:00 Dentist" }, { id: "mail", title: "dup", status: "ok", count: 0, newCount: null, fetchedAt: "x", text: "" }],
       summarize: async (x) => { seen.push(x.prompt); return { ok: true, sessionId: "s", messageId: "m", text: "S.\n---\nD.", usage: null, durationMs: 1 }; } } });
   a.reload(); a.sweep();
@@ -363,7 +364,7 @@ ptest("switching the app briefing off during its run lets that run finish with t
   const cfg = { owner: OWNER, tz: TZ, push: null, alerts: null, automations: [{ id: "briefing", title: "Morning briefing", schedule: { time: "06:00", days: [1, 2, 3, 4, 5, 6, 7] }, prompt: "x", collect: null, deliver: null, deliverFull: false, push: false, windowMs: 6 * 3600000 }] };
   let a;
   a = createAutomations({ db, configPath: join(dir, "none.json"), workDir: join(dir, "w"), emergency: { active: false }, now: () => NOW,
-    deps: { knownOwners: () => [OWNER], capacity: () => true, push: async () => "off", builtinConfig: () => (on ? cfg : null),
+    deps: { knownOwners: () => [OWNER], capacity: () => true, push: async () => "off", builtinConfig: () => (on ? cfg : null), connectionsOwner: () => OWNER,
       extraSources: async () => { on = false; a.reload(); return [{ id: "c-1", title: "Cal", status: "ok", count: 1, newCount: null, fetchedAt: "2026-11-28T05:00:00Z", text: "x" }]; },
       summarize: async () => { assert.equal(a._config()?.tz, TZ, "the running briefing still sees its config"); return { ok: true, sessionId: "s", messageId: "m", text: "S.\n---\nD.", usage: null, durationMs: 1 }; } } });
   a.reload(); a.sweep();
@@ -433,4 +434,43 @@ ptest("a connection removed while an earlier one is read is not read at all", as
   const out = await run;
   assert.deepEqual(out.map((s) => s.title), ["First"]);
   assert.equal(readFileSync(count, "utf8").trim().split("\n").length, 2, "only the first connection's two queries ran");
+});
+
+ptest("connections never go into a briefing of another account than the bridge owner", async () => {
+  const dir = sandbox();
+  const db = new DatabaseSync(":memory:");
+  const prog = script(dir, "collect", `#!/bin/sh\ncat <<'EOF'\n${JSON.stringify({ version: 1, sources: [{ id: "mail", title: "Mail", status: "ok", count: 1, newCount: null, fetchedAt: "2026-11-28T06:00:00Z", text: "m" }] })}\nEOF\n`);
+  const path = join(dir, "automations.json");
+  const OTHER = "other@example.com";
+  writeFileSync(path, JSON.stringify({ version: 1, owner: OTHER, tz: TZ, automations: [{ id: "briefing", title: "B", schedule: { time: "06:00", days: [1, 2, 3, 4, 5, 6, 7] }, prompt: "x", collect: [prog] }] }));
+  chmodSync(path, 0o600);
+  let asked = 0;
+  const prompts = [];
+  const a = createAutomations({ db, configPath: path, workDir: join(dir, "w"), emergency: { active: false }, now: () => NOW,
+    deps: { knownOwners: () => [OTHER], capacity: () => true, push: async () => "off", connectionsOwner: () => OWNER,
+      extraSources: async () => { asked++; return [{ id: "c-secret", title: "Owner's calendar", status: "ok", count: 1, newCount: null, fetchedAt: "x", text: "PRIVATE" }]; },
+      summarize: async (x) => { prompts.push(x.prompt); return { ok: true, sessionId: "s", messageId: "m", text: "S.\n---\nD.", usage: null, durationMs: 1 }; } } });
+  a.reload(); a.sweep();
+  await a.tick();
+  assert.equal(a.status().automations[0].lastRun.state, "done");
+  assert.equal(asked, 0, "the owner's connections are not even read");
+  assert.ok(!prompts[0].includes("PRIVATE"));
+  assert.deepEqual(a.status().automations[0].lastRun.header.sources.map((s) => s.id), ["mail"]);
+});
+
+ptest("gh gets no bridge secrets; Check is throttled per connection", async () => {
+  const dir = sandbox();
+  const envFile = join(dir, "env.json");
+  const gh = script(dir, "gh", `#!${process.execPath}\nrequire("fs").writeFileSync(${JSON.stringify(envFile)}, JSON.stringify(Object.keys(process.env)));\nprocess.stdout.write("[]");\n`);
+  let t = NOW;
+  const db = new DatabaseSync(":memory:");
+  const c = createConnections({ db, now: () => t, deps: { ghBin: gh, env: { PATH: process.env.PATH, HOME: dir, BRIDGE_SECRET: "s", CLAUDE_CODE_OAUTH_TOKEN: "tok", CONDUIT_VAPID_PRIVATE_KEY: "k" }, tz: () => TZ } });
+  const a = (await c.add({ kind: "github" })).connection;
+  assert.equal((await c.check(a.id)).ok, true);
+  const keys = JSON.parse(readFileSync(envFile, "utf8"));
+  for (const k of ["BRIDGE_SECRET", "CLAUDE_CODE_OAUTH_TOKEN", "CONDUIT_VAPID_PRIVATE_KEY"]) assert.ok(!keys.includes(k), k);
+  assert.ok(keys.includes("HOME"));
+  assert.equal((await c.check(a.id)).error, "throttled");
+  t += 10_001;
+  assert.equal((await c.check(a.id)).ok, true);
 });

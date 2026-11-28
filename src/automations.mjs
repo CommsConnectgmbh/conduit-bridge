@@ -248,6 +248,10 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
   async function runCollect(a) {
     const own = await runOwnCollect(a);
     if (!own.ok || !deps.extraSources) return own;
+    // The connections are the bridge owner's: they go only into briefings of
+    // that same account, never into one an automations.json gives to another.
+    const connOwner = String(deps.connectionsOwner?.() || "").toLowerCase();
+    if (!connOwner || String(cfgOf()?.owner || "").toLowerCase() !== connOwner) return own;
     if (stopped()) return { ok: false, errorClass: "emergency" };
     let extra = [];
     try { extra = await deps.extraSources({ register }); } catch (e) { log("error", "connections_collect_failed", { err: String(e?.message || e).slice(0, 120) }); }

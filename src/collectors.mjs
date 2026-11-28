@@ -160,6 +160,16 @@ function runFixed(bin, args, { timeoutMs, env, spawnFn = spawn, register = null 
   });
 }
 
+// What gh needs from the bridge's environment: its config and keyring live
+// under HOME. Never the bridge's own secrets or tokens.
+const GH_ENV_ALLOW = ["HOME", "USER", "LOGNAME", "PATH", "LANG", "LC_ALL", "TMPDIR", "XDG_CONFIG_HOME", "GH_CONFIG_DIR", "GH_HOST",
+  "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy"];
+export function ghEnv(env = {}) {
+  const out = { NO_COLOR: "1", GH_PROMPT_DISABLED: "1", GH_NO_UPDATE_NOTIFIER: "1" };
+  for (const k of GH_ENV_ALLOW) if (typeof env[k] === "string") out[k] = env[k];
+  return out;
+}
+
 export async function githubSource(conn, { ghBin, env, now = Date.now(), register = null, spawnFn = spawn } = {}) {
   const at = now;
   const id = conn.sourceId, title = conn.title;
@@ -167,7 +177,7 @@ export async function githubSource(conn, { ghBin, env, now = Date.now(), registe
   const lines = [], tasks = [];
   let cut = false, count = 0;
   for (const [kind, args] of Object.entries(GH_QUERIES)) {
-    const r = await runFixed(ghBin, args, { timeoutMs: GH_TIMEOUT_MS, env, spawnFn, register });
+    const r = await runFixed(ghBin, args, { timeoutMs: GH_TIMEOUT_MS, env: ghEnv(env), spawnFn, register });
     if (r.code !== 0) return errorSource(id, title, at, r.timedOut ? "gh timed out" : r.spawnError ? "gh could not start" : "gh failed (signed in? run gh auth status)");
     let rows;
     try { rows = JSON.parse(r.out); } catch { return errorSource(id, title, at, "gh answered in an unexpected format"); }
@@ -251,7 +261,13 @@ function sortKeys(v) {
  * `data` is the text of the one tool result.
  */
 export function runConnector({ bin, kind, tz, configDir, workDir, env = process.env, now = Date.now(), spawnFn = spawn, register = null,
-  timeoutMs = CONNECTOR_TIMEOUT_MS, initMs = CONNECTOR_INIT_MS }) {
+  timeoutMs = CONNECTOR_TIMEOUT_MS, initMs = CONNECTOR_INIT_MS, probe = null }) {
+  // `probe` exists for one thing: a live check of this code against the real
+  // CLI on a machine whose normal profile has hooks and local servers. It
+  // relaxes only the profile check (never the call check) and is never set by
+  // the bridge itself.
+  const initCheck = probe?.initCheck || checkConnectorInit;
+  const hooksAllowed = probe?.allowHooks === true;
   const call = connectorCall(kind, { tz, now });
   if (!call) return Promise.resolve({ ok: false, why: "unknown connector", data: null });
   const prompt = [
@@ -264,7 +280,9 @@ export function runConnector({ bin, kind, tz, configDir, workDir, env = process.
     let cwd;
     try { cwd = mkdtempSync(join(workDir, "conn-")); } catch { return resolve({ ok: false, why: "no work folder", data: null }); }
     let child;
-    try { child = spawnFn(bin, connectorArgs(call.tool), { cwd, env: connectorEnv(env, configDir), stdio: ["pipe", "pipe", "pipe"], detached: true }); }
+    const childEnv = connectorEnv(env, configDir);
+    if (probe?.normalProfile) delete childEnv.CLAUDE_CONFIG_DIR;
+    try { child = spawnFn(bin, connectorArgs(call.tool), { cwd, env: childEnv, stdio: ["pipe", "pipe", "pipe"], detached: true }); }
     catch { rmSync(cwd, { recursive: true, force: true }); return resolve({ ok: false, why: "Claude could not start", data: null }); }
     let initOk = false, finished = false, why = null, signedOut = false, data = null, calls = 0, useId = null, buf = "";
     const kill = (sig) => { try { process.kill(-child.pid, sig); } catch { try { child.kill(sig); } catch { /* gone */ } } };
@@ -281,9 +299,9 @@ export function runConnector({ bin, kind, tz, configDir, workDir, env = process.
     deadline.unref?.(); initTimer.unref?.();
     const onEvent = (ev) => {
       if (why) return;
-      if (ev.type === "system" && typeof ev.subtype === "string" && ev.subtype.startsWith("hook")) { stop("a hook ran in the connector profile"); return; }
+      if (ev.type === "system" && typeof ev.subtype === "string" && ev.subtype.startsWith("hook")) { if (!hooksAllowed) stop("a hook ran in the connector profile"); return; }
       if (ev.type === "system" && ev.subtype === "init") {
-        const p = checkConnectorInit(ev, call.tool);
+        const p = initCheck(ev, call.tool);
         if (p.includes("connector_missing")) { stop("connector not connected for this sign-in (connect it on claude.ai)"); return; }
         if (p.length) { stop(`connector profile not as expected (${p.join(", ")})`); return; }
         initOk = true; clearTimeout(initTimer); return;
