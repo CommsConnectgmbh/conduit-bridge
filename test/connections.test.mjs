@@ -204,7 +204,7 @@ ptest("connector source: count from the result, signed out reported as such, Out
 function store(extra = {}) {
   const db = new DatabaseSync(":memory:");
   const logs = [];
-  const c = createConnections({ db, log: (...a) => logs.push(a), now: () => NOW, deps: { claudeBin: "claude", ghBin: null, connectorConfigDir: "/x", workDir: "/x", env: {}, tz: () => TZ, ...extra } });
+  const c = createConnections({ db, log: (...a) => logs.push(a), now: () => NOW, deps: { claudeBin: "claude", ghBin: null, connectorConfigDir: "/x", workDir: "/x", env: {}, tz: () => TZ, connectorsEnabled: true, ...extra } });
   return { db, c, logs };
 }
 
@@ -473,4 +473,28 @@ ptest("gh gets no bridge secrets; Check is throttled per connection", async () =
   assert.equal((await c.check(a.id)).error, "throttled");
   t += 10_001;
   assert.equal((await c.check(a.id)).ok, true);
+});
+
+ptest("a switched-off connection is not read on request either: no collector starts", async () => {
+  const dir = sandbox();
+  const started = join(dir, "started");
+  const gh = script(dir, "gh", `#!/bin/sh\necho x >> "${started}"\necho '[]'\n`);
+  const db = new DatabaseSync(":memory:");
+  const c = createConnections({ db, now: () => NOW, deps: { ghBin: gh, env: { PATH: process.env.PATH }, tz: () => TZ } });
+  const a = (await c.add({ kind: "github" })).connection;
+  c.update(a.id, { enabled: false });
+  assert.equal((await c.check(a.id)).error, "disabled");
+  assert.deepEqual(await c.extraSources(), []);
+  assert.equal(existsSync(started), false, "gh never ran");
+});
+
+test("the claude.ai connectors stay off unless CONDUIT_CONNECTORS=1", async () => {
+  const off = store({ connectorsEnabled: false });
+  const st = await off.c.status();
+  assert.ok(!st.kinds.some((k) => k.viaClaude), "not offered");
+  assert.equal(st.connector, null);
+  assert.equal((await off.c.add({ kind: "gmail" })).error, "kind");
+  assert.ok(st.kinds.some((k) => k.kind === "ics") && st.kinds.some((k) => k.kind === "github"));
+  const on = store({ connectorsEnabled: true });
+  assert.ok((await on.c.status()).kinds.some((k) => k.kind === "gmail"));
 });

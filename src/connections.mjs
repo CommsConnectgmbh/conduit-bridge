@@ -92,6 +92,10 @@ export function createConnections({ db, log = () => {}, now = Date.now, deps }) 
     setSetting: db.prepare("INSERT INTO cockpit_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"),
   };
   const tz = () => { const t = deps.tz?.(); return t && isValidZone(t) ? t : systemZone(); };
+  // The claude.ai connectors stay behind CONDUIT_CONNECTORS=1 until a run in
+  // a real, freshly signed-in connector profile has been proven (3.9.2).
+  const connectorsOn = () => deps.connectorsEnabled === true;
+  const kindOn = (k) => !CONNECTOR_KINDS.includes(k) || connectorsOn();
   // Every running read (gh, connector, calendar fetch): the emergency stop
   // ends them all, whoever started them (a briefing or "Check").
   const handles = new Set();
@@ -135,7 +139,7 @@ export function createConnections({ db, log = () => {}, now = Date.now, deps }) 
     builtinConfig(owner) {
       const b = briefing();
       // Nothing connected, nothing to brief from.
-      if (!b.enabled || !owner || !q.all.all().some((r) => r.enabled)) return null;
+      if (!b.enabled || !owner || !q.all.all().some((r) => r.enabled && kindOn(r.kind))) return null;
       return {
         owner: String(owner).toLowerCase(), tz: tz(),
         // Push services need a contact; this one carries no personal address.
@@ -153,7 +157,7 @@ export function createConnections({ db, log = () => {}, now = Date.now, deps }) 
         // Read again right before the fetch: removed or switched off while an
         // earlier one was read means not read at all.
         const r = q.get.get(listed.id);
-        if (!r || !r.enabled) continue;
+        if (!r || !r.enabled || !kindOn(r.kind)) continue;
         const src = await collectOne(r, { register });
         if (src) out.push({ connId: r.id, src });
       }
@@ -167,22 +171,24 @@ export function createConnections({ db, log = () => {}, now = Date.now, deps }) 
     stopAll() { const n = handles.size; for (const h of [...handles]) { try { h.stop(); } catch { /* gone */ } } return n; },
     killAllNow() { for (const h of [...handles]) { try { h.killNow(); } catch { /* gone */ } } },
 
+    connectorsEnabled: connectorsOn,
+
     async status() {
       const conns = q.all.all().map(publicConn);
       let connector = null;
-      if (deps.connectorLogin) {
+      if (deps.connectorLogin && connectorsOn()) {
         try { const s = deps.connectorLogin.status(); connector = { state: s.state, method: s.method, expiresAt: s.expiresAt, checkedAt: s.checkedAt, login: s.login }; } catch { /* unknown */ }
       }
       return {
         connections: conns,
-        kinds: KINDS.map((k) => ({ kind: k, title: KIND_TITLE[k], available: k === "github" ? !!deps.ghBin : true, viaClaude: CONNECTOR_KINDS.includes(k) })),
+        kinds: KINDS.filter(kindOn).map((k) => ({ kind: k, title: KIND_TITLE[k], available: k === "github" ? !!deps.ghBin : true, viaClaude: CONNECTOR_KINDS.includes(k) })),
         connector,
         tz: tz(),
       };
     },
 
     async add({ kind, title, link } = {}) {
-      if (!KINDS.includes(kind)) return { ok: false, error: "kind" };
+      if (!KINDS.includes(kind) || !kindOn(kind)) return { ok: false, error: "kind" };
       if (q.count.get().n >= MAX_CONNECTIONS) return { ok: false, error: "full" };
       let secret = null;
       if (kind === "ics") {
@@ -222,6 +228,8 @@ export function createConnections({ db, log = () => {}, now = Date.now, deps }) 
       if (!ID_RE.test(String(id))) return { ok: false, error: "not_found" };
       const r = q.get.get(id);
       if (!r) return { ok: false, error: "not_found" };
+      // Switched off means not read, also on request (the app's button is only a hint).
+      if (!r.enabled || !kindOn(r.kind)) return { ok: false, error: "disabled" };
       // Throttled only after a read that worked: a retry right after fixing a
       // problem (signing in, say) always goes through.
       if (now() - (lastCheck.get(id) || 0) < 10_000) return { ok: false, error: "throttled" };

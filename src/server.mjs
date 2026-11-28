@@ -55,6 +55,7 @@ import { sessionOrigin, setTurnOrigin, setTurnEnd, kvGet, kvSet } from "./db.mjs
 import { createClaudeLogin } from "./claude-login.mjs";
 import { createTodos } from "./todos.mjs";
 import { createConnections } from "./connections.mjs";
+import { connectorEnv } from "./collectors.mjs";
 import { checkExecutable } from "./automations-config.mjs";
 
 // Automations, week view, Web Push; created just before listen (see below).
@@ -1119,6 +1120,7 @@ async function handleApi(req, res, u, auth) {
   // and the sign-in of the connector profile. Only the bridge owner's account.
   if (path === "/api/connections" || path.startsWith("/api/connections/") || path.startsWith("/api/connector-login")) {
     if (!connections || !isLoginOwner(email)) return json(res, 404, { ok: false, error: "not available" });
+    if (path.startsWith("/api/connector-login") && !connections.connectorsEnabled()) return json(res, 404, { ok: false, error: "not available" });
     return handleConnections(req, res, path, auth);
   }
 
@@ -3686,13 +3688,14 @@ if (PAIR_OWNER_EMAIL && process.platform !== "win32" && CLAUDE_ENGINE.isAvailabl
     const workDir = join(BRIDGE_DB_DIR, "connections-work");
     ensurePrivateDir(connectorDir);
     ensurePrivateDir(workDir);
-    const connectorEnvBase = { ...process.env, CLAUDE_CONFIG_DIR: connectorDir };
-    delete connectorEnvBase.CLAUDE_CODE_OAUTH_TOKEN;
+    // Only an allowlisted environment, like the reads (collectors.mjs).
+    const connectorEnvBase = connectorEnv(process.env, connectorDir);
     // The connector profile's own sign-in: checked on demand, never alerted
     // (the app shows its state where the connections are).
     connectorLogin = createClaudeLogin({ claudeBin: CLAUDE_BIN, env: connectorEnvBase, log: (lvl, msg, o) => log(lvl, msg.replace(/^claude_login/, "connector_login"), o), notify: async () => "off" });
     connections = createConnections({ db: historyDb, log, deps: {
       claudeBin: CLAUDE_BIN, ghBin: findGh(), connectorConfigDir: connectorDir, workDir, env: process.env,
+      connectorsEnabled: process.env.CONDUIT_CONNECTORS === "1",
       tz: () => phase4?.tz() || null, connectorLogin,
       onRemoved: (sourceId) => todos?.closeSource(PAIR_OWNER_EMAIL, sourceId),
       stopped: () => emergency.active === true,
@@ -3705,7 +3708,7 @@ if (PAIR_OWNER_EMAIL && process.platform !== "win32" && CLAUDE_ENGINE.isAvailabl
 
 async function handleConnections(req, res, path, auth) {
   const reloadAutomations = () => { try { return phase4?.reload() || null; } catch (e) { log("error", "automations_reload_failed", { err: String(e?.message || e).slice(0, 120) }); return null; } };
-  const code = (r) => (r.ok ? 200 : r.error === "not_found" ? 404 : r.error === "full" || r.error === "emergency" ? 409 : r.error === "throttled" ? 429 : 400);
+  const code = (r) => (r.ok ? 200 : r.error === "not_found" ? 404 : r.error === "full" || r.error === "emergency" || r.error === "disabled" ? 409 : r.error === "throttled" ? 429 : 400);
   const loginStatus = () => connectorLogin.status();
   if (path === "/api/connections" && req.method === "GET") {
     // A connector sign-in older than 10 minutes is read again in the background.
