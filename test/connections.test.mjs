@@ -357,6 +357,22 @@ ptest("a connection removed while it is read leaves no result behind (its closed
   assert.deepEqual(await run, []);
 });
 
+ptest("Check on a connection switched off during its read says disabled; removed during its read says not_found", async () => {
+  for (const [change, error] of [["off", "disabled"], ["remove", "not_found"]]) {
+    const dir = sandbox();
+    const started = join(dir, "started");
+    const gh = script(dir, "gh", `#!/bin/sh\necho x >> "${started}"\nsleep 1\necho '[]'\n`);
+    const db = new DatabaseSync(":memory:");
+    const c = createConnections({ db, now: () => NOW, deps: { ghBin: gh, env: { PATH: process.env.PATH }, tz: () => TZ } });
+    const a = (await c.add({ kind: "github", title: "Work" })).connection;
+    const pending = c.check(a.id);
+    while (!existsSync(started)) await new Promise((r) => setTimeout(r, 20));
+    if (change === "off") c.update(a.id, { enabled: false }); else c.remove(a.id);
+    assert.deepEqual(await pending, { ok: false, error }, change);
+    db.close();
+  }
+});
+
 ptest("switching the app briefing off during its run lets that run finish with the settings it started with", async () => {
   const dir = sandbox();
   const db = new DatabaseSync(":memory:");
