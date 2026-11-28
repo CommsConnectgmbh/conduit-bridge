@@ -30,7 +30,7 @@ import { mkdirSync, rmSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { checkExecutable, loadAutomationsConfig } from "./automations-config.mjs";
-import { COLLECT_TIMEOUT_MS, DELIVER_TIMEOUT_MS, MAX_COLLECT_BYTES, commandEnv, parseCollectOutput, runCommand } from "./automation-commands.mjs";
+import { COLLECT_TIMEOUT_MS, DELIVER_TIMEOUT_MS, MAX_COLLECT_BYTES, MAX_SOURCES, commandEnv, parseCollectOutput, runCommand } from "./automation-commands.mjs";
 import { FAILURE_SUMMARY, deliveryPayload, headerFacts, renderHeader, scheduledPrompt, summaryOf } from "./automation-text.mjs";
 import { addDays, dueSlot, localDate, nextSlot, slotOn } from "./schedule-time.mjs";
 import { SUMMARIZE_DEADLINE_MS } from "./isolated-claude.mjs";
@@ -141,6 +141,12 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
   ensureAutomationSchema(db);
   mkdirSync(workDir, { recursive: true, mode: 0o700 });
   let loaded = { enabled: false, reason: "not_configured", detail: null, config: null };
+  // The config of the last enabled load. A run that is under way keeps it
+  // when the app switches the briefing off meanwhile (3.9.0): it ends with
+  // the settings it started with instead of failing half way.
+  let lastConfig = null;
+  let running = 0;
+  const cfgOf = () => loaded.config || lastConfig;
   const active = new Set(); // process handles of running stages
   let timer = null;
   let lastTick = now();
@@ -181,7 +187,14 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
 
   function reload() {
     loaded = loadAutomationsConfig(configPath, { knownOwners: deps.knownOwners() });
-    if (loaded.enabled) for (const a of loaded.config.automations) Q.seen.run(a.id, now());
+    // No file: the briefing set up in the app (3.9.0), if there is one. A file
+    // that exists but is rejected stays rejected; the app never overrides it.
+    if (!loaded.enabled && loaded.reason === "not_configured" && deps.builtinConfig) {
+      let b = null;
+      try { b = deps.builtinConfig(); } catch (e) { log("error", "builtin_briefing_failed", { err: String(e?.message || e).slice(0, 120) }); }
+      if (b) loaded = { enabled: true, reason: null, detail: null, config: b, builtin: true };
+    }
+    if (loaded.enabled) { lastConfig = loaded.config; for (const a of loaded.config.automations) Q.seen.run(a.id, now()); }
     if (!loaded.enabled && loaded.reason !== "not_configured") log("warn", "automations_config_rejected", { reason: loaded.reason, detail: loaded.detail });
     return loaded;
   }
@@ -231,12 +244,25 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
     }
   }
 
+  /** The automation's own sources, then the connections set up in the app. */
   async function runCollect(a) {
+    const own = await runOwnCollect(a);
+    if (!own.ok || !deps.extraSources) return own;
+    if (stopped()) return { ok: false, errorClass: "emergency" };
+    let extra = [];
+    try { extra = await deps.extraSources({ register }); } catch (e) { log("error", "connections_collect_failed", { err: String(e?.message || e).slice(0, 120) }); }
+    if (stopped()) return { ok: false, errorClass: "emergency" };
+    const ids = new Set(own.sources.map((s) => s.id));
+    const sources = [...own.sources, ...extra.filter((s) => !ids.has(s.id))].slice(0, MAX_SOURCES);
+    return { ...own, sources };
+  }
+
+  async function runOwnCollect(a) {
     if (!a.collect) return { ok: true, sources: [] };
     try { checkExecutable(a.collect[0]); } catch { return { ok: false, errorClass: "collect_failed" }; }
     const out = await runCommand({
       argv: a.collect, timeoutMs: COLLECT_TIMEOUT_MS, maxBytes: MAX_COLLECT_BYTES,
-      env: commandEnv(process.env, loaded.config.tz), cwd: workDir, register,
+      env: commandEnv(process.env, cfgOf().tz), cwd: workDir, register,
     });
     if (out.stopped) return { ok: false, errorClass: "emergency" };
     if (out.tooLarge) return { ok: false, errorClass: "collect_too_large" };
@@ -257,14 +283,14 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
       // is added or closed. An empty list does close (everything was settled).
       if (!Array.isArray(src.tasks)) continue;
       try {
-        deps.todos.syncSource(loaded.config.owner, { automationId: a.id, sourceId: src.id, sourceTitle: src.title, status: src.status, tasks: src.tasks, cut: !!src.tasksCut, runId: r.id });
+        deps.todos.syncSource(cfgOf().owner, { automationId: a.id, sourceId: src.id, sourceTitle: src.title, status: src.status, tasks: src.tasks, cut: !!src.tasksCut, runId: r.id });
       } catch (e) { log("error", "todos_sync_failed", { automation: a.id, source: src.id, err: String(e?.message || e).slice(0, 120) }); }
     }
   }
 
   function todoCounts() {
-    if (!deps.todos || !loaded.config) return null;
-    try { return { open: deps.todos.openCount(loaded.config.owner) }; } catch { return null; }
+    if (!deps.todos || !cfgOf()) return null;
+    try { return { open: deps.todos.openCount(cfgOf().owner) }; } catch { return null; }
   }
 
   async function deliver(a, r, { header, summary, fullText }) {
@@ -283,7 +309,7 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
       try {
         checkExecutable(a.deliver[0]);
         const out = await runCommand({ argv: a.deliver, stdin: JSON.stringify(payload), timeoutMs: DELIVER_TIMEOUT_MS,
-          env: commandEnv(process.env, loaded.config.tz), cwd: workDir, register });
+          env: commandEnv(process.env, cfgOf().tz), cwd: workDir, register });
         // Killed while sending: it may have gone out.
         res = out.stopped || out.timedOut ? "unknown" : out.code === 0 ? "sent" : "failed";
         if (out.stopped) haltedByStop = true;
@@ -367,6 +393,11 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
   const pastWindow = (a, r) => now() >= windowEnd(a, r);
 
   async function execute(a, r) {
+    running++;
+    try { return await executeRun(a, r); } finally { running--; }
+  }
+
+  async function executeRun(a, r) {
     if (!tryLock(a.id, r.id)) return "busy";
     let tmp = null;
     try {
@@ -394,8 +425,8 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
       r.state = "summarizing";
       save(r);
       tmp = mkdtempSync(join(workDir, "run-"));
-      const date = r.slotDate || localDate(now(), loaded.config.tz);
-      const prompt = scheduledPrompt({ title: a.title, date, tz: loaded.config.tz, ownerPrompt: a.prompt, sources });
+      const date = r.slotDate || localDate(now(), cfgOf().tz);
+      const prompt = scheduledPrompt({ title: a.title, date, tz: cfgOf().tz, ownerPrompt: a.prompt, sources });
       const s = await deps.summarize({ run: r, automation: a, prompt, header: renderHeader(sources), cwd: tmp, register,
         deadlineMs: Math.max(1000, Math.min(SUMMARIZE_DEADLINE_MS, windowEnd(a, r) - now())) });
       r.sessionId = s.sessionId ?? r.sessionId;
@@ -407,7 +438,7 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
       if (!s.ok) { await fail(a, r, s.errorClass || "summarize_failed"); return "failed"; }
       r.summary = summaryOf(s.text);
       if (Array.isArray(s.todos) && deps.todos) {
-        try { deps.todos.replaceBriefing(loaded.config.owner, { automationId: a.id, runId: r.id, todos: s.todos }); }
+        try { deps.todos.replaceBriefing(cfgOf().owner, { automationId: a.id, runId: r.id, todos: s.todos }); }
         catch (e) { log("error", "todos_briefing_failed", { automation: a.id, err: String(e?.message || e).slice(0, 120) }); }
       }
       // Written, but the window is over (e.g. the Mac slept meanwhile): keep
@@ -581,6 +612,8 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
       if (!loaded.enabled) return { enabled: false, reason: loaded.reason, tz: null, automations: [] };
       return {
         enabled: true, reason: null, tz: loaded.config.tz,
+        // Where the briefing is set up: in the app (3.9.0) or in automations.json.
+        source: loaded.builtin ? "app" : "file",
         automations: loaded.config.automations.map((a) => ({
           id: a.id, title: a.title, schedule: a.schedule,
           nextAt: nextSlot(a.schedule, loaded.config.tz, t)?.slotAt ?? null,
@@ -634,6 +667,6 @@ export function createAutomations({ db, configPath, workDir, emergency, log = ()
     },
 
     _get: get,
-    _config: () => (loaded.enabled ? loaded.config : null),
+    _config: () => (loaded.enabled ? loaded.config : running > 0 ? lastConfig : null),
   };
 }
