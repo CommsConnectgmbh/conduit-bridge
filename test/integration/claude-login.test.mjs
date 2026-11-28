@@ -375,7 +375,7 @@ test("connections: owner only, the calendar link stays on the bridge, settings s
   assert.ok(!JSON.stringify(list.body).includes("SECRETKEY123"), "the link never goes back");
   assert.ok(!bridge.logs.text.includes("SECRETKEY123"), "nor into the log");
   assert.deepEqual(list.body.connections.map((x) => x.kind), ["ics"]);
-  assert.ok(list.body.kinds.some((k) => k.kind === "gmail" && k.viaClaude));
+  assert.ok(!list.body.kinds.some((k) => k.viaClaude), "connectors are off by default (3.9.2)");
   // The test's automations.json defines alerts only... it is the file's briefing that counts.
   const sb = await c.call("POST", "/api/connections/briefing", { enabled: true, time: "06:45", days: [1, 2, 3, 4, 5], prompt: "Kurz." });
   assert.equal(sb.head.status, 200);
@@ -395,8 +395,16 @@ test("connections: owner only, the calendar link stays on the bridge, settings s
 // read through it, without the bridge's token.
 test("connector profile: sign in from the phone, then Gmail is read through it", { skip: !POSIX, timeout: 90_000 }, async () => {
   await stopBridge("SIGTERM");
+  // Without the switch the connectors are not there at all.
   bridge = await startBridge({ warm: false, env: { CLAUDE_CODE_OAUTH_TOKEN: "bridge-token" } });
-  const c = await client({ sid: SID_A });
+  let c = await client({ sid: SID_A });
+  assert.equal((await c.call("POST", "/api/connections", { kind: "gmail" })).head.status, 400);
+  assert.equal((await c.call("GET", "/api/connector-login")).head.status, 404);
+  assert.ok(!(await c.call("GET", "/api/connections")).body.kinds.some((k) => k.viaClaude));
+  c.close();
+  await stopBridge("SIGTERM");
+  bridge = await startBridge({ warm: false, env: { CLAUDE_CODE_OAUTH_TOKEN: "bridge-token", CONDUIT_CONNECTORS: "1" } });
+  c = await client({ sid: SID_A });
   const add = await c.call("POST", "/api/connections", { kind: "gmail" });
   assert.equal(add.head.status, 200);
   const id = add.body.connection.id;
