@@ -145,7 +145,7 @@ const LOG = ${JSON.stringify(fakeLog)};
 const STATUS = process.env.CLAUDE_CONFIG_DIR ? process.env.CLAUDE_CONFIG_DIR + "/fake-status.json" : process.env.FAKE_STATUS_FILE;
 const out = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
 if (process.argv[2] === "auth") {
-  appendFileSync(LOG, JSON.stringify({ pid: process.pid, auth: process.argv[3], token: !!process.env.CLAUDE_CODE_OAUTH_TOKEN, browser: process.env.BROWSER || null }) + "\\n");
+  appendFileSync(LOG, JSON.stringify({ pid: process.pid, auth: process.argv[3], cfg: process.env.CLAUDE_CONFIG_DIR || null, token: !!process.env.CLAUDE_CODE_OAUTH_TOKEN, browser: process.env.BROWSER || null }) + "\\n");
   if (process.argv[3] === "status") {
     // The bridge's own sign-in: its token. Without it: the stored login.
     if (process.env.CLAUDE_CODE_OAUTH_TOKEN) out({ loggedIn: true, authMethod: "oauth_token", loginExpiresAt: null });
@@ -401,6 +401,9 @@ test("connector profile: sign in from the phone, then Gmail is read through it",
   assert.equal((await c.call("POST", "/api/connections", { kind: "gmail" })).head.status, 400);
   assert.equal((await c.call("GET", "/api/connector-login")).head.status, 404);
   assert.ok(!(await c.call("GET", "/api/connections")).body.kinds.some((k) => k.viaClaude));
+  // Nor is the connector profile ever started, not even for a sign-in check (3.9.3).
+  await new Promise((r) => setTimeout(r, 1500));
+  assert.deepEqual(fakeRuns().filter((r) => (r.cfg || "").endsWith("connector-profile")), [], "no run in the connector profile while the switch is off");
   c.close();
   await stopBridge("SIGTERM");
   bridge = await startBridge({ warm: false, env: { CLAUDE_CODE_OAUTH_TOKEN: "bridge-token", CONDUIT_CONNECTORS: "1" } });

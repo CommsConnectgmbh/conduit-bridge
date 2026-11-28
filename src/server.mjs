@@ -3711,9 +3711,13 @@ async function handleConnections(req, res, path, auth) {
   const code = (r) => (r.ok ? 200 : r.error === "not_found" ? 404 : r.error === "full" || r.error === "emergency" || r.error === "disabled" ? 409 : r.error === "throttled" ? 429 : 400);
   const loginStatus = () => connectorLogin.status();
   if (path === "/api/connections" && req.method === "GET") {
-    // A connector sign-in older than 10 minutes is read again in the background.
-    const st = connectorLogin.status();
-    if (!st.checkedAt || Date.now() - st.checkedAt > 10 * 60_000) connectorLogin.check("view").catch(() => {});
+    // A connector sign-in older than 10 minutes is read again in the background,
+    // but only while the connectors are switched on: with CONDUIT_CONNECTORS off
+    // the connector profile is never started.
+    if (connections.connectorsEnabled()) {
+      const st = connectorLogin.status();
+      if (!st.checkedAt || Date.now() - st.checkedAt > 10 * 60_000) connectorLogin.check("view").catch(() => {});
+    }
     const a = phase4?.automations.status() || { enabled: false, reason: "not_configured" };
     return json(res, 200, { ok: true, ...(await connections.status()), briefing: { settings: connections.briefing(), active: a.enabled, source: a.source || null, reason: a.enabled ? null : a.reason } });
   }
