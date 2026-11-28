@@ -334,3 +334,45 @@ test("to-dos: any paired account, through the E2E session, kept across a restart
   assert.ok(l.body.version >= 3);
   c.close();
 });
+
+// Connections (3.9.0): owner only; the calendar link never comes back; the
+// briefing settings are saved; a file briefing stays in charge.
+test("connections: owner only, the calendar link stays on the bridge, settings saved, file briefing wins", { skip: !POSIX, timeout: 90_000 }, async () => {
+  // Without an owner (the bridge left by the tests above): not there at all.
+  if (!bridge) bridge = await startBridge({ warm: false, env: { PAIR_OWNER_EMAIL: "" } });
+  let c = await client({ sid: SID_A });
+  let st = await c.call("GET", "/api/status");
+  assert.equal(st.body.features.connections, undefined);
+  for (const [m, p, b] of [["GET", "/api/connections"], ["POST", "/api/connections", { kind: "github" }], ["GET", "/api/connector-login"], ["POST", "/api/connector-login/start"]]) {
+    assert.equal((await c.call(m, p, b)).head.status, 404, `${m} ${p} without owner`);
+  }
+  c.close();
+
+  await stopBridge("SIGTERM");
+  bridge = await startBridge({ warm: false });
+  c = await client({ sid: SID_A });
+  st = await c.call("GET", "/api/status");
+  assert.equal(st.body.features.connections, 1);
+  const add = await c.call("POST", "/api/connections", { kind: "ics", title: "Family", link: "webcal://cal.example.com/private/SECRETKEY123.ics" });
+  assert.equal(add.head.status, 200);
+  assert.equal(add.body.connection.hint, "cal.example.com");
+  assert.equal((await c.call("POST", "/api/connections", { kind: "ics", link: "http://10.0.0.1/x.ics" })).head.status, 400);
+  assert.equal((await c.call("POST", "/api/connections", { kind: "exec", link: "/bin/sh" })).head.status, 400);
+  const list = await c.call("GET", "/api/connections");
+  assert.ok(!JSON.stringify(list.body).includes("SECRETKEY123"), "the link never goes back");
+  assert.ok(!bridge.logs.text.includes("SECRETKEY123"), "nor into the log");
+  assert.deepEqual(list.body.connections.map((x) => x.kind), ["ics"]);
+  assert.ok(list.body.kinds.some((k) => k.kind === "gmail" && k.viaClaude));
+  // The test's automations.json defines alerts only... it is the file's briefing that counts.
+  const sb = await c.call("POST", "/api/connections/briefing", { enabled: true, time: "06:45", days: [1, 2, 3, 4, 5], prompt: "Kurz." });
+  assert.equal(sb.head.status, 200);
+  assert.equal((await c.call("POST", "/api/connections/briefing", { enabled: true, time: "25:00", days: [1], prompt: "x" })).head.status, 400);
+  const after = await c.call("GET", "/api/connections");
+  assert.deepEqual(after.body.briefing.settings, { enabled: true, time: "06:45", days: [1, 2, 3, 4, 5], prompt: "Kurz." });
+  assert.equal(after.body.briefing.source, "file", "an automations.json keeps its briefing; the app's settings wait");
+  // Removing works and is final.
+  const id = add.body.connection.id;
+  assert.equal((await c.call("POST", `/api/connections/${id}/delete`)).head.status, 200);
+  assert.equal((await c.call("POST", `/api/connections/${id}/check`)).head.status, 404);
+  c.close();
+});

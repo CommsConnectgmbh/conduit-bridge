@@ -355,3 +355,62 @@ test("scheduled briefing end to end, follow-up, profile check, emergency stop, s
   for (let i = 0; i < 40 && alive(pid2); i++) await sleep(50);
   assert.equal(alive(pid2), false, "collect outlived the bridge");
 });
+
+// 3.9.0: the briefing set up in the app, on the real path (no automations.json,
+// a GitHub connection, the real scheduled summary). Switching it off while it
+// collects lets that run finish with the settings it started with; the PR
+// becomes a to-do of the owner.
+test("app briefing: runs without automations.json, survives being switched off mid-run, GitHub PR becomes a to-do", { skip: !POSIX, timeout: 120_000 }, async () => {
+  await stopBridge();
+  const { renameSync } = await import("node:fs");
+  renameSync(join(dir, "db", "automations.json"), join(dir, "db", "automations.json.off"));
+  const ghDir = join(dir, "gh-bin");
+  mkdirSync(ghDir, { recursive: true, mode: 0o700 });
+  const ghStarted = join(dir, "gh-started");
+  writeFileSync(join(ghDir, "gh"), `#!/bin/sh
+echo "$@" >> "${ghStarted}"
+sleep 2
+case "$2" in prs) echo '[{"url":"https://github.com/acme/app/pull/7","title":"Fix login","repository":{"nameWithOwner":"acme/app"},"updatedAt":"2026-11-27T10:00:00Z","number":7}]';; *) echo '[]';; esac
+`);
+  chmodSync(join(ghDir, "gh"), 0o700);
+  bridge = await startBridge({ PATH: `${ghDir}:${process.env.PATH}`, TZ: "UTC" });
+  const c = await pairedClient();
+  let st = await c.call("GET", "/api/automations");
+  assert.equal(st.body.enabled, false, "nothing set up yet");
+  const add = await c.call("POST", "/api/connections", { kind: "github" });
+  assert.equal(add.head.status, 200);
+  const on = await c.call("POST", "/api/connections/briefing", { enabled: true, time: utcHHMM(Date.now() + 6 * 3600_000), days: [1, 2, 3, 4, 5, 6, 7], prompt: "Summarise." });
+  assert.equal(on.head.status, 200);
+  st = await c.call("GET", "/api/automations");
+  assert.equal(st.body.enabled, true);
+  assert.equal(st.body.source, "app");
+  const run = await c.call("POST", "/api/automations/briefing/run");
+  assert.equal(run.head.status, 202);
+  for (let i = 0; i < 100 && !existsSync(ghStarted); i++) await sleep(50);
+  assert.ok(existsSync(ghStarted), "the connection is being read");
+  // Switched off while gh still runs.
+  const off = await c.call("POST", "/api/connections/briefing", { enabled: false, time: "07:00", days: [1], prompt: "Summarise." });
+  assert.equal(off.head.status, 200);
+  // The run ends done, with the GitHub source, written by the real scheduled path.
+  const t0 = Date.now();
+  let last = null;
+  while (Date.now() - t0 < 30_000) {
+    const runs = await c.call("GET", "/api/week");
+    const todos = await c.call("GET", "/api/todos");
+    last = todos.body;
+    if (todos.body.todos?.some((t) => t.origin === "source" && /acme\/app#7 Fix login/.test(t.text))) break;
+    await sleep(300);
+    void runs;
+  }
+  const todo = last.todos.find((t) => t.origin === "source");
+  assert.ok(todo, "the PR is a to-do: " + JSON.stringify(last).slice(0, 400) + "\n" + bridge.logs.text.slice(-2500));
+  assert.equal(todo.url, "https://github.com/acme/app/pull/7");
+  for (let i = 0; i < 60 && !/automation_run_done/.test(bridge.logs.text); i++) await sleep(250);
+  assert.match(bridge.logs.text, /"automation_run_done"/, "the run finished: " + bridge.logs.text.slice(-2500));
+  assert.doesNotMatch(bridge.logs.text, /automation_run_crashed/);
+  st = await c.call("GET", "/api/automations");
+  assert.equal(st.body.enabled, false, "and stays off for the next one");
+  await c.close();
+  await stopBridge();
+  renameSync(join(dir, "db", "automations.json.off"), join(dir, "db", "automations.json"));
+});

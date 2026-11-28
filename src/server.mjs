@@ -54,6 +54,8 @@ import { followUpPrompt } from "./automation-text.mjs";
 import { sessionOrigin, setTurnOrigin, setTurnEnd, kvGet, kvSet } from "./db.mjs";
 import { createClaudeLogin } from "./claude-login.mjs";
 import { createTodos } from "./todos.mjs";
+import { createConnections } from "./connections.mjs";
+import { checkExecutable } from "./automations-config.mjs";
 
 // Automations, week view, Web Push; created just before listen (see below).
 let phase4 = null;
@@ -1107,10 +1109,17 @@ async function handleApi(req, res, u, auth) {
       // emergencyStop: POST /api/emergency-stop|release; readOnly: prompt
       // frames take `readOnly: true`; spokenReplies: prompt frames take
       // `spoken: true` (short answer first, details after a "---" line).
-      features: { turnStatus: 1, emergencyStop: 1, readOnly: 1, spokenReplies: 1, ...(phase4 ? phase4.features() : {}), ...(todos ? { todos: 1 } : {}), ...(claudeLogin && isLoginOwner(email) ? { claudeLogin: 1 } : {}) },
+      features: { turnStatus: 1, emergencyStop: 1, readOnly: 1, spokenReplies: 1, ...(phase4 ? phase4.features() : {}), ...(todos ? { todos: 1 } : {}), ...(connections && isLoginOwner(email) ? { connections: 1 } : {}), ...(claudeLogin && isLoginOwner(email) ? { claudeLogin: 1 } : {}) },
       emergencyStop: emergency.status(),
       claudeLogin: claudeLogin && isLoginOwner(email) ? publicLoginStatus() : null,
     });
+  }
+
+  // Connections and the briefing set up in the app (connections.mjs, 3.9.0),
+  // and the sign-in of the connector profile. Only the bridge owner's account.
+  if (path === "/api/connections" || path.startsWith("/api/connections/") || path.startsWith("/api/connector-login")) {
+    if (!connections || !isLoginOwner(email)) return json(res, 404, { ok: false, error: "not available" });
+    return handleConnections(req, res, path, auth);
   }
 
   // Claude sign-in (claude-login.mjs): state, a fresh check, and signing in
@@ -2184,6 +2193,7 @@ function engageEmergencyStop(by) {
   try { alexaSession.stop?.("emergency"); } catch {}
   // Scheduled runs: collect, model and deliver, as process groups.
   try { stopped += phase4?.stopAll() || 0; } catch {}
+  try { stopped += connections?.stopAll() || 0; } catch {}
   log("warn", "emergency_stop_engaged", { by, stopped, dropped, already: st.already, persisted: st.persisted });
   return { stopped, dropped, persisted: st.persisted };
 }
@@ -3575,8 +3585,10 @@ function shutdown(sig) {
   // Scheduled runs live in their own process groups; without this they would
   // keep running after the bridge, and the next start would collect again.
   try { phase4?.killAllNow(); } catch {}
+  try { connections?.killAllNow(); } catch {}
   // A sign-in waiting for its code must not outlive the bridge.
   try { claudeLogin?.stop(); } catch {}
+  try { connectorLogin?.stop(); } catch {}
   log("info", "bridge_shutdown", { sig });
   process.exit(0);
 }
@@ -3589,7 +3601,9 @@ process.on("exit", () => {
   // Every exit path (watchdog, crash), not only SIGTERM: scheduled runs and
   // follow-up answers run in detached groups and would outlive the bridge.
   try { phase4?.killAllNow(); } catch {}
+  try { connections?.killAllNow(); } catch {}
   try { claudeLogin?.stop(); } catch {}
+  try { connectorLogin?.stop(); } catch {}
 });
 
 /**
@@ -3652,9 +3666,108 @@ async function handleTodos(req, res, path, auth) {
   return json(res, 404, { error: "not_found" });
 }
 
+// Connections (3.9.0): owner only, so only with an explicit PAIR_OWNER_EMAIL,
+// and only where automations run (POSIX).
+let connections = null;
+let connectorLogin = null;
+const BRIDGE_DB_DIR = process.env.DB_DIR || join(homedir(), "Library/conduit-bridge");
+/** The GitHub CLI, if one is installed in a place nobody else can write to. */
+function findGh() {
+  const dirs = [...String(process.env.PATH || "").split(":"), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"];
+  for (const d of dirs) {
+    if (!d || !d.startsWith("/")) continue;
+    try { checkExecutable(join(d, "gh")); return join(d, "gh"); } catch { /* not here */ }
+  }
+  return null;
+}
+if (PAIR_OWNER_EMAIL && process.platform !== "win32" && CLAUDE_ENGINE.isAvailable()) {
+  try {
+    const connectorDir = join(BRIDGE_DB_DIR, "connector-profile");
+    const workDir = join(BRIDGE_DB_DIR, "connections-work");
+    ensurePrivateDir(connectorDir);
+    ensurePrivateDir(workDir);
+    const connectorEnvBase = { ...process.env, CLAUDE_CONFIG_DIR: connectorDir };
+    delete connectorEnvBase.CLAUDE_CODE_OAUTH_TOKEN;
+    // The connector profile's own sign-in: checked on demand, never alerted
+    // (the app shows its state where the connections are).
+    connectorLogin = createClaudeLogin({ claudeBin: CLAUDE_BIN, env: connectorEnvBase, log: (lvl, msg, o) => log(lvl, msg.replace(/^claude_login/, "connector_login"), o), notify: async () => "off" });
+    connections = createConnections({ db: historyDb, log, deps: {
+      claudeBin: CLAUDE_BIN, ghBin: findGh(), connectorConfigDir: connectorDir, workDir, env: process.env,
+      tz: () => phase4?.tz() || null, connectorLogin,
+      onRemoved: (sourceId) => todos?.closeSource(PAIR_OWNER_EMAIL, sourceId),
+      stopped: () => emergency.active === true,
+    } });
+  } catch (e) {
+    log("error", "connections_init_failed", { err: String(e?.message || e).slice(0, 200) });
+    connections = null;
+  }
+}
+
+async function handleConnections(req, res, path, auth) {
+  const reloadAutomations = () => { try { return phase4?.reload() || null; } catch (e) { log("error", "automations_reload_failed", { err: String(e?.message || e).slice(0, 120) }); return null; } };
+  const code = (r) => (r.ok ? 200 : r.error === "not_found" ? 404 : r.error === "full" || r.error === "emergency" ? 409 : 400);
+  const loginStatus = () => connectorLogin.status();
+  if (path === "/api/connections" && req.method === "GET") {
+    // A connector sign-in older than 10 minutes is read again in the background.
+    const st = connectorLogin.status();
+    if (!st.checkedAt || Date.now() - st.checkedAt > 10 * 60_000) connectorLogin.check("view").catch(() => {});
+    const a = phase4?.automations.status() || { enabled: false, reason: "not_configured" };
+    return json(res, 200, { ok: true, ...(await connections.status()), briefing: { settings: connections.briefing(), active: a.enabled, source: a.source || null, reason: a.enabled ? null : a.reason } });
+  }
+  if (path === "/api/connections" && req.method === "POST") {
+    const b = await readJson(req) || {};
+    const r = await connections.add({ kind: b.kind, title: b.title, link: b.link });
+    if (r.ok) reloadAutomations();
+    log("info", "connection_add_requested", { by: auth.deviceId, ok: r.ok, error: r.error || null });
+    return json(res, code(r), r);
+  }
+  if (path === "/api/connections/briefing" && req.method === "POST") {
+    const b = await readJson(req) || {};
+    const r = connections.setBriefing(b);
+    if (r.ok) reloadAutomations();
+    return json(res, code(r), r);
+  }
+  let m = path.match(/^\/api\/connections\/(c_[0-9a-f-]{36})$/);
+  if (m && req.method === "POST") {
+    const b = await readJson(req) || {};
+    const r = connections.update(m[1], { title: b.title, enabled: b.enabled });
+    if (r.ok) reloadAutomations();
+    return json(res, code(r), r);
+  }
+  m = path.match(/^\/api\/connections\/(c_[0-9a-f-]{36})\/check$/);
+  if (m && req.method === "POST") {
+    if (emergency.active) return json(res, 409, { ok: false, error: "emergency" });
+    const r = await connections.check(m[1]);
+    return json(res, code(r), r);
+  }
+  m = path.match(/^\/api\/connections\/(c_[0-9a-f-]{36})\/delete$/);
+  if (m && req.method === "POST") {
+    const r = connections.remove(m[1]);
+    if (r.ok) reloadAutomations();
+    return json(res, code(r), r);
+  }
+  // The connector profile's sign-in, the same flow as /api/claude-login.
+  if (path === "/api/connector-login" && req.method === "GET") return json(res, 200, { ok: true, ...loginStatus() });
+  if (path === "/api/connector-login/check" && req.method === "POST") { await connectorLogin.check("manual", { fresh: true }); return json(res, 200, { ok: true, ...loginStatus() }); }
+  if (path === "/api/connector-login/start" && req.method === "POST") {
+    const r = await connectorLogin.startLogin();
+    log("info", "connector_login_start_requested", { by: auth.deviceId, ok: r.ok, error: r.error || null });
+    return json(res, r.ok ? 200 : 502, r.ok ? { ok: true, id: r.id, url: r.url } : { ok: false, error: r.error });
+  }
+  if (path === "/api/connector-login/code" && req.method === "POST") {
+    const body = await readJson(req) || {};
+    const r = await connectorLogin.submitCode(String(body.id || ""), String(body.code || ""));
+    return json(res, r.ok ? 200 : r.error === "bad_code" || r.error === "no_login" || r.error === "not_ready" ? 409 : 502, r.ok
+      ? { ok: true, ...loginStatus() }
+      : { ok: false, error: r.error, message: r.message || null, ...loginStatus() });
+  }
+  if (path === "/api/connector-login/cancel" && req.method === "POST") { connectorLogin.cancelLogin(); return json(res, 200, { ok: true, ...loginStatus() }); }
+  return json(res, 404, { ok: false, error: "not found" });
+}
+
 try {
   phase4 = createPhase4({
-    todos,
+    todos, connections, ownerEmail: () => PAIR_OWNER_EMAIL || null,
     dbDir: process.env.DB_DIR || join(homedir(), "Library/conduit-bridge"),
     db: historyDb, emergency, journal, log,
     claudeBin: CLAUDE_BIN, claudeModel: process.env.CLAUDE_MODEL || null,

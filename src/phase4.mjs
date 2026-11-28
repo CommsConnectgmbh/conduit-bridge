@@ -56,7 +56,7 @@ export function resolveVapid({ envKey, dbDir }) {
   return { keys, reason: null };
 }
 
-export function createPhase4({ dbDir, db, emergency, journal = null, log, claudeBin, claudeModel, knownOwners, activeTurns, maxTurns, vapidEnvKey, todos = null }) {
+export function createPhase4({ dbDir, db, emergency, journal = null, log, claudeBin, claudeModel, knownOwners, activeTurns, maxTurns, vapidEnvKey, todos = null, connections = null, ownerEmail = () => null }) {
   let summarizing = 0;
   const testPushes = new Set(); // AbortControllers of /api/push/test sends
   const alertRuns = new Set();  // runCommand handles of alert deliveries
@@ -72,6 +72,10 @@ export function createPhase4({ dbDir, db, emergency, journal = null, log, claude
       capacity: () => activeTurns() + summarizing < maxTurns,
       summarize,
       todos,
+      // 3.9.0: the briefing set up in the app, and the app's connections as
+      // extra sources of every briefing.
+      builtinConfig: connections ? () => connections.builtinConfig(ownerEmail()) : null,
+      extraSources: connections ? (o) => connections.extraSources(o) : null,
       push: pushToOwner,
       // The stored answer of a run, for a delivery resumed after a restart.
       fullText: async (run) => {
@@ -83,7 +87,9 @@ export function createPhase4({ dbDir, db, emergency, journal = null, log, claude
     },
   });
 
-  function config() { return automations.enabled ? automations._config() : null; }
+  // While a run is under way after the app switched its briefing off, this is
+  // still the config that run started with (automations.mjs _config).
+  function config() { return automations._config(); }
 
   /** One scheduled run: its own chat (origin schedule), the model without tools. */
   async function summarize({ run, automation, prompt, cwd, register, deadlineMs }) {
@@ -277,16 +283,25 @@ export function createPhase4({ dbDir, db, emergency, journal = null, log, claude
     return false;
   }
 
+  function ensureVapid() {
+    if (vapid.keys || !automations.enabled || !config().push) return;
+    try { vapid = resolveVapid({ envKey: vapidEnvKey, dbDir }); } catch (e) { vapid = { keys: null, reason: "vapid_mismatch" }; log("error", "vapid_load_failed", { err: String(e?.message || e).slice(0, 120) }); }
+    if (!vapid.keys) log("warn", "push_disabled", { reason: vapid.reason });
+  }
+
   return {
     automations,
     handle,
     week,
     start() {
       automations.start();
-      if (automations.enabled && config().push) {
-        try { vapid = resolveVapid({ envKey: vapidEnvKey, dbDir }); } catch (e) { vapid = { keys: null, reason: "vapid_mismatch" }; log("error", "vapid_load_failed", { err: String(e?.message || e).slice(0, 120) }); }
-        if (!vapid.keys) log("warn", "push_disabled", { reason: vapid.reason });
-      }
+      ensureVapid();
+    },
+    /** After the app changed the briefing or the connections. */
+    reload() {
+      automations.reload();
+      ensureVapid();
+      return automations.status();
     },
     alert,
     isOwner,

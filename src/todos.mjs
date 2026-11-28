@@ -164,6 +164,7 @@ export function createTodos({ db, now = Date.now, log = () => {} }) {
     sourceRows: db.prepare("SELECT * FROM todos WHERE email = ? AND origin = 'source' AND automation_id = ? AND source_id = ?"),
     sourceUpdate: db.prepare("UPDATE todos SET text = ?, text_key = ?, url = ?, source_title = ?, run_id = ?, updated_at = ? WHERE id = ?"),
     reopenSource: db.prepare("UPDATE todos SET text = ?, text_key = ?, url = ?, source_title = ?, run_id = ?, state = 'open', done_at = NULL, state_at = ?, updated_at = ? WHERE id = ?"),
+    closeSource: db.prepare("UPDATE todos SET state = 'resolved', state_at = ?, updated_at = ? WHERE email = ? AND origin = 'source' AND source_id = ? AND state IN ('open', 'done', 'deleted')"),
     openBriefing: db.prepare("SELECT id FROM todos WHERE email = ? AND origin = 'briefing' AND automation_id = ? AND state = 'open'"),
     // Ticked or removed by the owner: not suggested again for KEEP_MS.
     settledBriefingKeys: db.prepare("SELECT text_key FROM todos WHERE email = ? AND origin = 'briefing' AND automation_id = ? AND state IN ('done', 'deleted') AND state_at >= ?"),
@@ -288,6 +289,13 @@ export function createTodos({ db, now = Date.now, log = () => {} }) {
         if (changed) bump(e);
         return { added, closed };
       });
+    },
+
+    /** A source that is gone for good (a connection removed in the app): its to-dos end. */
+    closeSource(email, sourceId) {
+      const e = key(email);
+      const ts = now();
+      return tx(() => { const n = q.closeSource.run(ts, ts, e, sourceId).changes; if (n) bump(e); return n; });
     },
 
     /** A briefing's suggestions replace the previous run's open ones. */
