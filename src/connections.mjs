@@ -235,7 +235,12 @@ export function createConnections({ db, log = () => {}, now = Date.now, deps }) 
       if (now() - (lastCheck.get(id) || 0) < 10_000) return { ok: false, error: "throttled" };
       const src = await collectOne(r);
       if (src && src.status !== "error") lastCheck.set(id, now());
-      if (!src) return stoppedNow() ? { ok: false, error: "emergency" } : { ok: false, error: "not_found" };
+      if (!src) {
+        if (stoppedNow()) return { ok: false, error: "emergency" };
+        // Dropped because it changed during the read: still there means it was
+        // switched off (or its kind turned off), not removed.
+        return q.get.get(id) ? { ok: false, error: "disabled" } : { ok: false, error: "not_found" };
+      }
       return { ok: true, connection: publicConn(q.get.get(id)), result: { status: src.status, count: src.count ?? null } };
     },
 
