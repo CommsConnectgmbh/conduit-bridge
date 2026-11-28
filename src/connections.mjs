@@ -95,6 +95,7 @@ export function createConnections({ db, log = () => {}, now = Date.now, deps }) 
   // Every running read (gh, connector, calendar fetch): the emergency stop
   // ends them all, whoever started them (a briefing or "Check").
   const handles = new Set();
+  const lastCheck = new Map(); // id -> ms: "Check" at most every 10 s per connection
   const stoppedNow = () => deps.stopped?.() === true;
 
   function briefing() {
@@ -221,7 +222,11 @@ export function createConnections({ db, log = () => {}, now = Date.now, deps }) 
       if (!ID_RE.test(String(id))) return { ok: false, error: "not_found" };
       const r = q.get.get(id);
       if (!r) return { ok: false, error: "not_found" };
+      // Throttled only after a read that worked: a retry right after fixing a
+      // problem (signing in, say) always goes through.
+      if (now() - (lastCheck.get(id) || 0) < 10_000) return { ok: false, error: "throttled" };
       const src = await collectOne(r);
+      if (src && src.status !== "error") lastCheck.set(id, now());
       if (!src) return stoppedNow() ? { ok: false, error: "emergency" } : { ok: false, error: "not_found" };
       return { ok: true, connection: publicConn(q.get.get(id)), result: { status: src.status, count: src.count ?? null } };
     },

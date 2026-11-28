@@ -140,14 +140,16 @@ before(async () => {
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 const LOG = ${JSON.stringify(fakeLog)};
-const STATUS = process.env.FAKE_STATUS_FILE;
+// The connector profile (3.9.0) gets only an allowlisted environment: its
+// sign-in state lives in that profile's folder, like the real CLI's would.
+const STATUS = process.env.CLAUDE_CONFIG_DIR ? process.env.CLAUDE_CONFIG_DIR + "/fake-status.json" : process.env.FAKE_STATUS_FILE;
 const out = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
 if (process.argv[2] === "auth") {
   appendFileSync(LOG, JSON.stringify({ pid: process.pid, auth: process.argv[3], token: !!process.env.CLAUDE_CODE_OAUTH_TOKEN, browser: process.env.BROWSER || null }) + "\\n");
   if (process.argv[3] === "status") {
     // The bridge's own sign-in: its token. Without it: the stored login.
     if (process.env.CLAUDE_CODE_OAUTH_TOKEN) out({ loggedIn: true, authMethod: "oauth_token", loginExpiresAt: null });
-    else process.stdout.write(readFileSync(STATUS, "utf8") + "\\n");
+    else { let t = '{"loggedIn":false,"authMethod":"none"}'; try { t = readFileSync(STATUS, "utf8"); } catch {} process.stdout.write(t + "\\n"); }
     process.exit(0);
   }
   if (process.argv[3] === "login") {
@@ -159,6 +161,17 @@ if (process.argv[2] === "auth") {
     });
     setInterval(() => {}, 1000);
   }
+} else if (process.argv.includes("--allowedTools") && process.argv[process.argv.indexOf("--allowedTools") + 1].startsWith("mcp__claude_ai_")) {
+  // A connector run in the connector profile (3.9.0).
+  appendFileSync(LOG, JSON.stringify({ pid: process.pid, connector: true, cfg: process.env.CLAUDE_CONFIG_DIR || null, token: !!process.env.CLAUDE_CODE_OAUTH_TOKEN, argv: process.argv.slice(2) }) + "\\n");
+  const tool = process.argv[process.argv.indexOf("--allowedTools") + 1];
+  let input = ""; process.stdin.on("data", (d) => { input += d; }); process.stdin.on("end", () => {
+    const args = JSON.parse(input.split("\\n")[2]);
+    out({ type: "system", subtype: "init", tools: [tool, "mcp__claude_ai_Gmail__send_message"], mcp_servers: [{ name: "claude.ai Gmail", status: "connected" }], slash_commands: [], plugins: [], permissionMode: "dontAsk" });
+    out({ type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: tool, input: args }] } });
+    out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", content: [{ type: "text", text: JSON.stringify({ threads: [{ id: "a" }, { id: "b" }, { id: "c" }] }) }] }] } });
+    out({ type: "result", subtype: "success", is_error: false, result: "DONE" });
+  });
 } else {
   out({ type: "system", subtype: "init", session_id: "11111111-2222-3333-4444-555555555555" });
   createInterface({ input: process.stdin }).on("line", (raw) => {
@@ -374,5 +387,44 @@ test("connections: owner only, the calendar link stays on the bridge, settings s
   const id = add.body.connection.id;
   assert.equal((await c.call("POST", `/api/connections/${id}/delete`)).head.status, 200);
   assert.equal((await c.call("POST", `/api/connections/${id}/check`)).head.status, 404);
+  c.close();
+});
+
+// The connector profile end to end through the server (3.9.0): signed out at
+// first, sign-in from the phone into the profile's own folder, then a Gmail
+// read through it, without the bridge's token.
+test("connector profile: sign in from the phone, then Gmail is read through it", { skip: !POSIX, timeout: 90_000 }, async () => {
+  await stopBridge("SIGTERM");
+  bridge = await startBridge({ warm: false, env: { CLAUDE_CODE_OAUTH_TOKEN: "bridge-token" } });
+  const c = await client({ sid: SID_A });
+  const add = await c.call("POST", "/api/connections", { kind: "gmail" });
+  assert.equal(add.head.status, 200);
+  const id = add.body.connection.id;
+  // Not signed in yet: the read says so and starts no connector run.
+  let chk = await c.call("POST", `/api/connections/${id}/check`);
+  assert.equal(chk.body.result.status, "error");
+  assert.match(chk.body.connection.last.error, /sign-in for connectors needed/);
+  assert.equal(fakeRuns().filter((r) => r.connector).length, 0);
+  // Sign in from the phone into the connector profile.
+  let st = await c.call("POST", "/api/connector-login/check");
+  assert.equal(st.body.state, "signed_out");
+  const s1 = await c.call("POST", "/api/connector-login/start");
+  assert.equal(s1.body.ok, true);
+  assert.match(s1.body.url, /^https:\/\/claude\.com\/cai\/oauth\/authorize\?/);
+  const done = await c.call("POST", "/api/connector-login/code", { id: s1.body.id, code: "good-code#s1" });
+  assert.equal(done.body.ok, true, JSON.stringify(done.body));
+  st = await c.call("GET", "/api/connector-login");
+  assert.equal(st.body.state, "ok");
+  // The computer's own sign-in is untouched by it.
+  const own = await c.call("GET", "/api/claude-login");
+  assert.equal(own.body.ownToken, true);
+  // Now the read goes through the profile.
+  chk = await c.call("POST", `/api/connections/${id}/check`);
+  assert.deepEqual(chk.body.result, { status: "ok", count: 3 });
+  const run = fakeRuns().filter((r) => r.connector).at(-1);
+  assert.ok(run.cfg && run.cfg.endsWith("connector-profile"), "in the connector profile");
+  assert.equal(run.token, false, "never with the bridge's token");
+  const login = fakeRuns().filter((r) => r.auth === "login").at(-1);
+  assert.equal(login.token, false);
   c.close();
 });

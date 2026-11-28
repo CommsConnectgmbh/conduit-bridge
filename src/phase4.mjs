@@ -76,6 +76,7 @@ export function createPhase4({ dbDir, db, emergency, journal = null, log, claude
       // extra sources of every briefing.
       builtinConfig: connections ? () => connections.builtinConfig(ownerEmail()) : null,
       extraSources: connections ? (o) => connections.extraSources(o) : null,
+      connectionsOwner: () => ownerEmail(),
       push: pushToOwner,
       // The stored answer of a run, for a delivery resumed after a restart.
       fullText: async (run) => {

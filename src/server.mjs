@@ -3705,7 +3705,7 @@ if (PAIR_OWNER_EMAIL && process.platform !== "win32" && CLAUDE_ENGINE.isAvailabl
 
 async function handleConnections(req, res, path, auth) {
   const reloadAutomations = () => { try { return phase4?.reload() || null; } catch (e) { log("error", "automations_reload_failed", { err: String(e?.message || e).slice(0, 120) }); return null; } };
-  const code = (r) => (r.ok ? 200 : r.error === "not_found" ? 404 : r.error === "full" || r.error === "emergency" ? 409 : 400);
+  const code = (r) => (r.ok ? 200 : r.error === "not_found" ? 404 : r.error === "full" || r.error === "emergency" ? 409 : r.error === "throttled" ? 429 : 400);
   const loginStatus = () => connectorLogin.status();
   if (path === "/api/connections" && req.method === "GET") {
     // A connector sign-in older than 10 minutes is read again in the background.
