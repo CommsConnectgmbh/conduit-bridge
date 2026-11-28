@@ -164,3 +164,11 @@ test("unknown zones in RDATE, EXDATE or an override report the series; a floatin
   const fl = w(cal("BEGIN:VEVENT", "UID:f", "SUMMARY:Late", "DTSTART:20261127T233000", "RRULE:FREQ=DAILY;UNTIL=20261128T230000", "END:VEVENT"));
   assert.deepEqual(eventsText(fl.events, "Europe/Berlin").split("\n").filter(Boolean), [], "ends 23:00 local, so the 28th 23:30 is not part of it");
 });
+
+test("an all-day series ends on its UNTIL date in zones west of UTC too", () => {
+  const text = ["BEGIN:VCALENDAR", "BEGIN:VEVENT", "UID:u", "SUMMARY:Fair", "DTSTART;VALUE=DATE:20261127", "RRULE:FREQ=DAILY;UNTIL=20261128", "END:VEVENT", "END:VCALENDAR"].join("\r\n");
+  for (const tz of ["America/New_York", "Europe/Berlin", "Asia/Tokyo"]) {
+    const r = eventsInWindow(text, { tz, fromDate: "2026-11-27", toDate: "2026-11-30" });
+    assert.deepEqual(r.events.map((e) => e.date), ["2026-11-27", "2026-11-28"], tz);
+  }
+});

@@ -174,6 +174,8 @@ export function parseRule(s, untilTz = "UTC") {
     if (!u) return null;
     // A date-only UNTIL includes that whole day.
     rule.until = u.allDay ? u.ms + 86400000 - 1 : u.ms;
+    // A date-only UNTIL is a calendar date: kept as one, never via UTC.
+    rule.untilDate = u.allDay ? u.date : null;
   }
   if (r.BYDAY) {
     rule.byday = [];
@@ -334,7 +336,7 @@ export function eventsInWindow(text, { tz, fromDate, toDate }) {
     const replaced = overrides.get(e.uid) || new Set();
     const exd = new Set(e.exdates);
     if (e.start.allDay) {
-      const until = rule.until ? new Date(rule.until).toISOString().slice(0, 10) : null;
+      const until = rule.untilDate ?? (rule.until !== null ? lp(rule.until, tz).date : null);
       // Look back as far as one occurrence lasts (an absence from October to
       // December still runs in November).
       const lenMs = e.end ? e.end.ms - e.start.ms : (e.duration ? roughMs(e.duration) : 86400000);
