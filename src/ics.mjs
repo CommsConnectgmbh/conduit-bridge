@@ -142,15 +142,16 @@ export function parseEvents(text, tz) {
     else if (name === "DTEND") ev.end = parseTimeValue(value, params, tz);
     else if (name === "DURATION") ev.duration = parseDuration(value);
     else if (name === "RRULE") ev.rrule = value.trim();
-    else if (name === "EXDATE") for (const x of value.split(",")) { const t = parseTimeValue(x, params, tz); if (t) ev.exdates.push(t.ms); }
+    else if (name === "EXDATE") for (const x of value.split(",")) { const t = parseTimeValue(x, params, tz); if (t) { ev.exdates.push(t.ms); if (t.unknownZone) ev.zoneUnknown = true; } }
     else if (name === "RDATE") {
       // Extra single dates of a series. Periods (VALUE=PERIOD) are not read:
       // the series is then reported instead of shown without them.
       if (params.VALUE === "PERIOD" || value.includes("/")) ev.rdateUnsupported = true;
-      else for (const x of value.split(",")) { const t = parseTimeValue(x, params, tz); if (t) ev.rdates.push(t); }
+      else for (const x of value.split(",")) { const t = parseTimeValue(x, params, tz); if (t) { ev.rdates.push(t); if (t.unknownZone) ev.zoneUnknown = true; } }
     }
     else if (name === "RECURRENCE-ID") {
       ev.recurrenceId = parseTimeValue(value, params, tz);
+      if (ev.recurrenceId?.unknownZone) ev.zoneUnknown = true;
       // A change "for this and all later instances": not modelled here.
       if (String(params.RANGE || "").toUpperCase() === "THISANDFUTURE") ev.thisAndFuture = true;
     }
@@ -160,7 +161,8 @@ export function parseEvents(text, tz) {
 
 const WD = { MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6, SU: 7 };
 
-export function parseRule(s) {
+/** `untilTz`: the zone of the series' start; a floating UNTIL is read in it. */
+export function parseRule(s, untilTz = "UTC") {
   const r = {};
   for (const p of String(s).split(";")) { const [k, v] = p.split("="); if (k) r[k.toUpperCase()] = v ?? ""; }
   const known = new Set(["FREQ", "INTERVAL", "COUNT", "UNTIL", "BYDAY", "BYMONTHDAY", "WKST"]);
@@ -168,7 +170,7 @@ export function parseRule(s) {
   if (!["DAILY", "WEEKLY", "MONTHLY", "YEARLY"].includes(r.FREQ)) return null;
   const rule = { freq: r.FREQ, interval: Math.max(1, parseInt(r.INTERVAL || "1", 10) || 1), count: r.COUNT ? parseInt(r.COUNT, 10) : null, until: null, byday: null, bymonthday: null };
   if (r.UNTIL) {
-    const u = parseTimeValue(r.UNTIL, {}, "UTC");
+    const u = parseTimeValue(r.UNTIL, {}, untilTz);
     if (!u) return null;
     // A date-only UNTIL includes that whole day.
     rule.until = u.allDay ? u.ms + 86400000 - 1 : u.ms;
@@ -285,7 +287,9 @@ export function eventsInWindow(text, { tz, fromDate, toDate }) {
   for (const e of evs) if (e.recurrenceId && e.uid) {
     if (!overrides.has(e.uid)) overrides.set(e.uid, new Set());
     overrides.get(e.uid).add(e.recurrenceId.ms);
-    if (e.thisAndFuture) thisAndFuture.add(e.uid);
+    // Changed "from here on", or an override this reader cannot place: the
+    // whole series is reported rather than shown half right.
+    if (e.thisAndFuture || e.zoneUnknown || e.start?.unknownZone) thisAndFuture.add(e.uid);
   }
   const out = [];
   let unsupported = 0;
@@ -309,7 +313,7 @@ export function eventsInWindow(text, { tz, fromDate, toDate }) {
   };
   for (const e of evs) {
     if (!e.start || e.status === "CANCELLED") continue;
-    if (e.start.unknownZone || e.end?.unknownZone) { unsupported++; continue; }
+    if (e.start.unknownZone || e.end?.unknownZone || e.zoneUnknown) { unsupported++; continue; }
     // One instance per start time, however many of rule, RDATE and DTSTART name it.
     const seen = new Set();
     const addOnce = (ms, allDay, date) => { if (seen.has(ms)) return; seen.add(ms); add(e, ms, allDay, date); };
@@ -324,7 +328,7 @@ export function eventsInWindow(text, { tz, fromDate, toDate }) {
       addOnce(rd.ms, rd.allDay, rd.date);
     }
     if (!e.rrule) { if (!exHere.has(e.start.ms) && !replacedHere.has(e.start.ms)) addOnce(e.start.ms, e.start.allDay, e.start.date); continue; }
-    const rule = parseRule(e.rrule);
+    const rule = parseRule(e.rrule, e.start.allDay ? tz : (e.start.tz || "UTC"));
     if (!rule) { unsupported++; continue; }
     const ownTz = e.start.allDay ? tz : (e.start.tz || null);
     const replaced = overrides.get(e.uid) || new Set();

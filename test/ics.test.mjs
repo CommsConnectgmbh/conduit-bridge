@@ -148,3 +148,19 @@ test("a zone defined only in the file is reported; rule and RDATE naming the sam
   const dup = w(cal("BEGIN:VEVENT", "UID:d", "SUMMARY:Twice", "DTSTART;TZID=Europe/Berlin:20261128T090000", "RRULE:FREQ=DAILY;COUNT=2", "RDATE;TZID=Europe/Berlin:20261128T090000,20261129T090000", "END:VEVENT"));
   assert.deepEqual(eventsText(dup.events, "Europe/Berlin").split("\n"), ["2026-11-28 09:00: Twice", "2026-11-29 09:00: Twice"]);
 });
+
+test("unknown zones in RDATE, EXDATE or an override report the series; a floating UNTIL is local time", () => {
+  const cal = (...lines) => ["BEGIN:VCALENDAR", ...lines, "END:VCALENDAR"].join("\r\n");
+  const w = (t) => eventsInWindow(t, { tz: "Europe/Berlin", fromDate: "2026-11-28", toDate: "2026-11-29" });
+  const series = (extra) => ["BEGIN:VEVENT", "UID:s", "SUMMARY:S", "DTSTART;TZID=Europe/Berlin:20261126T150000", "RRULE:FREQ=DAILY", ...extra, "END:VEVENT"];
+  for (const extra of [["RDATE;TZID=Custom-Eastern:20261128T090000"], ["EXDATE;TZID=Custom-Eastern:20261128T090000"]]) {
+    const r = w(cal(...series(extra)));
+    assert.equal(r.events.length, 0, extra[0]);
+    assert.equal(r.unsupported, 1, extra[0]);
+  }
+  const ov = w(cal(...series([]), "BEGIN:VEVENT", "UID:s", "SUMMARY:S moved", "RECURRENCE-ID;TZID=Custom-Eastern:20261128T090000", "DTSTART;TZID=Europe/Berlin:20261128T170000", "END:VEVENT"));
+  assert.equal(ov.events.filter((x) => x.summary === "S").length, 0, "the series is not shown half right");
+  assert.ok(ov.unsupported >= 1);
+  const fl = w(cal("BEGIN:VEVENT", "UID:f", "SUMMARY:Late", "DTSTART:20261127T233000", "RRULE:FREQ=DAILY;UNTIL=20261128T230000", "END:VEVENT"));
+  assert.deepEqual(eventsText(fl.events, "Europe/Berlin").split("\n").filter(Boolean), [], "ends 23:00 local, so the 28th 23:30 is not part of it");
+});
